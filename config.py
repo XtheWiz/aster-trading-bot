@@ -53,7 +53,7 @@ class TradingConfig:
       while maintaining safe distance from liquidation price
     """
     # Trading symbol - ASTERUSDT is Aster DEX's native token pair
-    SYMBOL: str = "ASTERUSDT"
+    SYMBOL: str = "BTCUSDT"
     
     # Leverage multiplier - LOW to avoid liquidation during extended runs
     # 2x is conservative, 3x is moderate - avoid 5x+ for grid trading
