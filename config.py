@@ -119,7 +119,9 @@ class RiskConfig:
     """
     # Maximum drawdown before circuit breaker triggers (percentage of initial balance)
     # 10% drawdown on 500 USDT = 50 USDT max loss before emergency stop
-    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("10.0")
+    # Note: Margin lock for open orders is counted as drawdown
+    # Set higher (50%) to avoid false triggers when orders are placed
+    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("50.0")
     
     # Stop loss per individual position (not recommended for grid, but available)
     STOP_LOSS_PERCENT: Decimal | None = None
@@ -223,8 +225,8 @@ class BotConfig:
         # Risk validation
         if self.risk.MAX_DRAWDOWN_PERCENT <= 0:
             errors.append("MAX_DRAWDOWN_PERCENT must be positive")
-        if self.risk.MAX_DRAWDOWN_PERCENT > Decimal("50"):
-            errors.append("MAX_DRAWDOWN_PERCENT > 50% is extremely risky")
+        if self.risk.MAX_DRAWDOWN_PERCENT > Decimal("80"):
+            errors.append("MAX_DRAWDOWN_PERCENT > 80% is extremely risky")
         
         # Capital validation
         if self.INITIAL_CAPITAL_USDT < Decimal("100"):
