@@ -86,7 +86,7 @@ class GridConfig:
         levels = [85500, 86500, 87500, ..., 94500]
     """
     # Number of grid levels (total buy + sell orders)
-    GRID_COUNT: int = 10
+    GRID_COUNT: int = 6
     
     # Price boundaries - will be calculated dynamically based on current price
     # if not specified (using GRID_RANGE_PERCENT)
@@ -101,8 +101,8 @@ class GridConfig:
     # Quantity per grid level (in quote currency value, e.g., USDT)
     # With 300 USDT capital, 2x leverage = 600 USDT effective
     # Divided across ~5 active grids = ~120 USDT per grid is aggressive
-    # Using ~35 USDT per grid is balanced for this capital
-    QUANTITY_PER_GRID_USDT: Decimal = Decimal("35.0")
+    # Using ~35 USDT per    # For BTC at ~$90,000, minimum ~50 USDF per grid to meet lot size (0.001 BTC)
+    QUANTITY_PER_GRID_USDT: Decimal = Decimal("50.0")
     
     # Maximum number of open orders allowed
     MAX_OPEN_ORDERS: int = 20
