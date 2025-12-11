@@ -65,7 +65,7 @@ class TradingConfig:
     MARGIN_TYPE: Literal["ISOLATED", "CROSSED"] = "CROSSED"
     
     # Primary margin asset
-    MARGIN_ASSET: Literal["USDT", "USDF"] = "USDT"
+    MARGIN_ASSET: Literal["USDT", "USDF"] = "USDF"
 
 
 @dataclass
@@ -197,7 +197,7 @@ class BotConfig:
     DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() == "true"
     
     # Initial capital for the bot
-    INITIAL_CAPITAL_USDT: Decimal = Decimal("300.0")
+    INITIAL_CAPITAL_USDT: Decimal = Decimal("310.0")
     
     def validate(self) -> list[str]:
         """
