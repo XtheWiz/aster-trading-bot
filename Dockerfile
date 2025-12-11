@@ -28,7 +28,7 @@ COPY . .
 
 # Create volume mount point for SQLite (persistence)
 # Railway Volume should be mounted here via dashboard config
-VOLUME /app/data
+# VOLUME /app/data (Removed: Railway manages this via Dashboard)
 
 # Initial command (can be overridden by Railway Start Command)
 # Using python -u for unbuffered output to see logs immediately
