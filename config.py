@@ -59,9 +59,10 @@ class TradingConfig:
     # 2x is conservative, 3x is moderate - avoid 5x+ for grid trading
     LEVERAGE: int = 2
     
-    # Margin type: "ISOLATED" separates margin per position, "CROSSED" shares margin
-    # ISOLATED is safer for grid trading as losses are contained per position
-    MARGIN_TYPE: Literal["ISOLATED", "CROSSED"] = "ISOLATED"
+    # Margin type: ISOLATED or CROSSED
+    # For Multi-Asset Mode (using USDF as collateral), CROSSED is required
+    # CROSSED also provides 20x Airdrop Multiplier benefit when using USDF
+    MARGIN_TYPE: Literal["ISOLATED", "CROSSED"] = "CROSSED"
     
     # Primary margin asset
     MARGIN_ASSET: Literal["USDT", "USDF"] = "USDT"

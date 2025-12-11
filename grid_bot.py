@@ -732,22 +732,42 @@ class GridBot:
                     logger.warning(f"Could not set leverage: {e}")
             
             # Set margin type
+            # Note: In Multi-Asset Mode, margin type is locked to CROSSED
+            # Error -4168 indicates we're in Multi-Asset mode and can't change
             try:
                 await self.client.set_margin_type(config.trading.SYMBOL, config.trading.MARGIN_TYPE)
                 logger.info(f"Margin type set to {config.trading.MARGIN_TYPE}")
             except AsterAPIError as e:
-                if "No need to change" not in str(e):
+                if "No need to change" not in str(e) and "-4168" not in str(e):
                     logger.warning(f"Could not set margin type: {e}")
+                elif "-4168" in str(e):
+                    logger.info("Multi-Asset Mode detected - margin type is managed by exchange")
             
-            # Get initial balance
+            # Get initial balance (check both USDT and USDF for Multi-Asset Mode)
             balances = await self.client.get_account_balance()
+            usdt_balance = Decimal("0")
+            usdf_balance = Decimal("0")
+            
             for balance in balances:
-                if balance.get("asset") == config.trading.MARGIN_ASSET:
+                asset = balance.get("asset", "")
+                if asset == "USDT":
+                    usdt_balance = Decimal(balance.get("availableBalance", "0"))
+                elif asset == "USDF":
+                    usdf_balance = Decimal(balance.get("availableBalance", "0"))
+                    
+                # Set primary balance based on config
+                if asset == config.trading.MARGIN_ASSET:
                     self.state.initial_balance = Decimal(balance.get("balance", "0"))
                     self.state.current_balance = Decimal(balance.get("availableBalance", "0"))
-                    break
             
             logger.info(f"Initial balance: {self.state.initial_balance} {config.trading.MARGIN_ASSET}")
+            
+            # USDF Recommendation Warning (for Airdrop optimization)
+            if usdt_balance > Decimal("10") and usdf_balance < Decimal("10"):
+                logger.critical(
+                    "🚨 AIRDROP ALERT: You have USDT but no USDF! "
+                    "Swap USDT to USDF on AsterDEX for 20x Airdrop Multiplier!"
+                )
             
             # Get current price and calculate grid
             ticker = await self.client.get_ticker_price()
