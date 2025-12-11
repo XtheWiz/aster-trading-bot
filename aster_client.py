@@ -231,11 +231,18 @@ class AsterClient:
         session = await self._ensure_session()
         params = params or {}
         
-        # Add signature for authenticated endpoints
         if signed:
+            # For signed requests, we MUST ensure the query string sent is EXACTLY
+            # what we signed. aiohttp might reorder params or encode differently.
+            # So we construct the URL manually.
             params = self._add_auth_params(params.copy())
-        
-        url = f"{self.base_url}{endpoint}"
+            query_string = urlencode(sorted(params.items()))
+            url = f"{self.base_url}{endpoint}?{query_string}"
+            request_params = None # Already in URL
+        else:
+            url = f"{self.base_url}{endpoint}"
+            request_params = params
+
         headers = {"X-MBX-APIKEY": self.api_key} if self.api_key else {}
         
         # Rate limit backoff - respect previous limit
@@ -254,8 +261,7 @@ class AsterClient:
                 async with session.request(
                     method,
                     url,
-                    params=params if method == "GET" else None,
-                    data=params if method != "GET" else None,
+                    params=request_params, # Only for unsigned (GET/POST)
                     headers=headers,
                 ) as response:
                     # Reset backoff on successful request
