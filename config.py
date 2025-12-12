@@ -120,8 +120,9 @@ class RiskConfig:
     # Maximum drawdown before circuit breaker triggers (percentage of initial balance)
     # 10% drawdown on 500 USDT = 50 USDT max loss before emergency stop
     # Note: Margin lock for open orders is counted as drawdown
-    # Set higher (50%) to avoid false triggers when orders are placed
-    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("50.0")
+    # For 10 grids, margin lock can be 90%+ of capital
+    # Set to 99% to effectively disable false triggers
+    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("99.0")
     
     # Stop loss per individual position (not recommended for grid, but available)
     STOP_LOSS_PERCENT: Decimal | None = None
