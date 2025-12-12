@@ -52,8 +52,8 @@ class TradingConfig:
     - With 500 USDT capital, 2x leverage gives effective 1000 USDT buying power
       while maintaining safe distance from liquidation price
     """
-    # Trading symbol - ASTERUSDT is Aster DEX's native token pair
-    SYMBOL: str = "BTCUSDT"
+    # Trading symbol - ASTERUSDT for higher Airdrop points (until Dec 14)
+    SYMBOL: str = "ASTERUSDT"
     
     # Leverage multiplier - LOW to avoid liquidation during extended runs
     # 2x is conservative, 3x is moderate - avoid 5x+ for grid trading
@@ -86,7 +86,7 @@ class GridConfig:
         levels = [85500, 86500, 87500, ..., 94500]
     """
     # Number of grid levels (total buy + sell orders)
-    GRID_COUNT: int = 8
+    GRID_COUNT: int = 10
     
     # Price boundaries - will be calculated dynamically based on current price
     # if not specified (using GRID_RANGE_PERCENT)
@@ -101,8 +101,8 @@ class GridConfig:
     # Quantity per grid level (in quote currency value, e.g., USDT)
     # With 300 USDT capital, 2x leverage = 600 USDT effective
     # Divided across ~5 active grids = ~120 USDT per grid is aggressive
-    # Using ~35 USDT per    # For BTC at ~$90,000, minimum ~50 USDF per grid to meet lot size (0.001 BTC)
-    QUANTITY_PER_GRID_USDT: Decimal = Decimal("50.0")
+    # Using ~35 USDT per    # For ASTER at ~$0.95, 30 USDF per grid is optimal
+    QUANTITY_PER_GRID_USDT: Decimal = Decimal("30.0")
     
     # Maximum number of open orders allowed
     MAX_OPEN_ORDERS: int = 20
