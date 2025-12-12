@@ -55,9 +55,9 @@ class TradingConfig:
     # Trading symbol - ASTERUSDT for higher Airdrop points (until Dec 14)
     SYMBOL: str = "ASTERUSDT"
     
-    # Leverage multiplier - LOW to avoid liquidation during extended runs
-    # 2x is conservative, 3x is moderate - avoid 5x+ for grid trading
-    LEVERAGE: int = 2
+    # Leverage multiplier - 3x is balanced between profit and risk
+    # Higher leverage = more profit per grid but closer to liquidation
+    LEVERAGE: int = 3
     
     # Margin type: ISOLATED or CROSSED
     # For Multi-Asset Mode (using USDF as collateral), CROSSED is required
