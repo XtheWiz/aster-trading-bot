@@ -86,7 +86,7 @@ class GridConfig:
         levels = [85500, 86500, 87500, ..., 94500]
     """
     # Number of grid levels (total buy + sell orders)
-    GRID_COUNT: int = 6
+    GRID_COUNT: int = 8
     
     # Price boundaries - will be calculated dynamically based on current price
     # if not specified (using GRID_RANGE_PERCENT)
@@ -94,9 +94,9 @@ class GridConfig:
     UPPER_PRICE: Decimal | None = None
     
     # If LOWER/UPPER not set, use this percentage range around current price
-    # ±15% means grid spans from -15% to +15% of entry price
-    # Widened from 5% to 15% to handle high volatility conditions
-    GRID_RANGE_PERCENT: Decimal = Decimal("15.0")
+    # ±10% means grid spans from -10% to +10% of entry price
+    # Balanced: 10% range with 8 grids = ~2.8% step (good for normal volatility)
+    GRID_RANGE_PERCENT: Decimal = Decimal("10.0")
     
     # Quantity per grid level (in quote currency value, e.g., USDT)
     # With 300 USDT capital, 2x leverage = 600 USDT effective
