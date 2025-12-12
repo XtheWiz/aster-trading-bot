@@ -9,6 +9,7 @@ Usage:
     python cli.py price [symbol]   - Get current price
     python cli.py orders [symbol]  - List open orders
     python cli.py positions        - List open positions
+    python cli.py analyze [symbol] - Analyze market trend & conditions
     python cli.py test             - Test API connection
 """
 import asyncio
@@ -147,6 +148,75 @@ async def cmd_test():
         await client.close()
 
 
+async def cmd_analyze(symbol: str = None):
+    """Analyze market trend and conditions for a symbol."""
+    from strategy_manager import StrategyManager
+    
+    symbol = symbol or config.trading.SYMBOL
+    print(f"📊 Analyzing {symbol}...")
+    
+    client = AsterClient()
+    sm = StrategyManager(client)
+    
+    try:
+        analysis = await sm.analyze_market(symbol)
+        
+        price = float(analysis.current_price)
+        atr = float(analysis.atr_value)
+        atr_pct = (atr / price) * 100 if price > 0 else 0
+        
+        # Determine direction
+        trend = analysis.trend_direction
+        if trend == "UP":
+            direction = "🟢 BULLISH (ขาขึ้น)"
+            recommendation = "พิจารณาเปิด LONG หรือรอ Buy Grid Fill"
+        elif trend == "DOWN":
+            direction = "🔴 BEARISH (ขาลง)"
+            recommendation = "พิจารณาเปิด SHORT หรือรอ Sell Grid Fill"
+        else:
+            direction = "🟡 FLAT (Sideways)"
+            recommendation = "เหมาะสำหรับ Grid Trading (แกว่งตัวในกรอบ)"
+        
+        # Market state description
+        state = analysis.state.value
+        if "VOLATILE" in state:
+            state_desc = "⚠️ ผันผวนสูง - ระวังความเสี่ยง"
+        elif "STABLE" in state:
+            state_desc = "✅ เสถียร - เหมาะกับ Grid Trading"
+        elif "TRENDING" in state:
+            state_desc = "📈 มีเทรนด์ชัดเจน - Grid อาจ Fill ข้างเดียว"
+        else:
+            state_desc = state
+        
+        print("\n" + "=" * 60)
+        print(f"📈 MARKET ANALYSIS: {symbol}")
+        print("=" * 60)
+        print(f"\n💰 Price:      ${price:.4f}")
+        print(f"📊 ATR (14h):  ${atr:.4f} ({atr_pct:.2f}%)")
+        print(f"🎯 Trend:      {direction}")
+        print(f"🌡️  State:      {state_desc}")
+        print(f"📐 Volatility: {analysis.volatility_score:.2f}%")
+        
+        print("\n" + "-" * 60)
+        print("💡 RECOMMENDATION:")
+        print(f"   {recommendation}")
+        
+        # Grid suitability
+        if state == "RANGING_STABLE":
+            print("\n✅ Grid Trading: เหมาะสมมาก (ตลาดแกว่งตัวในกรอบ)")
+        elif state == "RANGING_VOLATILE":
+            print("\n⚠️ Grid Trading: เหมาะสม แต่ระวัง Volatility สูง")
+        elif "TRENDING" in state:
+            print("\n⚠️ Grid Trading: ไม่เหมาะ (ตลาดมี Trend ชัดเจน)")
+        
+        print("=" * 60)
+        
+    except Exception as e:
+        print(f"\n❌ Analysis failed: {e}")
+    finally:
+        await client.close()
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -165,6 +235,8 @@ def main():
         asyncio.run(cmd_positions())
     elif cmd == "test":
         asyncio.run(cmd_test())
+    elif cmd == "analyze":
+        asyncio.run(cmd_analyze(arg))
     else:
         print(f"❌ Unknown command: {cmd}")
         print(__doc__)
@@ -172,3 +244,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
