@@ -100,20 +100,20 @@ async def cmd_positions():
             print("\n✅ No open positions")
             return
         
-        print("\n" + "=" * 90)
-        print("SYMBOL".ljust(12) + "SIDE".ljust(8) + "SIZE".rjust(12) + 
-              "ENTRY".rjust(12) + "MARK".rjust(12) + "PNL".rjust(15) + "LIQ".rjust(12))
-        print("=" * 90)
+        print("\n" + "=" * 120)
+        print("SYMBOL".ljust(12) + "SIDE".ljust(12) + "SIZE".rjust(12) + 
+              "ENTRY".rjust(20) + "MARK".rjust(20) + "PNL".rjust(20) + "LIQ".rjust(20))
+        print("=" * 120)
         
         for p in active:
             amt = Decimal(p['positionAmt'])
             side = "LONG" if amt > 0 else "SHORT"
             pnl = p.get('unRealizedProfit', '0')
-            print(f"{p['symbol'].ljust(12)}{side.ljust(8)}{str(amt).rjust(12)}"
-                  f"{p['entryPrice'].rjust(12)}{p['markPrice'].rjust(12)}"
-                  f"{pnl.rjust(15)}{p.get('liquidationPrice', 'N/A').rjust(12)}")
+            print(f"{p['symbol'].ljust(12)}{side.ljust(12)}{str(amt).rjust(12)}"
+                  f"{p['entryPrice'].rjust(20)}{p['markPrice'].rjust(20)}"
+                  f"{pnl.rjust(20)}{p.get('liquidationPrice', 'N/A').rjust(20)}")
         
-        print("=" * 90)
+        print("=" * 120)
     finally:
         await client.close()
 
