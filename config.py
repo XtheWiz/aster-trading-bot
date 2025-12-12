@@ -85,8 +85,8 @@ class GridConfig:
         lower = 85,500, upper = 94,500, step = 1,000
         levels = [85500, 86500, 87500, ..., 94500]
     """
-    # Number of grid levels (total buy + sell orders)
-    GRID_COUNT: int = 10
+    # 6 grids with 30 USDF = ~180 margin lock (58% of 310 capital)
+    GRID_COUNT: int = 6
     
     # Price boundaries - will be calculated dynamically based on current price
     # if not specified (using GRID_RANGE_PERCENT)
@@ -120,9 +120,8 @@ class RiskConfig:
     # Maximum drawdown before circuit breaker triggers (percentage of initial balance)
     # 10% drawdown on 500 USDT = 50 USDT max loss before emergency stop
     # Note: Margin lock for open orders is counted as drawdown
-    # For 10 grids, margin lock can be 90%+ of capital
-    # Set to 99% to effectively disable false triggers
-    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("99.0")
+    # 6 grids = ~58% margin lock, so 80% threshold is safe
+    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("80.0")
     
     # Stop loss per individual position (not recommended for grid, but available)
     STOP_LOSS_PERCENT: Decimal | None = None
