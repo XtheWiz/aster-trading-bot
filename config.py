@@ -55,9 +55,9 @@ class TradingConfig:
     # Trading symbol - ASTERUSDT for higher Airdrop points (until Dec 14)
     SYMBOL: str = "ASTERUSDT"
     
-    # Leverage multiplier - 3x is balanced between profit and risk
-    # Higher leverage = more profit per grid but closer to liquidation
-    LEVERAGE: int = 3
+    # Leverage multiplier - 5x for Aggressive Scalping (High Risk/High Reward)
+    # WARNING: Liquidation distance is ~20%. Monitor closely!
+    LEVERAGE: int = 5
     
     # Margin type: ISOLATED or CROSSED
     # For Multi-Asset Mode (using USDF as collateral), CROSSED is required
@@ -85,8 +85,8 @@ class GridConfig:
         lower = 85,500, upper = 94,500, step = 1,000
         levels = [85500, 86500, 87500, ..., 94500]
     """
-    # 6 grids with 30 USDF = ~180 margin lock (58% of 310 capital)
-    GRID_COUNT: int = 6
+    # 8 grids with 30 USDF = ~240 margin lock (77% of 310 capital) - SAFE
+    GRID_COUNT: int = 8
     
     # Price boundaries - will be calculated dynamically based on current price
     # if not specified (using GRID_RANGE_PERCENT)
@@ -95,8 +95,9 @@ class GridConfig:
     
     # If LOWER/UPPER not set, use this percentage range around current price
     # ±10% means grid spans from -10% to +10% of entry price
-    # Balanced: 10% range with 8 grids = ~2.8% step (good for normal volatility)
-    GRID_RANGE_PERCENT: Decimal = Decimal("10.0")
+    # Aggressive Scalping: ±5% range with 8 grids = ~1.4% step
+    # Tighter range protects against deep drawdowns with 5x leverage
+    GRID_RANGE_PERCENT: Decimal = Decimal("5.0")
     
     # Quantity per grid level (in quote currency value, e.g., USDT)
     # With 300 USDT capital, 2x leverage = 600 USDT effective
