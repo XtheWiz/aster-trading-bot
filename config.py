@@ -95,13 +95,13 @@ class GridConfig:
     
     # If LOWER/UPPER not set, use this percentage range around current price
     # ±10% means grid spans from -10% to +10% of entry price
-    # Aggressive Scalping: ±3% range = ~1.5% step per grid
-    # Tighter = faster fills + more frequent Take Profits
-    GRID_RANGE_PERCENT: Decimal = Decimal("3.0")
+    # Safe Range: ±5% = ~1.25% step per grid
+    # Wider range = less frequent fills but more stable
+    GRID_RANGE_PERCENT: Decimal = Decimal("5.0")
     
-    # Dynamic Grid Rebalancing: After each fill, recalculate grid from current price
-    # This makes grid "follow" the price instead of staying static
-    DYNAMIC_GRID_REBALANCE: bool = True
+    # Dynamic Grid Rebalancing: DISABLED for safety
+    # Static Grid prevents position accumulation during trends
+    DYNAMIC_GRID_REBALANCE: bool = False
     
     # Quantity per grid level (in quote currency value, e.g., USDT)
     # With 300 USDT capital, 2x leverage = 600 USDT effective
