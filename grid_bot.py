@@ -403,17 +403,20 @@ class GridBot:
         """
         Rebalance grid after an order fill.
         
-        Grid Trading Rebalancing Logic:
-        ===============================
+        Dynamic Grid Rebalancing (when DYNAMIC_GRID_REBALANCE=True):
+        ============================================================
+        After each fill:
+        1. Cancel all existing orders
+        2. Get current market price
+        3. Recalculate grid centered on current price
+        4. Place new grid orders
+        
+        This makes the grid "follow" the price, ideal for trending markets.
+        
+        Static Grid Rebalancing (when DYNAMIC_GRID_REBALANCE=False):
+        ============================================================
         - When BUY order fills: Place SELL at one grid step HIGHER
         - When SELL order fills: Place BUY at one grid step LOWER
-        
-        This creates the "grid trap" that captures profit from oscillation.
-        
-        Example:
-            BUY fills at 0.9500 -> Place SELL at 0.9600
-            Price rises to 0.9600, SELL fills -> Profit captured
-            Place BUY at 0.9500 again -> Ready for next cycle
         
         Args:
             filled_level: The grid level whose order just filled
@@ -422,6 +425,53 @@ class GridBot:
         filled_level.filled = True
         filled_level.order_id = None
         
+        # Check if Dynamic Grid Rebalancing is enabled
+        if getattr(config.grid, 'DYNAMIC_GRID_REBALANCE', False):
+            await self._dynamic_rebalance(filled_level)
+            return
+        
+        # Static Grid Rebalancing (original behavior)
+        await self._static_rebalance(filled_level)
+    
+    async def _dynamic_rebalance(self, filled_level: GridLevel) -> None:
+        """
+        Dynamic Grid: Cancel all orders and recalculate grid from current price.
+        """
+        filled_side = filled_level.side
+        logger.info(
+            f"🔄 DYNAMIC REBALANCE: {filled_side.value} filled @ {filled_level.price:.4f} | "
+            f"Trade #{self.state.total_trades}"
+        )
+        
+        try:
+            # Cancel all existing orders
+            await self.cancel_all_orders()
+            
+            # Get current market price
+            ticker = await self.client.get_ticker_price(config.trading.SYMBOL)
+            current_price = Decimal(ticker["price"])
+            
+            logger.info(f"🔄 DYNAMIC REBALANCE: Recalculating grid from ${current_price:.4f}")
+            
+            # Recalculate grid levels centered on current price
+            self.state.levels = self.calculate_grid_levels(current_price)
+            self.state.entry_price = current_price
+            
+            # Place new grid orders
+            await self.place_grid_orders()
+            
+            logger.info(
+                f"🔄 DYNAMIC REBALANCE: Complete! New grid: "
+                f"${self.state.lower_price:.4f} - ${self.state.upper_price:.4f}"
+            )
+            
+        except AsterAPIError as e:
+            logger.error(f"Dynamic rebalance failed: {e}")
+    
+    async def _static_rebalance(self, filled_level: GridLevel) -> None:
+        """
+        Static Grid: Place counter-order at existing grid level.
+        """
         # Calculate target level for counter-order
         if filled_level.side == OrderSide.BUY:
             # BUY filled -> place SELL one level up
