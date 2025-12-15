@@ -41,6 +41,7 @@ from config import config
 from aster_client import AsterClient, AsterAPIError
 from trade_logger import TradeLogger, create_trade_record, BalanceSnapshot
 from telegram_notifier import TelegramNotifier
+from telegram_commands import TelegramCommandHandler
 from strategy_manager import StrategyManager
 
 # Configure logging with structured format
@@ -200,6 +201,7 @@ class GridBot:
         # Trade logging and notifications
         self.trade_logger = TradeLogger()
         self.telegram = TelegramNotifier()
+        self.telegram_commands = TelegramCommandHandler(bot_reference=self)
         self.strategy_manager = StrategyManager(self.client)
         self._session_id: int = 0
         self._last_hourly_summary = datetime.now()
@@ -847,6 +849,7 @@ class GridBot:
             )
             
             await self.telegram.start()
+            await self.telegram_commands.start()
             await self.telegram.send_bot_started(
                 symbol=config.trading.SYMBOL,
                 balance=self.state.initial_balance,
@@ -989,6 +992,7 @@ class GridBot:
             
             # Cleanup
             await self.telegram.stop()
+            await self.telegram_commands.stop()
             await self.trade_logger.close()
             
             logger.info("Bot shutdown complete")

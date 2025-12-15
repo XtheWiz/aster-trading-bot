@@ -55,9 +55,9 @@ class TradingConfig:
     # Trading symbol - SOLUSDT for long-term run (Post-Dec 15 Strategy)
     SYMBOL: str = "SOLUSDT"
     
-    # Leverage multiplier - 3x is balanced for SOL volatility
-    # Higher leverage = more profit per grid but closer to liquidation
-    LEVERAGE: int = 3
+    # Leverage multiplier - 5x for higher returns (Medium Risk)
+    # Liq distance ~20% - monitor closely during high volatility
+    LEVERAGE: int = 5
     
     # Margin type: ISOLATED or CROSSED
     # For Multi-Asset Mode (using USDF as collateral), CROSSED is required
@@ -104,10 +104,9 @@ class GridConfig:
     DYNAMIC_GRID_REBALANCE: bool = False
     
     # Quantity per grid level (in quote currency value, e.g., USDT)
-    # With 300 USDT capital, 2x leverage = 600 USDT effective
-    # Divided across ~5 active grids = ~120 USDT per grid is aggressive
-    # Using ~35 USDT per    # For ASTER at ~$0.95, 30 USDF per grid is optimal
-    QUANTITY_PER_GRID_USDT: Decimal = Decimal("30.0")
+    # For SOLUSDT at ~$140, 45 USDF per grid with 3x = ~1 SOL per grid
+    # Total margin usage: 45 * 8 / 3 = ~120 USDF (39% of 310 capital)
+    QUANTITY_PER_GRID_USDT: Decimal = Decimal("45.0")
     
     # Maximum number of open orders allowed
     MAX_OPEN_ORDERS: int = 20
@@ -126,7 +125,7 @@ class RiskConfig:
     # 10% drawdown on 500 USDT = 50 USDT max loss before emergency stop
     # Note: Margin lock for open orders is counted as drawdown
     # Stop bot if drawdown exceeds this percentage
-    # 50% drawdown threshold to prevent liquidation
+    # 80% threshold allows grid to work while preventing liquidation
     MAX_DRAWDOWN_PERCENT: Decimal = Decimal("80.0")
     
     # Stop loss per individual position (not recommended for grid, but available)

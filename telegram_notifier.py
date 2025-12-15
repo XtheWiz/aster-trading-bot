@@ -302,6 +302,122 @@ _Manual intervention required!_
 ⏰ *Time:* `{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}`
 """
         self.queue_message(message.strip())
+    
+    # =========================================================================
+    # ADVANCED MONITORING (5x Leverage)
+    # =========================================================================
+    
+    async def send_position_alert(
+        self,
+        symbol: str,
+        side: str,
+        size: Decimal,
+        entry_price: Decimal,
+        mark_price: Decimal,
+        liq_price: Decimal,
+        unrealized_pnl: Decimal,
+    ) -> None:
+        """Send position status alert with liquidation distance."""
+        pnl_emoji = "📈" if unrealized_pnl >= 0 else "📉"
+        
+        # Calculate liquidation distance
+        if side == "LONG":
+            liq_distance = ((mark_price - liq_price) / mark_price) * 100
+        else:
+            liq_distance = ((liq_price - mark_price) / mark_price) * 100
+        
+        # Warning level
+        if liq_distance < 10:
+            status = "🚨 DANGER"
+        elif liq_distance < 20:
+            status = "⚠️ WARNING"
+        else:
+            status = "✅ SAFE"
+        
+        message = f"""
+📊 *Position Update* {status}
+
+🎯 *Symbol:* `{symbol}`
+📍 *Side:* `{side}`
+📦 *Size:* `{size:.4f}`
+💵 *Entry:* `${entry_price:.4f}`
+📈 *Mark:* `${mark_price:.4f}`
+💀 *Liq Price:* `${liq_price:.4f}`
+📏 *Liq Distance:* `{liq_distance:.1f}%`
+{pnl_emoji} *uPnL:* `{unrealized_pnl:+.4f} USDT`
+"""
+        self.queue_message(message.strip())
+    
+    async def send_drawdown_warning(
+        self,
+        current_drawdown: Decimal,
+        max_drawdown: Decimal,
+        current_balance: Decimal,
+        initial_balance: Decimal,
+    ) -> None:
+        """Send drawdown warning when approaching threshold."""
+        pct_of_max = (current_drawdown / max_drawdown) * 100
+        
+        if pct_of_max >= 90:
+            status = "🚨 CRITICAL"
+        elif pct_of_max >= 75:
+            status = "⚠️ HIGH"
+        else:
+            status = "📊 MODERATE"
+        
+        message = f"""
+{status} *Drawdown Alert*
+
+📉 *Current Drawdown:* `{current_drawdown:.2f}%`
+🎯 *Max Threshold:* `{max_drawdown:.2f}%`
+📊 *% of Max:* `{pct_of_max:.1f}%`
+💰 *Current Balance:* `${current_balance:.2f}`
+💵 *Initial Balance:* `${initial_balance:.2f}`
+⏰ *Time:* `{datetime.now().strftime("%H:%M:%S")}`
+
+_Monitor closely! Bot will stop at {max_drawdown}%_
+"""
+        self.queue_message(message.strip())
+    
+    async def send_daily_report(
+        self,
+        symbol: str,
+        total_trades: int,
+        realized_pnl: Decimal,
+        unrealized_pnl: Decimal,
+        current_balance: Decimal,
+        initial_balance: Decimal,
+        win_rate: Decimal,
+        runtime_hours: float,
+    ) -> None:
+        """Send daily performance report."""
+        total_pnl = realized_pnl + unrealized_pnl
+        roi = ((current_balance - initial_balance) / initial_balance) * 100
+        
+        pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
+        roi_emoji = "📈" if roi >= 0 else "📉"
+        
+        message = f"""
+📅 *Daily Report* - {datetime.now().strftime("%Y-%m-%d")}
+
+🎯 *Symbol:* `{symbol}`
+⏱️ *Runtime:* `{runtime_hours:.1f} hours`
+
+📊 *Performance:*
+├ 🔄 Total Trades: `{total_trades}`
+├ 🎯 Win Rate: `{win_rate:.1f}%`
+├ 💵 Realized PnL: `{realized_pnl:+.4f}`
+├ 💭 Unrealized PnL: `{unrealized_pnl:+.4f}`
+└ {pnl_emoji} Total PnL: `{total_pnl:+.4f} USDT`
+
+💰 *Balance:*
+├ Initial: `${initial_balance:.2f}`
+├ Current: `${current_balance:.2f}`
+└ {roi_emoji} ROI: `{roi:+.2f}%`
+
+_Keep grinding! 💪_
+"""
+        self.queue_message(message.strip())
 
 
 # Convenience function for quick send
