@@ -52,12 +52,12 @@ class TradingConfig:
     - With 500 USDT capital, 2x leverage gives effective 1000 USDT buying power
       while maintaining safe distance from liquidation price
     """
-    # Trading symbol - ASTERUSDT for higher Airdrop points (until Dec 14)
-    SYMBOL: str = "ASTERUSDT"
+    # Trading symbol - SOLUSDT for long-term run (Post-Dec 15 Strategy)
+    SYMBOL: str = "SOLUSDT"
     
-    # Leverage multiplier - 5x for Aggressive Scalping (High Risk/High Reward)
-    # WARNING: Liquidation distance is ~20%. Monitor closely!
-    LEVERAGE: int = 5
+    # Leverage multiplier - 3x is balanced for SOL volatility
+    # Higher leverage = more profit per grid but closer to liquidation
+    LEVERAGE: int = 3
     
     # Margin type: ISOLATED or CROSSED
     # For Multi-Asset Mode (using USDF as collateral), CROSSED is required
@@ -85,7 +85,7 @@ class GridConfig:
         lower = 85,500, upper = 94,500, step = 1,000
         levels = [85500, 86500, 87500, ..., 94500]
     """
-    # 8 grids with 30 USDF = ~240 margin lock (77% of 310 capital) - SAFE
+    # 8 grids is standard for this range
     GRID_COUNT: int = 8
     
     # Price boundaries - will be calculated dynamically based on current price
@@ -95,9 +95,9 @@ class GridConfig:
     
     # If LOWER/UPPER not set, use this percentage range around current price
     # ±10% means grid spans from -10% to +10% of entry price
-    # Safe Range: ±5% = ~1.25% step per grid
-    # Wider range = less frequent fills but more stable
-    GRID_RANGE_PERCENT: Decimal = Decimal("5.0")
+    # Safe Range: ±15% for SOL (~$125 - $160)
+    # Wider range to capture SOL's larger swings
+    GRID_RANGE_PERCENT: Decimal = Decimal("15.0")
     
     # Dynamic Grid Rebalancing: DISABLED for safety
     # Static Grid prevents position accumulation during trends
