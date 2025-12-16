@@ -95,9 +95,9 @@ class GridConfig:
     
     # If LOWER/UPPER not set, use this percentage range around current price
     # ±10% means grid spans from -10% to +10% of entry price
-    # Safe Range: ±15% for SOL (~$125 - $160)
-    # Wider range to capture SOL's larger swings
-    GRID_RANGE_PERCENT: Decimal = Decimal("15.0")
+    # Safe Range: ±25% for SOL (~$96 - $160) - Extended for 4-day offline safety
+    # Wider range to survive volatility without monitoring
+    GRID_RANGE_PERCENT: Decimal = Decimal("25.0")
     
     # Dynamic Grid Rebalancing: DISABLED for safety
     # Static Grid prevents position accumulation during trends
