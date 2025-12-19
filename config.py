@@ -55,9 +55,9 @@ class TradingConfig:
     # Trading symbol - SOLUSDT for long-term run (Post-Dec 15 Strategy)
     SYMBOL: str = "SOLUSDT"
     
-    # Leverage multiplier - 5x for higher returns (Medium Risk)
-    # Liq distance ~20% - monitor closely during high volatility
-    LEVERAGE: int = 5
+    # Leverage multiplier - 2x for Super Safe Mode (High Volatility Period)
+    # BOJ Rate Decision + Weekend = Play it safe
+    LEVERAGE: int = 2
     
     # Margin type: ISOLATED or CROSSED
     # For Multi-Asset Mode (using USDF as collateral), CROSSED is required
@@ -85,8 +85,8 @@ class GridConfig:
         lower = 85,500, upper = 94,500, step = 1,000
         levels = [85500, 86500, 87500, ..., 94500]
     """
-    # 8 grids is standard for this range
-    GRID_COUNT: int = 8
+    # 6 grids for Super Safe Mode - less margin lock
+    GRID_COUNT: int = 6
     
     # Price boundaries - will be calculated dynamically based on current price
     # if not specified (using GRID_RANGE_PERCENT)
@@ -95,18 +95,17 @@ class GridConfig:
     
     # If LOWER/UPPER not set, use this percentage range around current price
     # ±10% means grid spans from -10% to +10% of entry price
-    # Safe Range: ±25% for SOL (~$96 - $160) - Extended for 4-day offline safety
-    # Wider range to survive volatility without monitoring
-    GRID_RANGE_PERCENT: Decimal = Decimal("25.0")
+    # Super Safe Range: ±30% for high volatility (~$83 - $154)
+    # Very wide range to survive BOJ + Weekend volatility
+    GRID_RANGE_PERCENT: Decimal = Decimal("30.0")
     
     # Dynamic Grid Rebalancing: DISABLED for safety
     # Static Grid prevents position accumulation during trends
     DYNAMIC_GRID_REBALANCE: bool = False
     
-    # Quantity per grid level (in quote currency value, e.g., USDT)
-    # For SOLUSDT at ~$140, 45 USDF per grid with 3x = ~1 SOL per grid
-    # Total margin usage: 45 * 8 / 3 = ~120 USDF (39% of 310 capital)
-    QUANTITY_PER_GRID_USDT: Decimal = Decimal("45.0")
+    # Quantity per grid level - Reduced for Super Safe Mode
+    # 30 USDF per grid with 2x = smaller positions
+    QUANTITY_PER_GRID_USDT: Decimal = Decimal("30.0")
     
     # Maximum number of open orders allowed
     MAX_OPEN_ORDERS: int = 20
@@ -125,8 +124,8 @@ class RiskConfig:
     # 10% drawdown on 500 USDT = 50 USDT max loss before emergency stop
     # Note: Margin lock for open orders is counted as drawdown
     # Stop bot if drawdown exceeds this percentage
-    # 80% threshold allows grid to work while preventing liquidation
-    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("80.0")
+    # 50% threshold for Super Safe Mode - stop earlier
+    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("50.0")
     
     # Stop loss per individual position (not recommended for grid, but available)
     STOP_LOSS_PERCENT: Decimal | None = None
