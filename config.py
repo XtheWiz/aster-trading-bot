@@ -55,9 +55,9 @@ class TradingConfig:
     # Trading symbol - SOLUSDT for long-term run (Post-Dec 15 Strategy)
     SYMBOL: str = "SOLUSDT"
     
-    # Leverage multiplier - 2x for Super Safe Mode (High Volatility Period)
-    # BOJ Rate Decision + Weekend = Play it safe
-    LEVERAGE: int = 2
+    # Leverage multiplier - 5x for higher returns
+    # Market stabilized after BOJ, ready for normal operations
+    LEVERAGE: int = 5
     
     # Margin type: ISOLATED or CROSSED
     # For Multi-Asset Mode (using USDF as collateral), CROSSED is required
@@ -85,8 +85,8 @@ class GridConfig:
         lower = 85,500, upper = 94,500, step = 1,000
         levels = [85500, 86500, 87500, ..., 94500]
     """
-    # 6 grids for Super Safe Mode - less margin lock
-    GRID_COUNT: int = 6
+    # 8 grids for standard operation
+    GRID_COUNT: int = 8
     
     # Price boundaries - will be calculated dynamically based on current price
     # if not specified (using GRID_RANGE_PERCENT)
@@ -95,17 +95,17 @@ class GridConfig:
     
     # If LOWER/UPPER not set, use this percentage range around current price
     # ±10% means grid spans from -10% to +10% of entry price
-    # Super Safe Range: ±30% for high volatility (~$83 - $154)
-    # Very wide range to survive BOJ + Weekend volatility
-    GRID_RANGE_PERCENT: Decimal = Decimal("30.0")
+    # Standard Range: ±20% for SOL (~$100 - $150)
+    # Balanced range for post-BOJ stable market
+    GRID_RANGE_PERCENT: Decimal = Decimal("20.0")
     
     # Dynamic Grid Rebalancing: DISABLED for safety
     # Static Grid prevents position accumulation during trends
     DYNAMIC_GRID_REBALANCE: bool = False
     
-    # Quantity per grid level - Reduced for Super Safe Mode
-    # 30 USDF per grid with 2x = smaller positions
-    QUANTITY_PER_GRID_USDT: Decimal = Decimal("30.0")
+    # Quantity per grid level - Standard for 5x
+    # 45 USDF per grid with 5x = ~1.8 SOL per grid
+    QUANTITY_PER_GRID_USDT: Decimal = Decimal("45.0")
     
     # Maximum number of open orders allowed
     MAX_OPEN_ORDERS: int = 20
@@ -124,8 +124,8 @@ class RiskConfig:
     # 10% drawdown on 500 USDT = 50 USDT max loss before emergency stop
     # Note: Margin lock for open orders is counted as drawdown
     # Stop bot if drawdown exceeds this percentage
-    # 50% threshold for Super Safe Mode - stop earlier
-    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("50.0")
+    # 80% threshold for normal operations
+    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("80.0")
     
     # Stop loss per individual position (not recommended for grid, but available)
     STOP_LOSS_PERCENT: Decimal | None = None
