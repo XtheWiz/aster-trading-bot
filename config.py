@@ -55,9 +55,9 @@ class TradingConfig:
     # Trading symbol - SOLUSDT for long-term run (Post-Dec 15 Strategy)
     SYMBOL: str = "SOLUSDT"
     
-    # Leverage multiplier - 5x for higher returns
-    # Market stabilized after BOJ, ready for normal operations
-    LEVERAGE: int = 5
+    # Leverage multiplier - 10x AGGRESSIVE (1-2 day trial)
+    # ⚠️ HIGH RISK: Liq distance ~10%, monitor closely!
+    LEVERAGE: int = 10
     
     # Margin type: ISOLATED or CROSSED
     # For Multi-Asset Mode (using USDF as collateral), CROSSED is required
@@ -95,9 +95,9 @@ class GridConfig:
     
     # If LOWER/UPPER not set, use this percentage range around current price
     # ±10% means grid spans from -10% to +10% of entry price
-    # Standard Range: ±20% for SOL (~$100 - $150)
-    # Balanced range for post-BOJ stable market
-    GRID_RANGE_PERCENT: Decimal = Decimal("20.0")
+    # Tight Range: ±10% for 10x leverage (~$114 - $139)
+    # Narrower range required for high leverage safety
+    GRID_RANGE_PERCENT: Decimal = Decimal("10.0")
     
     # Dynamic Grid Rebalancing: DISABLED for safety
     # Static Grid prevents position accumulation during trends
