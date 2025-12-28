@@ -326,6 +326,36 @@ class TradeLogger:
             "total_pnl": row["total_pnl"] or 0,
         }
     
+    async def get_recent_trades(self, limit: int = 10) -> list[dict]:
+        """
+        Get recent trades from database.
+        
+        Args:
+            limit: Maximum number of trades to return
+            
+        Returns:
+            List of trade dictionaries
+        """
+        async with self._lock:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self._get_recent_trades, limit)
+    
+    def _get_recent_trades(self, limit: int) -> list[dict]:
+        """Get recent trades (sync)."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT timestamp, symbol, side, order_type, price, quantity, 
+                   order_id, status, pnl, grid_level
+            FROM trades
+            ORDER BY id DESC
+            LIMIT ?
+        """, (limit,))
+        
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+    
     async def close(self) -> None:
         """Close database connection."""
         if self._connection:

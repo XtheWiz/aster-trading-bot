@@ -150,6 +150,11 @@ class GridState:
         """Count of grid levels with active orders."""
         return sum(1 for level in self.levels if level.order_id is not None)
     
+    @property
+    def step_size(self) -> Decimal:
+        """Grid step size (alias for grid_step)."""
+        return self.grid_step
+    
     def get_level_by_order_id(self, order_id: int) -> GridLevel | None:
         """Find grid level by order ID."""
         for level in self.levels:
@@ -537,6 +542,67 @@ class GridBot:
         except AsterAPIError as e:
             logger.error(f"Failed to place rebalance order: {e}")
     
+    async def _handle_partial_fill(
+        self,
+        level: GridLevel,
+        side: str,
+        price: Decimal,
+        quantity: Decimal
+    ) -> None:
+        """
+        Handle partial fill by placing a TP order for the filled portion.
+        
+        This ensures we don't miss profit opportunities on partial fills.
+        The TP order is placed at the next grid level in the opposite direction.
+        
+        Args:
+            level: The grid level that was partially filled
+            side: BUY or SELL
+            price: Fill price
+            quantity: Filled quantity
+        """
+        try:
+            # Calculate TP price (next grid step in opposite direction)
+            grid_step = self.state.step_size
+            
+            if side == "BUY":
+                tp_price = price + grid_step
+                tp_side = "SELL"
+            else:
+                tp_price = price - grid_step
+                tp_side = "BUY"
+            
+            # Round price to tick size
+            tp_price = self._round_price(tp_price)
+            
+            # Check minimum notional
+            notional = quantity * tp_price
+            if notional < self.min_notional:
+                logger.info(f"Partial TP notional too small ({notional:.2f}), skipping")
+                return
+            
+            # Place TP order
+            client_order_id = f"partial_tp_{level.index}_{int(datetime.now().timestamp())}"
+            
+            response = await self.client.place_order(
+                symbol=config.trading.SYMBOL,
+                side=tp_side,
+                order_type="LIMIT",
+                quantity=quantity,
+                price=tp_price,
+                client_order_id=client_order_id,
+            )
+            
+            logger.info(
+                f"PARTIAL TP: {tp_side} {quantity} @ {tp_price:.4f} | "
+                f"OrderID: {response.get('orderId')}"
+            )
+            
+        except AsterAPIError as e:
+            logger.error(f"Failed to place partial TP order: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error in partial fill handler: {e}")
+    
     # =========================================================================
     # RISK MANAGEMENT
     # =========================================================================
@@ -657,7 +723,26 @@ class GridBot:
                 ))
             
             elif status == "PARTIALLY_FILLED":
-                logger.info(f"Order PARTIAL: {side} @ {price} | Qty: {exec_qty}")
+                exec_qty_decimal = Decimal(exec_qty or "0")
+                price_decimal = Decimal(price or "0")
+                notional = exec_qty_decimal * price_decimal
+                
+                logger.info(f"Order PARTIAL: {side} @ {price} | Qty: {exec_qty} | Notional: {notional:.2f}")
+                
+                # Only handle partial fill if significant enough (> min_notional)
+                if notional >= self.min_notional and level:
+                    # Log trade for this partial fill
+                    asyncio.create_task(self._log_and_notify_fill(
+                        side, price, exec_qty, level.index
+                    ))
+                    
+                    # Schedule a partial rebalance to place TP for filled portion
+                    # This creates a separate TP order for the partial fill
+                    asyncio.create_task(self._handle_partial_fill(
+                        level, side, price_decimal, exec_qty_decimal
+                    ))
+                else:
+                    logger.info(f"Partial fill too small ({notional:.2f} < {self.min_notional}), skipping TP")
     
     def on_position_update(self, position_data: dict) -> None:
         """Handle position update from WebSocket."""
@@ -831,6 +916,12 @@ class GridBot:
             
             logger.info(f"Current price: {current_price}")
             
+            # Cancel all existing orders before placing new grid
+            # This prevents duplicate orders on bot restart/redeploy
+            logger.info("Cancelling existing orders before placing new grid...")
+            await self.cancel_all_orders()
+            await asyncio.sleep(1)  # Wait for orders to be cancelled
+            
             # Calculate grid levels
             self.state.levels = self.calculate_grid_levels(current_price)
             
@@ -859,6 +950,9 @@ class GridBot:
             
             # Start Strategy Manager
             asyncio.create_task(self.strategy_manager.start_monitoring())
+            
+            # Start Daily Report Scheduler
+            asyncio.create_task(self._daily_report_scheduler())
             
             return True
             
@@ -916,6 +1010,54 @@ class GridBot:
                 self._last_hourly_summary = datetime.now()
             
             await asyncio.sleep(60)  # Check every minute
+    
+    async def _daily_report_scheduler(self) -> None:
+        """
+        Send daily performance report every 24 hours.
+        
+        Report includes:
+        - Total trades, PnL, ROI
+        - Win rate, current balance
+        - Runtime statistics
+        """
+        # Wait 24 hours before first report (or until 8:00 AM)
+        while not self._shutdown_event.is_set():
+            try:
+                # Calculate stats
+                runtime = datetime.now() - self.state.start_time if self.state.start_time else None
+                runtime_hours = runtime.total_seconds() / 3600 if runtime else 0
+                
+                # Get win rate from trade logger
+                win_rate = Decimal("0")
+                try:
+                    trades = await self.trade_logger.get_recent_trades(100)
+                    if trades:
+                        profits = [float(t.get('pnl', 0) or 0) for t in trades]
+                        wins = len([p for p in profits if p > 0])
+                        total = len([p for p in profits if p != 0])
+                        win_rate = Decimal(str(wins / total * 100)) if total > 0 else Decimal("0")
+                except Exception as e:
+                    logger.debug(f"Could not calculate win rate: {e}")
+                
+                # Send daily report
+                await self.telegram.send_daily_report(
+                    symbol=config.trading.SYMBOL,
+                    total_trades=self.state.total_trades,
+                    realized_pnl=self.state.realized_pnl,
+                    unrealized_pnl=self.state.unrealized_pnl,
+                    current_balance=self.state.current_balance,
+                    initial_balance=self.state.initial_balance,
+                    win_rate=win_rate,
+                    runtime_hours=runtime_hours,
+                )
+                
+                logger.info("Daily report sent via Telegram")
+                
+            except Exception as e:
+                logger.error(f"Failed to send daily report: {e}")
+            
+            # Wait 24 hours
+            await asyncio.sleep(86400)  # 24 hours
     
     async def run(self) -> None:
         """

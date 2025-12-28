@@ -68,6 +68,8 @@ class TelegramCommandHandler:
             "orders": self._cmd_orders,
             "pnl": self._cmd_pnl,
             "grid": self._cmd_grid,
+            "stats": self._cmd_stats,
+            "history": self._cmd_history,
             "help": self._cmd_help,
         }
     
@@ -202,7 +204,8 @@ class TelegramCommandHandler:
 🔹 /orders - Open orders
 🔹 /pnl - Profit & Loss
 🔹 /grid - Grid levels
-🔹 /help - This help message
+🔹 /stats - Trading statistics
+🔹 /history - Recent trades
 
 _Tip: Commands only work in the configured chat._
 """
@@ -416,6 +419,115 @@ _Tip: Commands only work in the configured chat._
             message += f"{emoji} `${level.price:.4f}` {status}\n"
         
         await self._send_message(message.strip())
+    
+    async def _cmd_stats(self) -> None:
+        """Show trading statistics."""
+        if not self.bot:
+            await self._send_message("❌ Bot reference not available")
+            return
+        
+        try:
+            state = self.bot.state
+            runtime = datetime.now() - state.start_time if state.start_time else None
+            
+            # Calculate stats
+            total_trades = state.total_trades
+            total_pnl = state.realized_pnl + state.unrealized_pnl
+            roi = (state.current_balance - state.initial_balance) / state.initial_balance * 100 if state.initial_balance > 0 else Decimal(0)
+            
+            # Get trades from database if available
+            win_count = 0
+            loss_count = 0
+            avg_profit = Decimal(0)
+            
+            if hasattr(self.bot, 'trade_logger') and self.bot.trade_logger:
+                try:
+                    trades = await self.bot.trade_logger.get_recent_trades(100)
+                    if trades:
+                        profits = [t.get('pnl', 0) or 0 for t in trades if t.get('pnl')]
+                        if profits:
+                            win_count = len([p for p in profits if p > 0])
+                            loss_count = len([p for p in profits if p < 0])
+                            avg_profit = Decimal(str(sum(profits) / len(profits)))
+                except Exception as e:
+                    logger.debug(f"Could not get trade stats: {e}")
+            
+            win_rate = (win_count / (win_count + loss_count) * 100) if (win_count + loss_count) > 0 else 0
+            runtime_str = str(runtime).split('.')[0] if runtime else "N/A"
+            
+            pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
+            roi_emoji = "📈" if roi >= 0 else "📉"
+            
+            message = f"""
+📊 *Trading Statistics*
+
+⏱️ *Runtime:* `{runtime_str}`
+🔢 *Total Trades:* `{total_trades}`
+
+💹 *Profit & Loss*
+{pnl_emoji} *Total PnL:* `{total_pnl:+.4f} USDT`
+{roi_emoji} *ROI:* `{roi:+.2f}%`
+
+📈 *Performance*
+✅ *Wins:* `{win_count}`
+❌ *Losses:* `{loss_count}`
+🎯 *Win Rate:* `{win_rate:.1f}%`
+💰 *Avg Profit:* `{avg_profit:+.4f} USDT`
+
+📊 *Current*
+💵 *Balance:* `${state.current_balance:.2f}`
+📉 *Drawdown:* `{state.drawdown_percent:.2f}%`
+"""
+            await self._send_message(message.strip())
+            
+        except Exception as e:
+            await self._send_message(f"❌ Error fetching stats: {e}")
+    
+    async def _cmd_history(self) -> None:
+        """Show recent trade history."""
+        if not self.bot:
+            await self._send_message("❌ Bot reference not available")
+            return
+        
+        try:
+            # Get recent trades from database
+            trades = []
+            if hasattr(self.bot, 'trade_logger') and self.bot.trade_logger:
+                trades = await self.bot.trade_logger.get_recent_trades(10)
+            
+            if not trades:
+                await self._send_message("📜 No trade history available")
+                return
+            
+            message = f"📜 *Recent Trades* ({len(trades)} shown)\n\n"
+            
+            for trade in trades[:10]:
+                side = trade.get('side', 'N/A')
+                price = Decimal(str(trade.get('price', 0)))
+                qty = Decimal(str(trade.get('quantity', 0)))
+                pnl = trade.get('pnl', 0) or 0
+                timestamp = trade.get('timestamp', '')
+                
+                side_emoji = "🟢" if side == "BUY" else "🔴"
+                pnl_emoji = "💰" if pnl > 0 else "💸" if pnl < 0 else "➖"
+                
+                # Format timestamp
+                if timestamp:
+                    try:
+                        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                        time_str = dt.strftime("%m/%d %H:%M")
+                    except:
+                        time_str = timestamp[:10] if len(timestamp) > 10 else timestamp
+                else:
+                    time_str = "N/A"
+                
+                message += f"{side_emoji} `{side}` `${price:.2f}` × `{qty:.3f}`\n"
+                message += f"   {pnl_emoji} PnL: `{pnl:+.4f}` | {time_str}\n\n"
+            
+            await self._send_message(message.strip())
+            
+        except Exception as e:
+            await self._send_message(f"❌ Error fetching history: {e}")
 
 
 # Test the command handler
