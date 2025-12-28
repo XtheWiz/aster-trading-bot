@@ -103,9 +103,9 @@ class GridConfig:
     # Static Grid prevents position accumulation during trends
     DYNAMIC_GRID_REBALANCE: bool = False
     
-    # Quantity per grid level - Standard for 5x
-    # 45 USDF per grid with 5x = ~1.8 SOL per grid
-    QUANTITY_PER_GRID_USDT: Decimal = Decimal("45.0")
+    # Quantity per grid level - Increased for $383 capital
+    # 55 USDF per grid with 10x = ~4.4 SOL per grid
+    QUANTITY_PER_GRID_USDT: Decimal = Decimal("55.0")
     
     # Maximum number of open orders allowed
     MAX_OPEN_ORDERS: int = 20
