@@ -85,8 +85,8 @@ class GridConfig:
         lower = 85,500, upper = 94,500, step = 1,000
         levels = [85500, 86500, 87500, ..., 94500]
     """
-    # 8 grids for standard operation
-    GRID_COUNT: int = 8
+    # 10 grids for faster TP (step ~$2.80 instead of ~$3.50)
+    GRID_COUNT: int = 10
     
     # Price boundaries - will be calculated dynamically based on current price
     # if not specified (using GRID_RANGE_PERCENT)
