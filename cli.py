@@ -217,6 +217,103 @@ async def cmd_analyze(symbol: str = None):
         await client.close()
 
 
+async def cmd_close_position(symbol: str = None):
+    """Close an open position for a symbol."""
+    symbol = symbol or config.trading.SYMBOL
+    
+    print(f"📉 Closing position for {symbol}...")
+    
+    client = AsterClient()
+    
+    try:
+        # Get current position
+        positions = await client.get_position_risk(symbol)
+        position = None
+        
+        for pos in positions:
+            if pos.get("symbol") == symbol:
+                size = float(pos.get("positionAmt", 0))
+                if size != 0:
+                    position = pos
+                    break
+        
+        if not position:
+            print(f"\n✅ No open position for {symbol}")
+            return
+        
+        size = float(position.get("positionAmt", 0))
+        entry = float(position.get("entryPrice", 0))
+        mark = float(position.get("markPrice", 0))
+        upnl = float(position.get("unrealizedProfit", 0))
+        
+        print(f"\n📊 Current Position:")
+        print(f"   Side: {'LONG' if size > 0 else 'SHORT'}")
+        print(f"   Size: {abs(size)}")
+        print(f"   Entry: ${entry:.4f}")
+        print(f"   Mark: ${mark:.4f}")
+        print(f"   uPnL: ${upnl:.2f}")
+        
+        # Close by placing opposite order
+        close_side = "SELL" if size > 0 else "BUY"
+        close_qty = abs(size)
+        
+        print(f"\n🔄 Placing {close_side} order for {close_qty} {symbol}...")
+        
+        result = await client.place_order(
+            symbol=symbol,
+            side=close_side,
+            quantity=Decimal(str(close_qty)),
+            order_type="MARKET"
+        )
+        
+        print(f"\n✅ Position closed!")
+        print(f"   Order ID: {result.get('orderId')}")
+        print(f"   Realized PnL: ~${upnl:.2f}")
+        
+    except Exception as e:
+        print(f"\n❌ Failed to close position: {e}")
+    finally:
+        await client.close()
+
+
+async def cmd_order(symbol: str, side: str, quantity: str, order_type: str = "MARKET", price: str = None):
+    """Place an order."""
+    symbol = symbol.upper()
+    side = side.upper()
+    order_type = order_type.upper()
+    
+    print(f"📝 Placing {side} {order_type} order for {quantity} {symbol}...")
+    
+    client = AsterClient()
+    
+    try:
+        kwargs = {
+            "symbol": symbol,
+            "side": side,
+            "quantity": Decimal(quantity),
+            "order_type": order_type,
+        }
+        
+        if price and order_type == "LIMIT":
+            kwargs["price"] = Decimal(price)
+        
+        result = await client.place_order(**kwargs)
+        
+        print(f"\n✅ Order placed!")
+        print(f"   Order ID: {result.get('orderId')}")
+        print(f"   Symbol: {symbol}")
+        print(f"   Side: {side}")
+        print(f"   Type: {order_type}")
+        print(f"   Quantity: {quantity}")
+        if price:
+            print(f"   Price: ${price}")
+        
+    except Exception as e:
+        print(f"\n❌ Failed to place order: {e}")
+    finally:
+        await client.close()
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -237,6 +334,21 @@ def main():
         asyncio.run(cmd_test())
     elif cmd == "analyze":
         asyncio.run(cmd_analyze(arg))
+    elif cmd == "close":
+        asyncio.run(cmd_close_position(arg))
+    elif cmd == "order":
+        # Usage: python cli.py order SOLUSDT BUY 1.0 [MARKET/LIMIT] [price]
+        if len(sys.argv) < 5:
+            print("Usage: python cli.py order SYMBOL SIDE QUANTITY [TYPE] [PRICE]")
+            print("Example: python cli.py order SOLUSDT BUY 1.0 MARKET")
+            print("Example: python cli.py order SOLUSDT SELL 1.0 LIMIT 130.00")
+            return
+        symbol = sys.argv[2]
+        side = sys.argv[3]
+        qty = sys.argv[4]
+        order_type = sys.argv[5] if len(sys.argv) > 5 else "MARKET"
+        price = sys.argv[6] if len(sys.argv) > 6 else None
+        asyncio.run(cmd_order(symbol, side, qty, order_type, price))
     else:
         print(f"❌ Unknown command: {cmd}")
         print(__doc__)

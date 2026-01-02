@@ -55,9 +55,9 @@ class TradingConfig:
     # Trading symbol - SOLUSDT for long-term run (Post-Dec 15 Strategy)
     SYMBOL: str = "SOLUSDT"
     
-    # Leverage multiplier - 10x AGGRESSIVE (1-2 day trial)
-    # ⚠️ HIGH RISK: Liq distance ~10%, monitor closely!
-    LEVERAGE: int = 10
+    # Leverage multiplier - 3x CONSERVATIVE (Safe Mode)
+    # Low risk: Liq distance ~33%, safer for grid trading
+    LEVERAGE: int = 3
     
     # Margin type: ISOLATED or CROSSED
     # For Multi-Asset Mode (using USDF as collateral), CROSSED is required
@@ -85,8 +85,8 @@ class GridConfig:
         lower = 85,500, upper = 94,500, step = 1,000
         levels = [85500, 86500, 87500, ..., 94500]
     """
-    # 10 grids for faster TP (step ~$2.80 instead of ~$3.50)
-    GRID_COUNT: int = 10
+    # 12 grids for more frequent, smaller profits
+    GRID_COUNT: int = 12
     
     # Price boundaries - will be calculated dynamically based on current price
     # if not specified (using GRID_RANGE_PERCENT)
@@ -95,17 +95,17 @@ class GridConfig:
     
     # If LOWER/UPPER not set, use this percentage range around current price
     # ±10% means grid spans from -10% to +10% of entry price
-    # Tight Range: ±10% for 10x leverage (~$114 - $139)
-    # Narrower range required for high leverage safety
-    GRID_RANGE_PERCENT: Decimal = Decimal("10.0")
+    # Conservative Range: ±8% for 3x leverage (~$121 - $142)
+    # Based on current S/R levels from TradingView
+    GRID_RANGE_PERCENT: Decimal = Decimal("8.0")
     
     # Dynamic Grid Rebalancing: DISABLED for safety
     # Static Grid prevents position accumulation during trends
     DYNAMIC_GRID_REBALANCE: bool = False
     
-    # Quantity per grid level - Increased for $383 capital
-    # 55 USDF per grid with 10x = ~4.4 SOL per grid
-    QUANTITY_PER_GRID_USDT: Decimal = Decimal("55.0")
+    # Quantity per grid level - Conservative for low-risk trading
+    # 25 USDF per grid with 3x = ~0.6 SOL per grid (small position)
+    QUANTITY_PER_GRID_USDT: Decimal = Decimal("25.0")
     
     # Maximum number of open orders allowed
     MAX_OPEN_ORDERS: int = 20
@@ -124,8 +124,8 @@ class RiskConfig:
     # 10% drawdown on 500 USDT = 50 USDT max loss before emergency stop
     # Note: Margin lock for open orders is counted as drawdown
     # Stop bot if drawdown exceeds this percentage
-    # 80% threshold for normal operations
-    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("80.0")
+    # 50% threshold for conservative mode - stop early if losing
+    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("50.0")
     
     # Stop loss per individual position (not recommended for grid, but available)
     STOP_LOSS_PERCENT: Decimal | None = None
