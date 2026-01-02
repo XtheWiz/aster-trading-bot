@@ -269,6 +269,16 @@ class GridBot:
                 # At current price - skip or use as reference
                 side = None
             
+            # Filter by GRID_SIDE config
+            # LONG mode: only BUY orders (for bullish markets)
+            # SHORT mode: only SELL orders (for bearish markets)
+            # BOTH mode: traditional grid with both sides
+            grid_side = config.grid.GRID_SIDE
+            if grid_side == "LONG" and side == OrderSide.SELL:
+                side = None  # Skip SELL orders in LONG mode
+            elif grid_side == "SHORT" and side == OrderSide.BUY:
+                side = None  # Skip BUY orders in SHORT mode
+            
             levels.append(GridLevel(
                 index=i,
                 price=price,
@@ -490,6 +500,15 @@ class GridBot:
             target_index = filled_level.index - 1
             new_side = OrderSide.BUY
             log_action = "SELL filled -> placing BUY"
+        
+        # Check GRID_SIDE config - skip counter-orders that violate the config
+        grid_side = config.grid.GRID_SIDE
+        if grid_side == "LONG" and new_side == OrderSide.SELL:
+            logger.info(f"LONG mode: Skipping SELL counter-order after BUY fill")
+            return
+        elif grid_side == "SHORT" and new_side == OrderSide.BUY:
+            logger.info(f"SHORT mode: Skipping BUY counter-order after SELL fill")
+            return
         
         # Validate target level exists
         if target_index < 0 or target_index >= len(self.state.levels):

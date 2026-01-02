@@ -103,6 +103,13 @@ class GridConfig:
     # Static Grid prevents position accumulation during trends
     DYNAMIC_GRID_REBALANCE: bool = False
     
+    # Grid Side: "BOTH", "LONG", or "SHORT"
+    # BOTH = traditional grid (BUY below price, SELL above price)
+    # LONG = only BUY orders (for bullish market)
+    # SHORT = only SELL orders (for bearish market)
+    # Currently: LONG-only for bullish trend (Strong Buy signal)
+    GRID_SIDE: Literal["BOTH", "LONG", "SHORT"] = "LONG"
+    
     # Quantity per grid level - Conservative for low-risk trading
     # 25 USDF per grid with 3x = ~0.6 SOL per grid (small position)
     QUANTITY_PER_GRID_USDT: Decimal = Decimal("25.0")
