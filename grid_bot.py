@@ -1054,6 +1054,9 @@ class GridBot:
             # Start Daily Report Scheduler
             asyncio.create_task(self._daily_report_scheduler())
             
+            # Start Auto Re-Grid Monitor
+            asyncio.create_task(self._auto_regrid_monitor())
+            
             return True
             
         except Exception as e:
@@ -1110,6 +1113,91 @@ class GridBot:
                 self._last_hourly_summary = datetime.now()
             
             await asyncio.sleep(60)  # Check every minute
+    
+    async def _auto_regrid_monitor(self) -> None:
+        """
+        Monitor price drift and automatically reposition grid when needed.
+        
+        Logic:
+        1. Run every REGRID_CHECK_INTERVAL_MINUTES
+        2. Calculate grid center from current levels
+        3. If price drift > REGRID_THRESHOLD_PERCENT, trigger re-grid
+        """
+        if not config.grid.AUTO_REGRID_ENABLED:
+            logger.info("Auto Re-Grid is disabled")
+            return
+        
+        interval_seconds = config.grid.REGRID_CHECK_INTERVAL_MINUTES * 60
+        threshold = float(config.grid.REGRID_THRESHOLD_PERCENT)
+        
+        logger.info(
+            f"Auto Re-Grid Monitor started: checking every {config.grid.REGRID_CHECK_INTERVAL_MINUTES} min, "
+            f"threshold {threshold}%"
+        )
+        
+        while not self._shutdown_event.is_set():
+            try:
+                # Wait for interval
+                await asyncio.sleep(interval_seconds)
+                
+                if self._shutdown_event.is_set():
+                    break
+                
+                # Calculate grid center
+                if not self.state.levels:
+                    continue
+                
+                grid_center = (self.state.lower_price + self.state.upper_price) / 2
+                
+                # Get current price
+                ticker = await self.client.get_ticker_price(config.trading.SYMBOL)
+                current_price = Decimal(str(ticker.get("price", 0)))
+                
+                if current_price == 0:
+                    continue
+                
+                # Calculate drift percentage
+                drift = abs(current_price - grid_center) / grid_center * 100
+                
+                logger.info(
+                    f"Re-Grid Check: Price ${current_price:.2f} | "
+                    f"Grid Center ${grid_center:.2f} | Drift {drift:.2f}%"
+                )
+                
+                if drift > Decimal(str(threshold)):
+                    logger.warning(
+                        f"🔄 RE-GRID TRIGGERED: Drift {drift:.2f}% > {threshold}%"
+                    )
+                    
+                    # Send Telegram notification
+                    await self.telegram.send_message(
+                        f"🔄 Auto Re-Grid Triggered!\n"
+                        f"Price: ${current_price:.2f}\n"
+                        f"Grid Center: ${grid_center:.2f}\n"
+                        f"Drift: {drift:.2f}%"
+                    )
+                    
+                    # Cancel all orders
+                    await self.cancel_all_orders()
+                    
+                    # Recalculate grid centered on current price
+                    self.state.entry_price = current_price
+                    self.state.levels = self.calculate_grid_levels(current_price)
+                    
+                    # Place new orders
+                    await self.place_grid_orders()
+                    
+                    logger.info(
+                        f"✅ Re-Grid complete: New grid ${self.state.lower_price:.2f} - ${self.state.upper_price:.2f}"
+                    )
+                    
+                    await self.telegram.send_message(
+                        f"✅ Re-Grid Complete!\n"
+                        f"New Grid: ${self.state.lower_price:.2f} - ${self.state.upper_price:.2f}"
+                    )
+                    
+            except Exception as e:
+                logger.error(f"Auto Re-Grid error: {e}")
     
     async def _daily_report_scheduler(self) -> None:
         """

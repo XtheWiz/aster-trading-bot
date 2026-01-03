@@ -116,6 +116,16 @@ class GridConfig:
     
     # Maximum number of open orders allowed
     MAX_OPEN_ORDERS: int = 20
+    
+    # Auto Re-Grid: Automatically reposition grid when price drifts too far
+    # When enabled, bot monitors price and re-grids if distance > threshold
+    AUTO_REGRID_ENABLED: bool = True
+    
+    # Re-grid threshold: if price moves more than this % from grid center, re-grid
+    REGRID_THRESHOLD_PERCENT: Decimal = Decimal("5.0")
+    
+    # How often to check for re-grid (in minutes)
+    REGRID_CHECK_INTERVAL_MINUTES: int = 30
 
 
 @dataclass
