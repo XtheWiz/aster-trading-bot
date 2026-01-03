@@ -44,6 +44,7 @@ from telegram_notifier import TelegramNotifier
 from telegram_commands import TelegramCommandHandler
 from strategy_manager import StrategyManager
 from indicator_analyzer import IndicatorAnalyzer, get_smart_tp
+from trade_event_logger import trade_event_logger
 
 # Configure logging with structured format
 logging.basicConfig(
@@ -635,6 +636,16 @@ class GridBot:
                 f"Entry: ${entry_price:.4f}\n"
                 f"TP: ${tp_price:.4f} (+{tp_percent}%)\n"
                 f"Qty: {quantity}"
+            )
+            
+            # Log trade event for analysis
+            trade_event_logger.log_smart_tp(
+                entry_price=entry_price,
+                tp_price=tp_price,
+                tp_percent=tp_percent,
+                rsi=0.0,  # Will be enhanced with actual values
+                macd_hist=0.0,
+                trend="",
             )
             
         except AsterAPIError as e:

@@ -205,6 +205,13 @@ class LogConfig:
     # Log file path (None for stdout only)
     LOG_FILE: str | None = "grid_bot.log"
     
+    # Trade events log (for analysis) - JSON format
+    TRADE_EVENTS_LOG: str | None = "trade_events.jsonl"
+    
+    # Log rotation settings
+    LOG_ROTATION_MAX_BYTES: int = 10 * 1024 * 1024  # 10 MB
+    LOG_ROTATION_BACKUP_COUNT: int = 5  # Keep 5 backup files
+    
     # Enable structured JSON logging
     JSON_LOGGING: bool = False
 
