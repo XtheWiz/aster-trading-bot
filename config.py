@@ -55,9 +55,9 @@ class TradingConfig:
     # Trading symbol - SOLUSDT for long-term run (Post-Dec 15 Strategy)
     SYMBOL: str = "SOLUSDT"
     
-    # Leverage multiplier - 3x CONSERVATIVE (Safe Mode)
-    # Low risk: Liq distance ~33%, safer for grid trading
-    LEVERAGE: int = 3
+    # Leverage multiplier - 5x MODERATE (balanced risk/reward)
+    # Moderate risk: Liq distance ~20%, good for trending markets
+    LEVERAGE: int = 5
     
     # Margin type: ISOLATED or CROSSED
     # For Multi-Asset Mode (using USDF as collateral), CROSSED is required
@@ -95,9 +95,9 @@ class GridConfig:
     
     # If LOWER/UPPER not set, use this percentage range around current price
     # ±10% means grid spans from -10% to +10% of entry price
-    # Conservative Range: ±8% for 3x leverage (~$121 - $142)
-    # Based on current S/R levels from TradingView
-    GRID_RANGE_PERCENT: Decimal = Decimal("8.0")
+    # Tighter Range: ±4% for closer grid (~$127 - $138 at current price)
+    # Grid closer to price for faster fills in trending market
+    GRID_RANGE_PERCENT: Decimal = Decimal("4.0")
     
     # Dynamic Grid Rebalancing: DISABLED for safety
     # Static Grid prevents position accumulation during trends
