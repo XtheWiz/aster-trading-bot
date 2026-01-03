@@ -202,11 +202,14 @@ class LogConfig:
     # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     
-    # Log file path (None for stdout only)
-    LOG_FILE: str | None = "grid_bot.log"
+    # Log directory - Railway volume mount point
+    LOG_DIR: str = os.getenv("LOG_DIR", "/app/logs")
+    
+    # Log file path (uses LOG_DIR)
+    LOG_FILE: str | None = os.path.join(os.getenv("LOG_DIR", "/app/logs"), "grid_bot.log")
     
     # Trade events log (for analysis) - JSON format
-    TRADE_EVENTS_LOG: str | None = "trade_events.jsonl"
+    TRADE_EVENTS_LOG: str | None = os.path.join(os.getenv("LOG_DIR", "/app/logs"), "trade_events.jsonl")
     
     # Log rotation settings
     LOG_ROTATION_MAX_BYTES: int = 10 * 1024 * 1024  # 10 MB
