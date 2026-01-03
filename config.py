@@ -131,8 +131,8 @@ class RiskConfig:
     # 10% drawdown on 500 USDT = 50 USDT max loss before emergency stop
     # Note: Margin lock for open orders is counted as drawdown
     # Stop bot if drawdown exceeds this percentage
-    # 50% threshold for conservative mode - stop early if losing
-    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("50.0")
+    # 80% threshold - higher because margin lock is included in calculation
+    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("80.0")
     
     # Stop loss per individual position (not recommended for grid, but available)
     STOP_LOSS_PERCENT: Decimal | None = None
