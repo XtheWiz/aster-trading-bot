@@ -43,6 +43,7 @@ from trade_logger import TradeLogger, create_trade_record, BalanceSnapshot
 from telegram_notifier import TelegramNotifier
 from telegram_commands import TelegramCommandHandler
 from strategy_manager import StrategyManager
+from indicator_analyzer import IndicatorAnalyzer, get_smart_tp
 
 # Configure logging with structured format
 logging.basicConfig(
@@ -501,10 +502,15 @@ class GridBot:
             new_side = OrderSide.BUY
             log_action = "SELL filled -> placing BUY"
         
-        # Check GRID_SIDE config - skip counter-orders that violate the config
+        # Check GRID_SIDE config - handle special cases for LONG/SHORT only modes
         grid_side = config.grid.GRID_SIDE
+        
         if grid_side == "LONG" and new_side == OrderSide.SELL:
-            logger.info(f"LONG mode: Skipping SELL counter-order after BUY fill")
+            # LONG mode: Instead of regular counter-order, place Smart TP
+            if config.risk.AUTO_TP_ENABLED:
+                await self._place_smart_tp(filled_level)
+            else:
+                logger.info(f"LONG mode: AUTO_TP disabled, skipping SELL")
             return
         elif grid_side == "SHORT" and new_side == OrderSide.BUY:
             logger.info(f"SHORT mode: Skipping BUY counter-order after SELL fill")
@@ -560,6 +566,81 @@ class GridBot:
             
         except AsterAPIError as e:
             logger.error(f"Failed to place rebalance order: {e}")
+    
+    async def _place_smart_tp(self, filled_level: GridLevel) -> None:
+        """
+        Place intelligent Take-Profit order based on market indicators.
+        
+        This method:
+        1. Fetches candle data from API
+        2. Calculates RSI, MACD, and other indicators
+        3. Determines optimal TP% based on market conditions
+        4. Places SELL order at calculated TP price
+        
+        Args:
+            filled_level: The grid level that just got filled (BUY)
+        """
+        try:
+            entry_price = filled_level.price
+            
+            # Get TP percentage
+            if config.risk.USE_SMART_TP:
+                # Fetch candle data for indicator calculation
+                candles = await self.client.get_klines(
+                    symbol=config.trading.SYMBOL,
+                    interval="1h",
+                    limit=50
+                )
+                
+                if candles:
+                    tp_percent = await get_smart_tp(candles)
+                    logger.info(f"🧠 Smart TP calculated: {tp_percent}%")
+                else:
+                    tp_percent = config.risk.DEFAULT_TP_PERCENT
+                    logger.warning(f"No candle data, using default TP: {tp_percent}%")
+            else:
+                tp_percent = config.risk.DEFAULT_TP_PERCENT
+                logger.info(f"Smart TP disabled, using default: {tp_percent}%")
+            
+            # Calculate TP price
+            tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
+            tp_price = self._round_price(tp_price)
+            
+            # Calculate quantity (same as filled order)
+            quantity = self.calculate_quantity_for_level(entry_price)
+            
+            # Generate client order ID
+            client_order_id = f"tp_{filled_level.index}_{int(datetime.now().timestamp())}"
+            
+            # Place SELL order at TP price
+            response = await self.client.place_order(
+                symbol=config.trading.SYMBOL,
+                side="SELL",
+                order_type="LIMIT",
+                quantity=quantity,
+                price=tp_price,
+                client_order_id=client_order_id,
+            )
+            
+            order_id = response.get("orderId")
+            
+            logger.info(
+                f"🎯 SMART TP PLACED: SELL @ ${tp_price:.4f} (+{tp_percent}%) | "
+                f"Entry: ${entry_price:.4f} | OrderID: {order_id}"
+            )
+            
+            # Send Telegram notification
+            await self.telegram.send_message(
+                f"🎯 Smart TP Placed!\n"
+                f"Entry: ${entry_price:.4f}\n"
+                f"TP: ${tp_price:.4f} (+{tp_percent}%)\n"
+                f"Qty: {quantity}"
+            )
+            
+        except AsterAPIError as e:
+            logger.error(f"Failed to place Smart TP order: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error in Smart TP: {e}")
     
     async def _handle_partial_fill(
         self,

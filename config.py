@@ -140,6 +140,16 @@ class RiskConfig:
     # Take profit per grid step (implicit in grid logic, but can override)
     TAKE_PROFIT_PERCENT: Decimal | None = None
     
+    # Auto Take Profit - automatically place TP order after BUY fill
+    AUTO_TP_ENABLED: bool = True
+    
+    # Smart TP - use indicators (RSI, MACD) to determine optimal TP%
+    # If False, uses DEFAULT_TP_PERCENT
+    USE_SMART_TP: bool = True
+    
+    # Default TP percentage when Smart TP is disabled or fails
+    DEFAULT_TP_PERCENT: Decimal = Decimal("1.5")
+    
     # Minimum balance to maintain (bot stops if balance falls below)
     MIN_BALANCE_USDT: Decimal = Decimal("50.0")
     
