@@ -126,6 +126,27 @@ class GridConfig:
     
     # How often to check for re-grid (in minutes)
     REGRID_CHECK_INTERVAL_MINUTES: int = 30
+    
+    # ==========================================================================
+    # Auto Switch Side: Automatically change grid direction based on trend
+    # ==========================================================================
+    
+    # Enable automatic side switching based on trend analysis
+    # Uses multi-indicator confirmation (EMA + MACD + RSI) for safety
+    AUTO_SWITCH_SIDE_ENABLED: bool = True
+    
+    # Minimum trend score to trigger a switch (±2 = moderate, ±3 = strong)
+    # Score range: -3 (strong bearish) to +3 (strong bullish)
+    # Score ±1 = unclear, ±2 = moderate trend, ±3 = strong trend
+    MIN_SWITCH_SCORE: int = 2
+    
+    # Number of consecutive confirmations needed before switching
+    # Each check is 30 min apart, so 2 checks = 1 hour confirmation
+    SWITCH_CONFIRMATION_CHECKS: int = 2
+    
+    # What to do when trend is unclear (score 0 or ±1)
+    # "STAY" = keep current side, "PAUSE" = pause trading
+    UNCLEAR_TREND_ACTION: Literal["STAY", "PAUSE"] = "STAY"
 
 
 @dataclass

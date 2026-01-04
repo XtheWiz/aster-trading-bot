@@ -209,7 +209,7 @@ class GridBot:
         self.trade_logger = TradeLogger()
         self.telegram = TelegramNotifier()
         self.telegram_commands = TelegramCommandHandler(bot_reference=self)
-        self.strategy_manager = StrategyManager(self.client)
+        self.strategy_manager = StrategyManager(self.client, bot_reference=self)
         self._session_id: int = 0
         self._last_hourly_summary = datetime.now()
     
@@ -792,6 +792,116 @@ class GridBot:
         
         self.bot_state = BotState.STOPPED
         self._shutdown_event.set()
+    
+    async def pause(self) -> None:
+        """
+        Pause bot operations gracefully.
+        
+        Unlike emergency_shutdown, this:
+        - Does NOT cancel existing orders (they may still fill)
+        - Just stops placing new orders
+        - Can be resumed with resume()
+        
+        Used by StrategyManager when market conditions are dangerous.
+        """
+        if self.bot_state == BotState.PAUSED:
+            logger.info("Bot is already paused")
+            return
+        
+        logger.warning("⏸️ BOT PAUSED - No new orders will be placed")
+        self.bot_state = BotState.PAUSED
+        
+        await self.telegram.send_message(
+            "⏸️ Bot Paused\n\n"
+            "Existing orders remain active.\n"
+            "Use /resume to restart operations."
+        )
+    
+    async def resume(self) -> None:
+        """
+        Resume bot operations after pause.
+        """
+        if self.bot_state != BotState.PAUSED:
+            logger.info(f"Bot is not paused (state: {self.bot_state})")
+            return
+        
+        logger.info("▶️ BOT RESUMED - Normal operations restored")
+        self.bot_state = BotState.RUNNING
+        
+        await self.telegram.send_message(
+            "▶️ Bot Resumed\n\n"
+            "Normal operations restored."
+        )
+    
+    async def switch_grid_side(self, new_side: str) -> None:
+        """
+        Switch grid direction (LONG/SHORT/BOTH).
+        
+        Called by StrategyManager when trend score confirms new direction.
+        
+        Process:
+        1. Cancel all existing orders
+        2. Update GRID_SIDE in runtime config
+        3. Get current price
+        4. Recalculate grid levels
+        5. Place new orders
+        
+        Args:
+            new_side: "LONG", "SHORT", or "BOTH"
+        """
+        old_side = config.grid.GRID_SIDE
+        
+        if old_side == new_side:
+            logger.info(f"Already on {new_side} side, no switch needed")
+            return
+        
+        logger.warning(f"🔄 SWITCHING GRID SIDE: {old_side} → {new_side}")
+        
+        try:
+            # 1. Cancel all existing orders
+            await self.cancel_all_orders()
+            logger.info("All orders canceled for side switch")
+            
+            # 2. Update runtime config (note: this doesn't persist to .env file)
+            # We modify the config object directly
+            config.grid.GRID_SIDE = new_side
+            logger.info(f"Grid side updated to: {new_side}")
+            
+            # 3. Get current price
+            ticker = await self.client.get_ticker_price(config.trading.SYMBOL)
+            current_price = Decimal(ticker["price"])
+            logger.info(f"Current price for new grid: ${current_price:.4f}")
+            
+            # 4. Recalculate grid levels
+            self.state.levels = self.calculate_grid_levels(current_price)
+            self.state.entry_price = current_price
+            
+            # 5. Place new orders
+            await self.place_grid_orders()
+            
+            logger.info(
+                f"✅ Side switch complete: {old_side} → {new_side} | "
+                f"New grid: ${self.state.lower_price:.2f} - ${self.state.upper_price:.2f}"
+            )
+            
+            # Log trade event
+            trade_event_logger.log_event("SIDE_SWITCH", {
+                "old_side": old_side,
+                "new_side": new_side,
+                "price": str(current_price),
+                "lower_price": str(self.state.lower_price),
+                "upper_price": str(self.state.upper_price),
+            })
+            
+        except Exception as e:
+            logger.error(f"Side switch failed: {e}")
+            # Attempt to restore old side on failure
+            config.grid.GRID_SIDE = old_side
+            await self.telegram.send_message(
+                f"❌ Side Switch Failed!\n\n"
+                f"Error: {e}\n"
+                f"Keeping current side: {old_side}"
+            )
     
     # =========================================================================
     # EVENT HANDLERS
