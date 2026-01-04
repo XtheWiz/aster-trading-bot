@@ -272,13 +272,51 @@ _Manual intervention required!_
         unrealized_pnl: Decimal,
         current_balance: Decimal,
         active_orders: int,
+        market_status: dict | None = None,
     ) -> None:
-        """Send hourly summary."""
+        """Send hourly summary with market conditions."""
         if not self.config.NOTIFY_HOURLY_SUMMARY:
             return
         
         total_pnl = realized_pnl + unrealized_pnl
         pnl_emoji = "📈" if total_pnl >= 0 else "📉"
+        
+        # Build market status section
+        market_section = ""
+        if market_status:
+            state = market_status.get("state", "UNKNOWN")
+            trend_score = market_status.get("trend_score", 0)
+            current_side = market_status.get("current_side", "LONG")
+            rsi = market_status.get("rsi", 0)
+            price = market_status.get("price", 0)
+            
+            # State emoji
+            state_emojis = {
+                "RANGING_STABLE": "✅",
+                "RANGING_VOLATILE": "⚠️",
+                "TRENDING_UP": "📈",
+                "TRENDING_DOWN": "📉",
+                "EXTREME_VOLATILITY": "🚨",
+                "UNKNOWN": "❓",
+            }
+            state_emoji = state_emojis.get(state, "📊")
+            
+            # Trend score display
+            if trend_score > 0:
+                score_emoji = "🟢"
+            elif trend_score < 0:
+                score_emoji = "🔴"
+            else:
+                score_emoji = "⚪"
+            
+            market_section = f"""
+🌍 *Market Status:*
+├ {state_emoji} State: `{state}`
+├ {score_emoji} Trend Score: `{trend_score:+d}`
+├ 📊 RSI: `{rsi:.1f}`
+├ 💵 Price: `${price:.2f}`
+└ 🎯 Grid Side: `{current_side}`
+"""
         
         message = f"""
 📊 *Hourly Summary*
@@ -289,7 +327,7 @@ _Manual intervention required!_
 {pnl_emoji} *Total PnL:* `{total_pnl:+.4f} USDT`
 💰 *Balance:* `{current_balance:.2f} USDT`
 📋 *Active Orders:* `{active_orders}`
-"""
+{market_section}"""
         self.queue_message(message.strip())
     
     async def send_error(self, error_type: str, details: str) -> None:

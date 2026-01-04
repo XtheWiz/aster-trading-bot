@@ -1224,12 +1224,25 @@ class GridBot:
             
             # Send hourly summary
             if (datetime.now() - self._last_hourly_summary).total_seconds() >= 3600:
+                # Build market status from strategy manager
+                market_status = None
+                if self.strategy_manager.last_analysis:
+                    analysis = self.strategy_manager.last_analysis
+                    market_status = {
+                        "state": analysis.state.value,
+                        "trend_score": analysis.trend_score,
+                        "rsi": analysis.rsi,
+                        "price": float(analysis.current_price),
+                        "current_side": config.grid.GRID_SIDE,
+                    }
+                
                 await self.telegram.send_hourly_summary(
                     trades_count=self.state.total_trades,
                     realized_pnl=self.state.realized_pnl,
                     unrealized_pnl=self.state.unrealized_pnl,
                     current_balance=self.state.current_balance,
                     active_orders=self.state.active_orders_count,
+                    market_status=market_status,
                 )
                 self._last_hourly_summary = datetime.now()
             
