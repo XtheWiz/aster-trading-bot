@@ -14,6 +14,7 @@ Core Responsibilities:
 import logging
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Literal
@@ -123,6 +124,12 @@ class StrategyManager:
         self.pending_switch_side: Literal["LONG", "SHORT"] | None = None
         self.switch_confirmation_count: int = 0
         self.current_trend_score: TrendScore | None = None
+        
+        # Dynamic Re-Grid on TP tracking
+        self.grid_placement_score: int = 0  # Score when grid was placed
+        self.last_analysis_time: datetime | None = None
+        self.last_regrid_time: datetime | None = None
+        self.pending_regrid_count: int = 0
         
     async def start_monitoring(self):
         """Start the background monitoring loop."""
@@ -429,6 +436,81 @@ class StrategyManager:
         # Reset tracking
         self.pending_switch_side = None
         self.switch_confirmation_count = 0
+    
+    def record_grid_placement(self) -> None:
+        """Record the current trend score when grid is placed."""
+        if self.current_trend_score:
+            self.grid_placement_score = self.current_trend_score.total
+        self.last_regrid_time = datetime.now()
+        logger.info(f"Grid placement recorded: score={self.grid_placement_score}")
+    
+    async def should_regrid_on_tp(self) -> Literal["REPLACE", "REGRID", "WAIT"]:
+        """
+        Decide action after TP fill.
+        
+        Returns:
+            "REPLACE" - Re-place BUY at original level (same trend)
+            "REGRID" - Do full re-grid (trend changed + confirmed)
+            "WAIT" - Wait for more confirmation (trend changed but not confirmed)
+        """
+        if not config.grid.REGRID_ON_TP_ENABLED:
+            return "REPLACE"  # Default behavior
+        
+        # Check rate limit
+        if self.last_regrid_time:
+            minutes_since_regrid = (datetime.now() - self.last_regrid_time).total_seconds() / 60
+            if minutes_since_regrid < config.grid.REGRID_MIN_INTERVAL_MINUTES:
+                logger.info(f"Rate limited: only {minutes_since_regrid:.1f} min since last re-grid")
+                return "REPLACE"
+        
+        # Check if we need fresh analysis or can use cache
+        need_fresh_analysis = True
+        if self.last_analysis_time:
+            minutes_since_analysis = (datetime.now() - self.last_analysis_time).total_seconds() / 60
+            if minutes_since_analysis < config.grid.REGRID_ANALYSIS_CACHE_MINUTES:
+                need_fresh_analysis = False
+                logger.info(f"Using cached analysis ({minutes_since_analysis:.1f} min old)")
+        
+        # Run analysis if needed
+        if need_fresh_analysis:
+            await self.analyze_market()
+            self.last_analysis_time = datetime.now()
+        
+        if not self.current_trend_score:
+            return "REPLACE"
+        
+        current_score = self.current_trend_score.total
+        
+        # Compare direction: positive = bullish, negative = bearish
+        same_direction = (
+            (current_score >= 0 and self.grid_placement_score >= 0) or
+            (current_score < 0 and self.grid_placement_score < 0)
+        )
+        
+        if same_direction:
+            # Same direction → just re-place the BUY
+            self.pending_regrid_count = 0
+            logger.info(f"Same trend direction (score: {self.grid_placement_score} -> {current_score}), replacing BUY")
+            return "REPLACE"
+        else:
+            # Different direction → need confirmation
+            self.pending_regrid_count += 1
+            logger.info(
+                f"Trend changed (score: {self.grid_placement_score} -> {current_score}), "
+                f"confirmation {self.pending_regrid_count}/2"
+            )
+            
+            if self.pending_regrid_count >= 2:
+                self.pending_regrid_count = 0
+                return "REGRID"
+            else:
+                await self.telegram.send_message(
+                    f"🔄 Trend Change Detected\n\n"
+                    f"Old Score: {self.grid_placement_score:+d}\n"
+                    f"New Score: {current_score:+d}\n\n"
+                    f"Waiting for confirmation..."
+                )
+                return "WAIT"
 
     async def evaluate_safety(self, analysis: MarketAnalysis):
         """

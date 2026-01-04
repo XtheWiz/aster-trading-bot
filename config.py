@@ -97,7 +97,7 @@ class GridConfig:
     # ±10% means grid spans from -10% to +10% of entry price
     # Tighter Range: ±4% for closer grid (~$127 - $138 at current price)
     # Grid closer to price for faster fills in trending market
-    GRID_RANGE_PERCENT: Decimal = Decimal("4.0")
+    GRID_RANGE_PERCENT: Decimal = Decimal("3.0")
     
     # Dynamic Grid Rebalancing: DISABLED for safety
     # Static Grid prevents position accumulation during trends
@@ -147,6 +147,24 @@ class GridConfig:
     # What to do when trend is unclear (score 0 or ±1)
     # "STAY" = keep current side, "PAUSE" = pause trading
     UNCLEAR_TREND_ACTION: Literal["STAY", "PAUSE"] = "STAY"
+    
+    # ==========================================================================
+    # Dynamic Re-Grid on TP: Re-analyze and re-place after Take Profit fills
+    # ==========================================================================
+    
+    # Enable dynamic re-grid when TP order fills
+    # When enabled, bot re-analyzes market after each TP and decides:
+    # - Same trend → Re-place BUY at original level
+    # - Different trend → Queue for full re-grid
+    REGRID_ON_TP_ENABLED: bool = True
+    
+    # Minimum minutes between full re-grids (rate limiting)
+    # Prevents excessive re-gridding in volatile markets
+    REGRID_MIN_INTERVAL_MINUTES: int = 5
+    
+    # Use cached analysis if it's less than this many minutes old
+    # Reduces API calls and computation
+    REGRID_ANALYSIS_CACHE_MINUTES: int = 5
 
 
 @dataclass
