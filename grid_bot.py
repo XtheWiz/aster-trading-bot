@@ -629,6 +629,11 @@ class GridBot:
             
             order_id = response.get("orderId")
             
+            # CRITICAL: Store order_id so TP fill can be tracked
+            filled_level.order_id = order_id
+            filled_level.side = OrderSide.SELL
+            filled_level.client_order_id = client_order_id
+            
             logger.info(
                 f"🎯 SMART TP PLACED: SELL @ ${tp_price:.4f} (+{tp_percent}%) | "
                 f"Entry: ${entry_price:.4f} | OrderID: {order_id}"
