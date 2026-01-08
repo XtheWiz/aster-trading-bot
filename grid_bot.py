@@ -1099,10 +1099,11 @@ class GridBot:
             positions = await self.client.get_position_risk(config.trading.SYMBOL)
             current_price = Decimal("0")
 
-            # Find balance
+            # Find balance - use 'balance' (wallet balance) not 'availableBalance'
+            # availableBalance is reduced by margin locked for pending orders
             for balance in balances:
                 if balance.get("asset") == config.trading.MARGIN_ASSET:
-                    self.state.current_balance = Decimal(balance.get("availableBalance", "0"))
+                    self.state.current_balance = Decimal(balance.get("balance", "0"))
                     break
 
             # Get unrealized PnL and current price
