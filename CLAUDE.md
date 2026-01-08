@@ -4,7 +4,7 @@
 
 Automated grid trading bot for Aster DEX futures market. Uses arithmetic grid strategy with smart take-profit, auto-side switching, and dynamic re-grid capabilities.
 
-**Codebase:** ~5,700 lines of Python
+**Codebase:** ~6,200 lines of Python
 
 ## Tech Stack
 
@@ -36,12 +36,12 @@ Automated grid trading bot for Aster DEX futures market. Uses arithmetic grid st
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `grid_bot.py` | ~2,140 | Main bot, order management, rebalancing |
-| `strategy_manager.py` | ~1,360 | Risk analysis, market monitoring, alerts |
+| `grid_bot.py` | ~2,200 | Main bot, order management, rebalancing |
+| `strategy_manager.py` | ~1,800 | Risk analysis, drawdown management, alerts |
 | `aster_client.py` | ~1,040 | API client (REST + WebSocket) |
 | `cli.py` | ~800 | Command-line interface |
 | `indicator_analyzer.py` | ~340 | Technical indicators, Smart TP |
-| `config.py` | ~375 | All configurations |
+| `config.py` | ~420 | All configurations |
 | `telegram_notifier.py` | - | Telegram notifications |
 | `telegram_commands.py` | - | Interactive Telegram commands |
 | `trade_logger.py` | - | SQLite trade history |
@@ -89,6 +89,16 @@ MAX_POSITION_PERCENT = 80
 AUTO_TP_ENABLED = True
 USE_SMART_TP = True
 
+# Intelligent Drawdown Management (Moderate Mode)
+DRAWDOWN_PAUSE_PERCENT = 15      # Pause BUY orders
+DRAWDOWN_PARTIAL_CUT_PERCENT = 20  # Cut 30% of position
+DRAWDOWN_FULL_CUT_PERCENT = 25   # Cut all positions
+PARTIAL_CUT_RATIO = 30           # % to cut at level 2
+MIN_BALANCE_GUARD = 100          # Stop everything if below
+DAILY_LOSS_LIMIT_USDT = 50       # Pause for 24h if exceeded
+AUTO_REENTRY_ENABLED = True      # Auto re-enter after cut loss
+REENTRY_POSITION_SIZE_RATIO = 50 # Start with 50% size
+
 # Features
 AUTO_SWITCH_SIDE_ENABLED = True
 AUTO_REGRID_ENABLED = True
@@ -124,7 +134,7 @@ else  → STAY current side
 Requires 2 confirmations before switching (anti-whipsaw)
 ```
 
-## Risk Management (10 Layers)
+## Risk Management (12 Layers)
 
 ### Layer 1: Circuit Breaker
 - **Max Drawdown 20%** → Auto-pause bot
@@ -182,12 +192,38 @@ Requires 2 confirmations before switching (anti-whipsaw)
 - **CRITICAL** when ≥ 90% + suggestions
 - Prevents over-exposure
 
+### Layer 11: Intelligent Drawdown Management (Moderate Mode)
+Graduated protection against position drawdowns:
+
+| Drawdown | Price (from $135) | Action |
+|----------|-------------------|--------|
+| **15%** | ~$115 | Pause new BUY orders (TP still active) |
+| **20%** | ~$108 | Partial cut 30% of position |
+| **25%** | ~$102 | Full cut loss (close all) |
+
+**Auto Re-entry Logic:**
+- Wait 30 minutes after cut loss
+- Check RSI < 40 and bouncing up
+- BTC not strongly bearish (score > -2)
+- Re-enter with **50% position size**
+- Gradually increase size on profitable trades
+
+**Safety Net:**
+- **Min Balance Guard $100** → Stop everything immediately
+- **Daily Loss Limit $50** → Pause for 24 hours
+
+### Layer 12: Side Switch Protection
+- **Block side switch** if holding position
+- Prevents selling at loss when switching LONG → SHORT
+- Must wait for TP to fill before switching
+- Telegram alert when switch is blocked
+
 ## Monitoring Schedule
 
 | Interval | Checks |
 |----------|--------|
 | **Real-time** | Price spike detection (WebSocket) |
-| **Every 15 min** | Market analysis, funding rate, BTC correlation, liquidity, position size |
+| **Every 15 min** | Market analysis, funding rate, BTC correlation, liquidity, position size, **drawdown** |
 
 ## Telegram Commands
 
@@ -242,6 +278,12 @@ class StrategyManager:
     # Position size thresholds
     position_warning = 70%          # Of max
     position_danger = 90%
+
+    # Drawdown Management (Moderate Mode)
+    drawdown_state = "NORMAL"  # NORMAL, PAUSED, PARTIAL_CUT, FULL_CUT, WAITING_REENTRY
+    drawdown_pause = 15%       # Level 1: Pause BUY
+    drawdown_partial = 20%     # Level 2: Cut 30%
+    drawdown_full = 25%        # Level 3: Cut all
 ```
 
 ## Realized PnL Calculation
@@ -295,6 +337,9 @@ git push origin main
 
 | Feature | Description |
 |---------|-------------|
+| **Drawdown Management** | 3-level protection (15%/20%/25%) with auto re-entry |
+| **Side Switch Block** | Prevent switching while holding position |
+| **Safety Net** | Min balance $100 + daily loss limit $50 |
 | TP Fix | Use total position avg entry instead of level entry |
 | Sync Positions | Place TP for existing positions after restart |
 | 15-min Check | Reduced from 30 minutes |
@@ -304,9 +349,18 @@ git push origin main
 | Liquidity Check | Spread + depth monitoring |
 | Position Size | Exposure coordination |
 
+## Drawdown States
+
+```
+NORMAL → PAUSED → PARTIAL_CUT → FULL_CUT → WAITING_REENTRY → NORMAL
+  ↑                                              ↓
+  └──────────────── Auto Re-entry ───────────────┘
+```
+
 ## Known Issues (All Fixed)
 
 1. ~~`send_message()` missing in TelegramNotifier~~ (Fixed 2026-01-08)
 2. ~~`realized_pnl` always 0~~ (Fixed 2026-01-08)
 3. ~~Position size not tracked accurately~~ (Fixed 2026-01-08)
 4. ~~TP calculated from level entry instead of total position~~ (Fixed 2026-01-08)
+5. ~~Side switch causes realized loss~~ (Fixed 2026-01-08)
