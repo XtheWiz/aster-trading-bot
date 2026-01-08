@@ -193,7 +193,20 @@ class StrategyManager:
         self.last_position_value: Decimal = Decimal("0")
         self.max_position_alert_sent = False
         self.exposure_mismatch_alerted = False
-        
+
+        # ==========================================================================
+        # Intelligent Drawdown Management
+        # ==========================================================================
+        self.drawdown_state: Literal["NORMAL", "PAUSED", "PARTIAL_CUT", "FULL_CUT", "WAITING_REENTRY"] = "NORMAL"
+        self.last_position_entry_price: Decimal = Decimal("0")
+        self.last_position_drawdown: Decimal = Decimal("0")
+        self.partial_cut_executed: bool = False
+        self.full_cut_executed: bool = False
+        self.cut_loss_time: datetime | None = None
+        self.daily_loss_usdt: Decimal = Decimal("0")
+        self.daily_loss_reset_time: datetime = datetime.now()
+        self.reentry_check_count: int = 0
+
     async def start_monitoring(self):
         """Start the background monitoring loop."""
         self.is_running = True
@@ -219,6 +232,9 @@ class StrategyManager:
 
                 # Check position size coordination
                 await self._check_position_size()
+
+                # Check drawdown and execute protection actions
+                await self._check_drawdown()
 
                 # Sleep for interval
                 await asyncio.sleep(self.check_interval)
@@ -874,6 +890,431 @@ class StrategyManager:
                 self.max_position_alert_sent = False
                 usage_percent = float(usage_ratio * 100)
                 logger.info(f"Position usage normalized: {usage_percent:.1f}%")
+
+    # ==========================================================================
+    # Intelligent Drawdown Management
+    # ==========================================================================
+
+    async def _check_drawdown(self) -> None:
+        """
+        Check position drawdown and execute protection actions.
+
+        Drawdown Levels (Moderate Mode):
+        - 15%: Pause new BUY orders (keep existing TP orders)
+        - 20%: Partial cut 30% of position
+        - 25%: Full cut loss (close all positions)
+
+        After full cut: Wait for market stabilization then auto re-entry.
+        """
+        try:
+            symbol = config.trading.SYMBOL
+
+            # Reset daily loss if new day
+            if datetime.now().date() > self.daily_loss_reset_time.date():
+                self.daily_loss_usdt = Decimal("0")
+                self.daily_loss_reset_time = datetime.now()
+                logger.info("Daily loss counter reset")
+
+            # Check if waiting for re-entry
+            if self.drawdown_state == "WAITING_REENTRY":
+                await self._check_reentry_conditions()
+                return
+
+            # Get current position
+            positions = await self.client.get_position_risk(symbol)
+            position_amt = Decimal("0")
+            entry_price = Decimal("0")
+            current_price = Decimal("0")
+            unrealized_pnl = Decimal("0")
+
+            for pos in positions:
+                if pos.get("symbol") == symbol:
+                    position_amt = Decimal(pos.get("positionAmt", "0"))
+                    entry_price = Decimal(pos.get("entryPrice", "0"))
+                    unrealized_pnl = Decimal(pos.get("unRealizedProfit", "0"))
+                    break
+
+            # Get current price
+            ticker = await self.client.get_ticker_price(symbol)
+            current_price = Decimal(ticker.get("price", "0"))
+
+            # No position = reset state
+            if position_amt == 0 or entry_price == 0:
+                if self.drawdown_state != "NORMAL" and self.drawdown_state != "WAITING_REENTRY":
+                    self.drawdown_state = "NORMAL"
+                    self.partial_cut_executed = False
+                    self.full_cut_executed = False
+                    logger.info("No position - drawdown state reset to NORMAL")
+                return
+
+            self.last_position_entry_price = entry_price
+
+            # Calculate drawdown from entry price
+            # For LONG: drawdown = (entry - current) / entry * 100
+            if position_amt > 0:  # LONG position
+                drawdown_percent = (entry_price - current_price) / entry_price * 100
+            else:  # SHORT position
+                drawdown_percent = (current_price - entry_price) / entry_price * 100
+
+            # Only care about losses (positive drawdown)
+            if drawdown_percent <= 0:
+                drawdown_percent = Decimal("0")
+                # Reset state if we're back in profit
+                if self.drawdown_state == "PAUSED":
+                    self.drawdown_state = "NORMAL"
+                    self.partial_cut_executed = False
+                    if self.bot:
+                        await self.bot.resume()
+                    await self.telegram.send_message(
+                        "✅ Drawdown Recovered!\n\n"
+                        f"Price back above entry.\n"
+                        f"Entry: ${entry_price:.4f}\n"
+                        f"Current: ${current_price:.4f}\n\n"
+                        "BUY orders resumed."
+                    )
+                    logger.info("Drawdown recovered - resumed buying")
+
+            self.last_position_drawdown = drawdown_percent
+
+            logger.info(
+                f"Drawdown Check: {drawdown_percent:.2f}% | "
+                f"Entry: ${entry_price:.4f} | Current: ${current_price:.4f} | "
+                f"Position: {position_amt} | uPnL: ${unrealized_pnl:.2f}"
+            )
+
+            # Check balance guard
+            balances = await self.client.get_account_balance()
+            current_balance = Decimal("0")
+            for bal in balances:
+                if bal.get("asset") == config.trading.MARGIN_ASSET:
+                    current_balance = Decimal(bal.get("balance", "0"))
+                    break
+
+            if current_balance < config.risk.MIN_BALANCE_GUARD:
+                logger.critical(f"BALANCE GUARD TRIGGERED: ${current_balance:.2f} < ${config.risk.MIN_BALANCE_GUARD}")
+                await self._execute_full_cut(position_amt, entry_price, current_price, "BALANCE_GUARD")
+                return
+
+            # Check daily loss limit
+            if self.daily_loss_usdt >= config.risk.DAILY_LOSS_LIMIT_USDT:
+                logger.warning(f"Daily loss limit reached: ${self.daily_loss_usdt:.2f}")
+                if self.bot and not self.bot.is_paused:
+                    await self.bot.pause()
+                    await self.telegram.send_message(
+                        f"⏸️ Daily Loss Limit Reached!\n\n"
+                        f"Daily Loss: ${self.daily_loss_usdt:.2f}\n"
+                        f"Limit: ${config.risk.DAILY_LOSS_LIMIT_USDT:.2f}\n\n"
+                        "Bot paused for 24 hours."
+                    )
+                return
+
+            # Execute actions based on drawdown level
+            await self._execute_drawdown_actions(
+                drawdown_percent,
+                position_amt,
+                entry_price,
+                current_price,
+                unrealized_pnl
+            )
+
+        except Exception as e:
+            logger.error(f"Error checking drawdown: {e}")
+
+    async def _execute_drawdown_actions(
+        self,
+        drawdown_percent: Decimal,
+        position_amt: Decimal,
+        entry_price: Decimal,
+        current_price: Decimal,
+        unrealized_pnl: Decimal
+    ) -> None:
+        """
+        Execute protection actions based on drawdown level.
+
+        Actions are cumulative:
+        - 15%+: Pause BUY
+        - 20%+: Pause BUY + Partial Cut 30%
+        - 25%+: Pause BUY + Full Cut
+        """
+        pause_threshold = config.risk.DRAWDOWN_PAUSE_PERCENT
+        partial_threshold = config.risk.DRAWDOWN_PARTIAL_CUT_PERCENT
+        full_threshold = config.risk.DRAWDOWN_FULL_CUT_PERCENT
+
+        # Level 3: Full Cut (25%+)
+        if drawdown_percent >= full_threshold and not self.full_cut_executed:
+            await self._execute_full_cut(position_amt, entry_price, current_price, "DRAWDOWN_25%")
+            return
+
+        # Level 2: Partial Cut (20%+)
+        if drawdown_percent >= partial_threshold and not self.partial_cut_executed:
+            await self._execute_partial_cut(position_amt, entry_price, current_price)
+
+        # Level 1: Pause BUY (15%+)
+        if drawdown_percent >= pause_threshold and self.drawdown_state == "NORMAL":
+            await self._execute_pause_buying(drawdown_percent, entry_price, current_price)
+
+    async def _execute_pause_buying(
+        self,
+        drawdown_percent: Decimal,
+        entry_price: Decimal,
+        current_price: Decimal
+    ) -> None:
+        """Pause new BUY orders while keeping existing TP orders."""
+        self.drawdown_state = "PAUSED"
+
+        if self.bot:
+            # Cancel only BUY orders, keep TP (SELL) orders
+            await self.bot.pause_buying()
+
+        await self.telegram.send_message(
+            f"⚠️ Drawdown Alert - Level 1\n\n"
+            f"Drawdown: {drawdown_percent:.1f}%\n"
+            f"Entry: ${entry_price:.4f}\n"
+            f"Current: ${current_price:.4f}\n\n"
+            f"Action: Paused new BUY orders\n"
+            f"TP orders still active.\n\n"
+            f"Next level at 20%: Partial cut 30%"
+        )
+
+        logger.warning(f"DRAWDOWN LEVEL 1: {drawdown_percent:.1f}% - Paused buying")
+
+    async def _execute_partial_cut(
+        self,
+        position_amt: Decimal,
+        entry_price: Decimal,
+        current_price: Decimal
+    ) -> None:
+        """Cut 30% of position to reduce risk."""
+        self.partial_cut_executed = True
+        self.drawdown_state = "PARTIAL_CUT"
+
+        cut_ratio = config.risk.PARTIAL_CUT_RATIO / 100
+        cut_quantity = abs(position_amt) * cut_ratio
+
+        # Round to appropriate precision
+        cut_quantity = cut_quantity.quantize(Decimal("0.01"))
+
+        if cut_quantity <= 0:
+            logger.warning("Partial cut quantity too small, skipping")
+            return
+
+        try:
+            # Determine sell side based on position direction
+            side = "SELL" if position_amt > 0 else "BUY"
+
+            # Execute market order to close partial position
+            response = await self.client.place_order(
+                symbol=config.trading.SYMBOL,
+                side=side,
+                order_type="MARKET",
+                quantity=cut_quantity,
+            )
+
+            order_id = response.get("orderId")
+
+            # Calculate realized loss
+            loss_per_unit = abs(entry_price - current_price)
+            realized_loss = loss_per_unit * cut_quantity
+            self.daily_loss_usdt += realized_loss
+
+            remaining = abs(position_amt) - cut_quantity
+
+            await self.telegram.send_message(
+                f"✂️ Drawdown Alert - Level 2\n\n"
+                f"Action: Partial Cut 30%\n"
+                f"Sold: {cut_quantity} @ ${current_price:.4f}\n"
+                f"Realized Loss: -${realized_loss:.2f}\n\n"
+                f"Remaining Position: {remaining:.4f}\n"
+                f"Entry: ${entry_price:.4f}\n\n"
+                f"Next level at 25%: Full cut\n"
+                f"OrderID: {order_id}"
+            )
+
+            logger.warning(
+                f"DRAWDOWN LEVEL 2: Partial cut executed | "
+                f"Sold {cut_quantity} @ ${current_price:.4f} | "
+                f"Loss: -${realized_loss:.2f}"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to execute partial cut: {e}")
+            await self.telegram.send_message(
+                f"❌ Partial Cut Failed!\n\n"
+                f"Error: {e}\n\n"
+                f"Please manually reduce position."
+            )
+
+    async def _execute_full_cut(
+        self,
+        position_amt: Decimal,
+        entry_price: Decimal,
+        current_price: Decimal,
+        reason: str
+    ) -> None:
+        """Close all positions to prevent further losses."""
+        self.full_cut_executed = True
+        self.drawdown_state = "WAITING_REENTRY"
+        self.cut_loss_time = datetime.now()
+        self.reentry_check_count = 0
+
+        cut_quantity = abs(position_amt)
+
+        if cut_quantity <= 0:
+            logger.warning("No position to cut")
+            return
+
+        try:
+            # Cancel all orders first
+            if self.bot:
+                await self.bot.cancel_all_orders()
+
+            # Determine sell side based on position direction
+            side = "SELL" if position_amt > 0 else "BUY"
+
+            # Execute market order to close all
+            response = await self.client.place_order(
+                symbol=config.trading.SYMBOL,
+                side=side,
+                order_type="MARKET",
+                quantity=cut_quantity,
+            )
+
+            order_id = response.get("orderId")
+
+            # Calculate realized loss
+            loss_per_unit = abs(entry_price - current_price)
+            realized_loss = loss_per_unit * cut_quantity
+            self.daily_loss_usdt += realized_loss
+
+            await self.telegram.send_message(
+                f"🛑 Drawdown Alert - Level 3\n\n"
+                f"Reason: {reason}\n"
+                f"Action: FULL CUT LOSS\n\n"
+                f"Closed: {cut_quantity} @ ${current_price:.4f}\n"
+                f"Entry was: ${entry_price:.4f}\n"
+                f"Realized Loss: -${realized_loss:.2f}\n\n"
+                f"Daily Loss Total: -${self.daily_loss_usdt:.2f}\n\n"
+                f"🔄 Auto Re-entry enabled.\n"
+                f"Waiting for market to stabilize...\n"
+                f"OrderID: {order_id}"
+            )
+
+            logger.critical(
+                f"DRAWDOWN LEVEL 3: Full cut executed | "
+                f"Reason: {reason} | "
+                f"Closed {cut_quantity} @ ${current_price:.4f} | "
+                f"Loss: -${realized_loss:.2f}"
+            )
+
+            # Pause the bot
+            if self.bot:
+                await self.bot.pause()
+
+        except Exception as e:
+            logger.error(f"Failed to execute full cut: {e}")
+            await self.telegram.send_message(
+                f"❌ Full Cut Failed!\n\n"
+                f"Error: {e}\n\n"
+                f"URGENT: Please manually close all positions!"
+            )
+
+    async def _check_reentry_conditions(self) -> None:
+        """
+        Check if conditions are met for auto re-entry after full cut.
+
+        Conditions:
+        1. Minimum wait time passed
+        2. RSI is oversold and bouncing
+        3. BTC is not strongly bearish
+        4. Price showing signs of reversal
+        """
+        if not config.risk.AUTO_REENTRY_ENABLED:
+            return
+
+        # Check minimum wait time
+        if self.cut_loss_time:
+            wait_minutes = (datetime.now() - self.cut_loss_time).total_seconds() / 60
+            if wait_minutes < config.risk.REENTRY_MIN_WAIT_MINUTES:
+                return
+
+        self.reentry_check_count += 1
+
+        # Get current analysis
+        analysis = self.last_analysis
+        if not analysis:
+            return
+
+        # Check RSI - looking for oversold bounce
+        rsi = analysis.rsi
+        rsi_threshold = float(config.risk.REENTRY_RSI_THRESHOLD)
+
+        # We want RSI to have been below threshold and now rising
+        rsi_condition = rsi < 40 and rsi > rsi_threshold  # Was oversold, now recovering
+
+        # Check BTC correlation
+        btc_ok = True
+        if self.btc_trend_score:
+            btc_ok = self.btc_trend_score.total > -2  # Not strongly bearish
+
+        # Check trend - looking for reversal signs
+        trend_ok = analysis.trend_score.total > -2  # Not strongly bearish
+
+        logger.info(
+            f"Re-entry Check #{self.reentry_check_count}: "
+            f"RSI={rsi:.1f} (need <40 & >{rsi_threshold}) | "
+            f"BTC OK: {btc_ok} | Trend OK: {trend_ok}"
+        )
+
+        # All conditions met
+        if rsi_condition and btc_ok and trend_ok:
+            await self._execute_reentry()
+        elif self.reentry_check_count >= 12:  # After 3 hours (15min × 12)
+            # Force check with relaxed conditions
+            if rsi < 50 and btc_ok:
+                await self._execute_reentry()
+
+    async def _execute_reentry(self) -> None:
+        """Execute auto re-entry with reduced position size."""
+        self.drawdown_state = "NORMAL"
+        self.partial_cut_executed = False
+        self.full_cut_executed = False
+        self.cut_loss_time = None
+        self.reentry_check_count = 0
+
+        # Get current price
+        ticker = await self.client.get_ticker_price(config.trading.SYMBOL)
+        current_price = Decimal(ticker.get("price", "0"))
+
+        # Calculate reduced position size
+        size_ratio = config.risk.REENTRY_POSITION_SIZE_RATIO / 100
+
+        await self.telegram.send_message(
+            f"🔄 Auto Re-entry Triggered!\n\n"
+            f"Market conditions improved:\n"
+            f"• RSI showing recovery\n"
+            f"• BTC not bearish\n"
+            f"• Trend stabilizing\n\n"
+            f"Re-entry Price: ${current_price:.4f}\n"
+            f"Position Size: {size_ratio*100:.0f}% of normal\n\n"
+            f"Resuming grid trading..."
+        )
+
+        logger.info(
+            f"AUTO RE-ENTRY: Market stabilized | "
+            f"Price: ${current_price:.4f} | "
+            f"Size ratio: {size_ratio*100:.0f}%"
+        )
+
+        # Resume bot with reduced size
+        if self.bot:
+            # Temporarily reduce quantity per grid
+            original_qty = config.grid.QUANTITY_PER_GRID_USDT
+            config.grid.QUANTITY_PER_GRID_USDT = original_qty * size_ratio
+
+            await self.bot.resume()
+
+            # Schedule restoration of original size after successful trades
+            # (This will be handled by gradual increase logic)
 
     async def analyze_market(self, symbol: str | None = None) -> MarketAnalysis:
         """

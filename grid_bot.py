@@ -1339,15 +1339,68 @@ class GridBot:
         if self.bot_state != BotState.PAUSED:
             logger.info(f"Bot is not paused (state: {self.bot_state})")
             return
-        
+
         logger.info("▶️ BOT RESUMED - Normal operations restored")
         self.bot_state = BotState.RUNNING
-        
+
         await self.telegram.send_message(
             "▶️ Bot Resumed\n\n"
             "Normal operations restored."
         )
-    
+
+    @property
+    def is_paused(self) -> bool:
+        """Check if bot is currently paused."""
+        return self.bot_state == BotState.PAUSED
+
+    async def pause_buying(self) -> None:
+        """
+        Pause only BUY orders while keeping existing TP (SELL) orders active.
+
+        Used by Drawdown Management to prevent accumulating more positions
+        while still allowing profitable exits via TP orders.
+        """
+        logger.warning("⏸️ PAUSE BUYING - Cancelling BUY orders only, keeping TP orders")
+
+        try:
+            # Get all open orders
+            open_orders = await self.client.get_open_orders(config.trading.SYMBOL)
+
+            cancelled_count = 0
+            kept_count = 0
+
+            for order in open_orders:
+                order_side = order.get("side", "")
+                order_id = order.get("orderId")
+
+                # Only cancel BUY orders
+                if order_side == "BUY" and order_id:
+                    try:
+                        await self.client.cancel_order(
+                            symbol=config.trading.SYMBOL,
+                            order_id=order_id
+                        )
+                        cancelled_count += 1
+
+                        # Update grid level state
+                        level = self.state.get_level_by_order_id(order_id)
+                        if level:
+                            level.order_id = None
+                            level.state = GridLevelState.EMPTY
+
+                    except Exception as e:
+                        logger.error(f"Failed to cancel BUY order {order_id}: {e}")
+                else:
+                    kept_count += 1
+
+            logger.info(f"Pause buying complete: cancelled {cancelled_count} BUY orders, kept {kept_count} TP orders")
+
+            # Set bot to paused state to prevent new orders
+            self.bot_state = BotState.PAUSED
+
+        except Exception as e:
+            logger.error(f"Error during pause_buying: {e}")
+
     async def switch_grid_side(self, new_side: str) -> None:
         """
         Switch grid direction (LONG/SHORT/BOTH).

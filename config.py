@@ -243,6 +243,49 @@ class RiskConfig:
     # Maximum position size as percentage of balance
     MAX_POSITION_PERCENT: Decimal = Decimal("80.0")
 
+    # ==========================================================================
+    # Intelligent Drawdown Management (Moderate Mode)
+    # Protects capital through graduated responses to drawdown
+    # ==========================================================================
+
+    # Level 1: Pause new BUY orders (keep existing TP orders)
+    DRAWDOWN_PAUSE_PERCENT: Decimal = Decimal("15.0")
+
+    # Level 2: Partial cut loss (reduce position)
+    DRAWDOWN_PARTIAL_CUT_PERCENT: Decimal = Decimal("20.0")
+
+    # Level 3: Full cut loss (close all positions)
+    DRAWDOWN_FULL_CUT_PERCENT: Decimal = Decimal("25.0")
+
+    # How much to cut at Level 2 (30% of position)
+    PARTIAL_CUT_RATIO: Decimal = Decimal("30.0")
+
+    # ==========================================================================
+    # Safety Net
+    # ==========================================================================
+
+    # Minimum balance guard - stop everything if balance falls below this
+    MIN_BALANCE_GUARD: Decimal = Decimal("100.0")
+
+    # Daily loss limit in USDT - pause for 24h if exceeded
+    DAILY_LOSS_LIMIT_USDT: Decimal = Decimal("50.0")
+
+    # ==========================================================================
+    # Auto Re-entry after Cut Loss
+    # ==========================================================================
+
+    # Enable automatic re-entry after full cut loss
+    AUTO_REENTRY_ENABLED: bool = True
+
+    # RSI threshold for re-entry (wait for oversold bounce)
+    REENTRY_RSI_THRESHOLD: Decimal = Decimal("30.0")
+
+    # Position size ratio for re-entry (50% = start with half size)
+    REENTRY_POSITION_SIZE_RATIO: Decimal = Decimal("50.0")
+
+    # Minimum wait time after cut loss before re-entry (minutes)
+    REENTRY_MIN_WAIT_MINUTES: int = 30
+
 
 @dataclass
 class HarvestConfig:
