@@ -122,6 +122,7 @@ class StrategyManager:
     - Real-time price spike detection via WebSocket
     - Funding rate monitoring with alerts
     - BTC correlation analysis (leading indicator)
+    - Liquidity monitoring (spread and depth)
     """
     
     def __init__(self, client: AsterClient, bot_reference=None):
@@ -174,6 +175,15 @@ class StrategyManager:
         self.btc_rsi_danger_high = 70  # BTC overbought - danger for LONG
         self.btc_rsi_danger_low = 30   # BTC oversold - danger for SHORT
         self.btc_divergence_alert_sent = False
+
+        # Liquidity Crisis Detection
+        self.spread_warning_threshold = Decimal("0.003")  # 0.3% spread = warning
+        self.spread_danger_threshold = Decimal("0.005")   # 0.5% spread = danger
+        self.min_depth_usdt = Decimal("5000")  # Minimum $5000 depth on each side
+        self.last_spread: Decimal = Decimal("0")
+        self.last_bid_depth: Decimal = Decimal("0")
+        self.last_ask_depth: Decimal = Decimal("0")
+        self.liquidity_warning_sent = False
         
     async def start_monitoring(self):
         """Start the background monitoring loop."""
@@ -194,6 +204,9 @@ class StrategyManager:
 
                 # Check BTC correlation (leading indicator)
                 await self._check_btc_correlation()
+
+                # Check liquidity (spread and depth)
+                await self._check_liquidity()
 
                 # Sleep for interval
                 await asyncio.sleep(self.check_interval)
@@ -550,6 +563,146 @@ class StrategyManager:
             if self.btc_divergence_alert_sent:
                 self.btc_divergence_alert_sent = False
                 logger.info("BTC correlation normalized - divergence alert cleared")
+
+    async def _check_liquidity(self) -> None:
+        """
+        Check order book liquidity and spread.
+
+        Liquidity crisis indicators:
+        - Wide spread (> 0.3% warning, > 0.5% danger)
+        - Low depth (< $5000 on bid or ask side)
+
+        Low liquidity means:
+        - Orders may not fill at expected prices
+        - Slippage on market orders
+        - Difficulty exiting positions in panic
+        """
+        try:
+            symbol = config.trading.SYMBOL
+
+            # Get order book depth
+            depth = await self.client.get_depth(symbol=symbol, limit=20)
+
+            if not depth or "bids" not in depth or "asks" not in depth:
+                logger.warning("Could not fetch order book depth")
+                return
+
+            bids = depth.get("bids", [])
+            asks = depth.get("asks", [])
+
+            if not bids or not asks:
+                logger.warning("Empty order book")
+                return
+
+            # Calculate spread
+            best_bid = Decimal(bids[0][0])
+            best_ask = Decimal(asks[0][0])
+            mid_price = (best_bid + best_ask) / 2
+            spread = (best_ask - best_bid) / mid_price
+            self.last_spread = spread
+
+            # Calculate depth (total value in USDT for top 20 levels)
+            bid_depth = sum(Decimal(b[0]) * Decimal(b[1]) for b in bids)
+            ask_depth = sum(Decimal(a[0]) * Decimal(a[1]) for a in asks)
+            self.last_bid_depth = bid_depth
+            self.last_ask_depth = ask_depth
+
+            spread_percent = float(spread * 100)
+            logger.info(
+                f"Liquidity Check: Spread={spread_percent:.3f}% | "
+                f"Bid Depth=${bid_depth:,.0f} | Ask Depth=${ask_depth:,.0f}"
+            )
+
+            # Evaluate liquidity conditions
+            await self._evaluate_liquidity(spread, bid_depth, ask_depth, mid_price)
+
+        except Exception as e:
+            logger.error(f"Error checking liquidity: {e}")
+
+    async def _evaluate_liquidity(
+        self,
+        spread: Decimal,
+        bid_depth: Decimal,
+        ask_depth: Decimal,
+        mid_price: Decimal
+    ) -> None:
+        """
+        Evaluate liquidity conditions and alert if dangerous.
+
+        Args:
+            spread: Current bid-ask spread as decimal (e.g., 0.003 = 0.3%)
+            bid_depth: Total bid depth in USDT
+            ask_depth: Total ask depth in USDT
+            mid_price: Current mid price
+        """
+        issues = []
+        severity = "WARNING"
+        grid_side = config.grid.GRID_SIDE
+
+        # Check spread
+        if spread >= self.spread_danger_threshold:
+            issues.append(f"WIDE SPREAD: {float(spread * 100):.2f}%")
+            severity = "CRITICAL"
+        elif spread >= self.spread_warning_threshold:
+            issues.append(f"High spread: {float(spread * 100):.2f}%")
+
+        # Check depth based on grid side
+        if grid_side == "LONG":
+            # For LONG grid, we need good ask depth (to buy) and bid depth (to sell/TP)
+            if ask_depth < self.min_depth_usdt:
+                issues.append(f"LOW ASK DEPTH: ${ask_depth:,.0f}")
+                severity = "CRITICAL"
+            if bid_depth < self.min_depth_usdt:
+                issues.append(f"Low bid depth: ${bid_depth:,.0f} (TP may slip)")
+        else:
+            # For SHORT grid, we need good bid depth (to sell) and ask depth (to buy/TP)
+            if bid_depth < self.min_depth_usdt:
+                issues.append(f"LOW BID DEPTH: ${bid_depth:,.0f}")
+                severity = "CRITICAL"
+            if ask_depth < self.min_depth_usdt:
+                issues.append(f"Low ask depth: ${ask_depth:,.0f} (TP may slip)")
+
+        # Send alert if issues detected
+        if issues:
+            if not self.liquidity_warning_sent:
+                self.liquidity_warning_sent = True
+
+                icon = "🚨" if severity == "CRITICAL" else "⚠️"
+                issues_text = "\n".join(f"  • {issue}" for issue in issues)
+
+                await self.telegram.send_message(
+                    f"{icon} Liquidity Warning!\n\n"
+                    f"Symbol: {config.trading.SYMBOL}\n"
+                    f"Mid Price: ${mid_price:.2f}\n\n"
+                    f"Issues:\n{issues_text}\n\n"
+                    f"Grid: {grid_side}\n\n"
+                    f"{'🔴 Consider pausing trading!' if severity == 'CRITICAL' else '⚠️ Monitor order fills closely!'}"
+                )
+
+                logger.warning(f"Liquidity warning: {issues}")
+
+                # Auto-pause on critical liquidity crisis
+                if severity == "CRITICAL" and self.bot and hasattr(self.bot, 'pause'):
+                    logger.critical("CRITICAL liquidity crisis - auto-pausing bot!")
+                    await self.telegram.send_message(
+                        "🚨 AUTO-PAUSE TRIGGERED\n\n"
+                        "Bot paused due to critical liquidity conditions.\n"
+                        "Manual intervention required."
+                    )
+                    await self.bot.pause()
+        else:
+            # Reset warning flag when liquidity normalizes
+            if self.liquidity_warning_sent:
+                self.liquidity_warning_sent = False
+                logger.info("Liquidity normalized - warning cleared")
+
+                await self.telegram.send_message(
+                    "✅ Liquidity Normalized\n\n"
+                    f"Spread: {float(spread * 100):.3f}%\n"
+                    f"Bid Depth: ${bid_depth:,.0f}\n"
+                    f"Ask Depth: ${ask_depth:,.0f}\n\n"
+                    "Trading conditions improved."
+                )
 
     async def analyze_market(self, symbol: str | None = None) -> MarketAnalysis:
         """
