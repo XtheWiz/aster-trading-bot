@@ -1023,9 +1023,127 @@ class GridBot:
         )
     
     # =========================================================================
+    # POSITION SYNC (for bot restart)
+    # =========================================================================
+
+    async def sync_existing_positions(self) -> int:
+        """
+        Sync existing positions from exchange and place TP orders.
+
+        Called on bot startup to handle positions that were opened before
+        the bot restarted. This ensures no position is left without a TP.
+
+        Returns:
+            Number of positions synced
+        """
+        try:
+            positions = await self.client.get_position_risk(config.trading.SYMBOL)
+
+            synced = 0
+            for pos in positions:
+                if pos.get("symbol") != config.trading.SYMBOL:
+                    continue
+
+                position_amt = Decimal(pos.get("positionAmt", "0"))
+                entry_price = Decimal(pos.get("entryPrice", "0"))
+
+                # Skip if no position
+                if position_amt == 0 or entry_price == 0:
+                    continue
+
+                # LONG mode: only handle positive positions
+                if config.grid.GRID_SIDE == "LONG" and position_amt < 0:
+                    logger.warning(f"Found SHORT position in LONG mode, skipping sync")
+                    continue
+
+                # SHORT mode: only handle negative positions
+                if config.grid.GRID_SIDE == "SHORT" and position_amt > 0:
+                    logger.warning(f"Found LONG position in SHORT mode, skipping sync")
+                    continue
+
+                position_qty = abs(position_amt)
+
+                logger.info(
+                    f"🔄 SYNC: Found existing position | "
+                    f"Qty: {position_qty} | Entry: ${entry_price:.4f}"
+                )
+
+                # Check if TP already exists for this position
+                open_orders = await self.client.get_open_orders(config.trading.SYMBOL)
+                has_tp = False
+                for order in open_orders:
+                    # Check if there's a SELL order (TP) for roughly this quantity
+                    if order.get("side") == "SELL":
+                        order_qty = Decimal(order.get("origQty", "0"))
+                        if abs(order_qty - position_qty) < Decimal("0.01"):
+                            has_tp = True
+                            logger.info(f"🔄 SYNC: TP already exists for position, skipping")
+                            break
+
+                if has_tp:
+                    continue
+
+                # Calculate TP price using Smart TP
+                if config.risk.USE_SMART_TP and config.risk.AUTO_TP_ENABLED:
+                    cached_analysis = self.strategy_manager.last_analysis
+                    if cached_analysis and cached_analysis.rsi > 0:
+                        tp_percent = await get_smart_tp(market_analysis=cached_analysis)
+                    else:
+                        tp_percent = config.risk.DEFAULT_TP_PERCENT
+                else:
+                    tp_percent = config.risk.DEFAULT_TP_PERCENT
+
+                tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
+                tp_price = self._round_price(tp_price)
+
+                # Place TP order
+                client_order_id = f"sync_tp_{int(datetime.now().timestamp())}"
+
+                response = await self.client.place_order(
+                    symbol=config.trading.SYMBOL,
+                    side="SELL" if position_amt > 0 else "BUY",
+                    order_type="LIMIT",
+                    quantity=position_qty,
+                    price=tp_price,
+                    client_order_id=client_order_id,
+                )
+
+                order_id = response.get("orderId")
+
+                logger.info(
+                    f"🎯 SYNC TP PLACED: SELL @ ${tp_price:.4f} (+{tp_percent}%) | "
+                    f"Entry: ${entry_price:.4f} | Qty: {position_qty} | OrderID: {order_id}"
+                )
+
+                # Send Telegram notification
+                await self.telegram.send_message(
+                    f"🔄 Synced Existing Position\n\n"
+                    f"Entry: ${entry_price:.4f}\n"
+                    f"TP: ${tp_price:.4f} (+{tp_percent}%)\n"
+                    f"Qty: {position_qty}\n\n"
+                    f"Position from before restart now has TP!"
+                )
+
+                synced += 1
+
+            if synced > 0:
+                logger.info(f"🔄 SYNC: Placed TP for {synced} existing position(s)")
+            else:
+                logger.info("🔄 SYNC: No existing positions to sync")
+
+            return synced
+
+        except AsterAPIError as e:
+            logger.error(f"Failed to sync existing positions: {e}")
+            return 0
+        except Exception as e:
+            logger.error(f"Unexpected error syncing positions: {e}")
+            return 0
+
+    # =========================================================================
     # RISK MANAGEMENT
     # =========================================================================
-    
+
     async def check_circuit_breaker(self) -> bool:
         """
         Check if circuit breaker should trigger.
@@ -1628,10 +1746,14 @@ class GridBot:
             logger.info("Grid Levels:")
             for level in self.state.levels:
                 logger.info(f"  {level}")
-            
+
+            # Sync existing positions from exchange (place TP for positions from before restart)
+            logger.info("Syncing existing positions from exchange...")
+            await self.sync_existing_positions()
+
             self.state.start_time = datetime.now()
             self.bot_state = BotState.RUNNING
-            
+
             # Initialize trade logger and telegram
             await self.trade_logger.initialize()
             self._session_id = await self.trade_logger.start_session(
