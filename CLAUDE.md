@@ -4,11 +4,14 @@
 
 Automated grid trading bot for Aster DEX futures market. Uses arithmetic grid strategy with smart take-profit, auto-side switching, and dynamic re-grid capabilities.
 
+**Codebase:** ~5,700 lines of Python
+
 ## Tech Stack
 
 - **Language:** Python 3.11+
-- **Async:** asyncio, aiohttp
+- **Async:** asyncio, aiohttp, websockets
 - **Database:** SQLite (trade history)
+- **Indicators:** pandas, ta library
 - **Notifications:** Telegram Bot API
 - **Deployment:** Railway (production)
 
@@ -17,34 +20,31 @@ Automated grid trading bot for Aster DEX futures market. Uses arithmetic grid st
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        GridBot                               │
-│  (Main orchestrator - order management, rebalancing)         │
-├─────────────────────────────────────────────────────────────┤
-│  StrategyManager          │  IndicatorAnalyzer              │
-│  (Market analysis,        │  (RSI, MACD, SMA calculations,  │
-│   trend scoring,          │   Smart TP recommendations)     │
-│   auto-switch logic)      │                                 │
-├─────────────────────────────────────────────────────────────┤
-│  AsterClient              │  TelegramNotifier               │
-│  (REST API + WebSocket)   │  (Real-time alerts + commands)  │
-├─────────────────────────────────────────────────────────────┤
-│  TradeLogger              │  Config                         │
-│  (SQLite persistence)     │  (Centralized settings)         │
+│            (Order management, Rebalancing)                   │
+├──────────────────────────┬──────────────────────────────────┤
+│    StrategyManager       │       IndicatorAnalyzer          │
+│    (Risk & Analysis)     │       (Technical Indicators)     │
+├──────────────────────────┼──────────────────────────────────┤
+│    AsterClient           │       TelegramNotifier           │
+│    (REST + WebSocket)    │       (Alerts + Commands)        │
+├──────────────────────────┴──────────────────────────────────┤
+│              TradeLogger (SQLite) + Config                   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Key Files
 
-| File | Purpose |
-|------|---------|
-| `grid_bot.py` | Main bot class, order management, rebalancing logic |
-| `strategy_manager.py` | Market analysis, trend scoring, auto-switch decisions |
-| `indicator_analyzer.py` | Technical indicators, Smart TP calculation |
-| `aster_client.py` | Aster DEX API client (REST + WebSocket) |
-| `telegram_notifier.py` | Telegram notifications (alerts, summaries) |
-| `telegram_commands.py` | Interactive Telegram commands (/status, /balance, etc.) |
-| `trade_logger.py` | SQLite trade history and balance snapshots |
-| `config.py` | All configuration (API, trading, grid, risk) |
-| `cli.py` | Command-line interface for running the bot |
+| File | Lines | Purpose |
+|------|-------|---------|
+| `grid_bot.py` | ~2,140 | Main bot, order management, rebalancing |
+| `strategy_manager.py` | ~1,360 | Risk analysis, market monitoring, alerts |
+| `aster_client.py` | ~1,040 | API client (REST + WebSocket) |
+| `cli.py` | ~800 | Command-line interface |
+| `indicator_analyzer.py` | ~340 | Technical indicators, Smart TP |
+| `config.py` | ~375 | All configurations |
+| `telegram_notifier.py` | - | Telegram notifications |
+| `telegram_commands.py` | - | Interactive Telegram commands |
+| `trade_logger.py` | - | SQLite trade history |
 
 ## Common Commands
 
@@ -57,6 +57,9 @@ python cli.py run --dry-run
 
 # Check status
 python cli.py status
+
+# View trade history
+python cli.py history
 
 # View logs on Railway
 railway logs -n 500
@@ -76,11 +79,13 @@ MARGIN_ASSET = "USDF"
 
 # Grid
 GRID_COUNT = 12
-GRID_RANGE_PERCENT = 3.0  # ±3% (dynamic: 2-6%)
+GRID_RANGE_PERCENT = 3.0  # ±3%
 QUANTITY_PER_GRID_USDT = 25
 
 # Risk
-MAX_DRAWDOWN_PERCENT = 80
+MAX_DRAWDOWN_PERCENT = 20
+MAX_POSITIONS = 5
+MAX_POSITION_PERCENT = 80
 AUTO_TP_ENABLED = True
 USE_SMART_TP = True
 
@@ -92,28 +97,97 @@ REGRID_ON_TP_ENABLED = True
 
 ## Grid Strategy
 
-1. **Arithmetic Grid:** Evenly spaced price levels
-2. **LONG-only mode:** Only BUY orders (configurable)
-3. **Smart TP:** RSI/MACD-based take-profit (1.0% - 2.5%)
-4. **Auto Re-Grid:** Repositions when price drifts >3.5%
-5. **Auto Switch Side:** Changes LONG/SHORT based on trend score
+### Order Flow
+```
+EMPTY → BUY_PLACED → POSITION_HELD → TP_PLACED → (TP fills) → EMPTY
+         ↓              ↓                ↓
+    Place BUY       BUY filled       Place TP
+                  Store entry price   Wait for profit
+```
 
-## Trend Score System
+### Smart Take-Profit (Dynamic TP%)
+| Condition | TP% | Reason |
+|-----------|-----|--------|
+| RSI > 65 (near overbought) | 1.0% | Take profit quickly |
+| RSI < 40 (oversold) | 2.5% | Hold for bigger move |
+| MACD+ & Trend bullish | 2.0% | Medium TP |
+| Default | 1.5% | Standard |
 
+### Trend Score System
 ```
 Score = EMA + MACD + RSI + Volume (-4 to +4)
 
 ≥ +2  → LONG bias
 ≤ -2  → SHORT bias
 else  → STAY current side
+
+Requires 2 confirmations before switching (anti-whipsaw)
 ```
 
-## Risk Management
+## Risk Management (10 Layers)
 
-- **Circuit Breaker:** Auto-pause at 80% drawdown
-- **Min Balance:** $50 minimum
-- **Volatility Detection:** Pause on extreme volatility (>10% ATR)
-- **Position Limits:** Max open orders = 20
+### Layer 1: Circuit Breaker
+- **Max Drawdown 20%** → Auto-pause bot
+- **Min Balance $50** → Stop if balance too low
+- Prevents catastrophic losses
+
+### Layer 2: Position Limits
+- **MAX_POSITIONS = 5** → Limit concurrent positions
+- **MAX_POSITION_PERCENT = 80%** → Don't use more than 80% of balance
+- Reduces exposure during volatility
+
+### Layer 3: Volatility Detection
+- **ATR > 5%** = RANGING_VOLATILE → Recommend wider grid
+- **ATR > 10%** = EXTREME_VOLATILITY → **Auto-pause**
+- Prevents trading during extreme swings
+
+### Layer 4: Auto Re-Grid
+- When price moves **> 3.5%** from grid center
+- **Auto-cancel** old orders and place new grid
+- Prevents grid from drifting away from price
+
+### Layer 5: Trend Score & Auto-Switch
+- Calculates **Trend Score** from 4 indicators
+- Score ≥ +2 → Recommend LONG
+- Score ≤ -2 → Recommend SHORT
+- Requires **2 confirmations** before switch
+
+### Layer 6: Real-time Price Spike Detection
+- **WebSocket** monitors price in real-time
+- Alert when price moves **≥ 3%** in 5 minutes
+- **Extreme Alert** when ≥ 5% + unfavorable direction
+- Faster response than 15-min check
+
+### Layer 7: Funding Rate Monitoring
+- Check funding rate every 15 minutes
+- **Warning** when rate ≥ 0.1% and near funding time
+- **Extreme Alert** when rate ≥ 0.3%
+- Calculates favorable/unfavorable based on grid side
+
+### Layer 8: BTC Correlation Analysis
+- Analyzes **BTC** as leading indicator
+- **LONG grid + BTC bearish (score ≤ -2)** → CRITICAL
+- **LONG grid + BTC RSI > 70** → WARNING
+- Prevents altcoin losses from BTC dumps
+
+### Layer 9: Liquidity Crisis Detection
+- Check **Spread** and **Order Book Depth**
+- Spread > 0.3% = WARNING, > 0.5% = CRITICAL
+- Depth < $5,000 = CRITICAL + **Auto-pause**
+- Prevents slippage during low liquidity
+
+### Layer 10: Position Size Coordination
+- Check **Grid Config vs Balance** mismatch
+- Alert when position usage ≥ 70% of limit
+- **CRITICAL** when ≥ 90% + suggestions
+- Prevents over-exposure
+
+## Monitoring Schedule
+
+| Interval | Checks |
+|----------|--------|
+| **Real-time** | Price spike detection (WebSocket) |
+| **Every 15 min** | Market analysis, funding rate, BTC correlation, liquidity, position size |
 
 ## Telegram Commands
 
@@ -129,39 +203,62 @@ else  → STAY current side
 | `/history` | Recent trade history |
 | `/help` | All available commands |
 
-## Grid Level State Machine
+## Alert Types
 
-```
-GridLevelState:
-  EMPTY          → No order, no position
-  BUY_PLACED     → BUY order placed, waiting fill
-  POSITION_HELD  → BUY filled, holding position (entry_price, position_quantity set)
-  TP_PLACED      → TP SELL order placed (tp_order_id set)
-  SELL_PLACED    → Regular SELL order placed
+| Icon | Level | Meaning |
+|------|-------|---------|
+| `🚨` | CRITICAL | Immediate action required |
+| `⚠️` | WARNING | Monitor closely |
+| `📈📉` | INFO | Price movement |
+| `✅` | OK | Condition normalized |
 
-Flow: EMPTY → BUY_PLACED → POSITION_HELD → TP_PLACED → (TP fills) → EMPTY
+## StrategyManager Features
+
+```python
+class StrategyManager:
+    # Check interval
+    check_interval = 900  # 15 minutes
+
+    # Volatility thresholds
+    volatility_threshold_high = 5%    # ATR
+    volatility_threshold_extreme = 10%
+
+    # Funding rate thresholds
+    funding_rate_threshold = 0.1%   # Warning
+    funding_rate_extreme = 0.3%     # Critical
+
+    # Price spike detection
+    price_spike_threshold = 3%      # In 5-min window
+
+    # BTC correlation
+    btc_rsi_danger_high = 70        # Overbought
+    btc_rsi_danger_low = 30         # Oversold
+
+    # Liquidity thresholds
+    spread_warning = 0.3%
+    spread_danger = 0.5%
+    min_depth = $5,000
+
+    # Position size thresholds
+    position_warning = 70%          # Of max
+    position_danger = 90%
 ```
 
 ## Realized PnL Calculation
 
 ```python
+# TP uses TOTAL position avg entry (not individual level)
+# This ensures TP is always profitable
+
+positions = await client.get_position_risk(symbol)
+total_entry_price = positions[0]["entryPrice"]  # Weighted average
+
+tp_price = total_entry_price * (1 + tp_percent)
+
 # On SELL (TP) fill:
-pnl = (fill_price - level.entry_price) * level.position_quantity
-state.realized_pnl += pnl  # Accumulates total realized PnL
+pnl = (fill_price - entry_price) * quantity
+state.realized_pnl += pnl
 ```
-
-## Known Issues
-
-1. ~~`send_message()` missing in TelegramNotifier~~ (Fixed 2026-01-08)
-2. ~~`realized_pnl` always 0~~ (Fixed 2026-01-08)
-3. ~~Position size not tracked accurately in GridLevel~~ (Fixed 2026-01-08)
-
-## Development Notes
-
-- Always test with `--dry-run` first
-- Railway deployment auto-restarts on push to main
-- Logs stored in `/app/logs/` on Railway (volume mounted)
-- SQLite DB: `grid_bot_trades.db`
 
 ## Environment Variables
 
@@ -186,3 +283,30 @@ railway logs -n 500
 # Trigger redeploy
 git push origin main
 ```
+
+## Development Notes
+
+- Always test with `--dry-run` first
+- Railway auto-restarts on push to main
+- Logs stored in `/app/logs/` on Railway (volume mounted)
+- SQLite DB: `grid_bot_trades.db`
+
+## Recent Updates (2026-01-08)
+
+| Feature | Description |
+|---------|-------------|
+| TP Fix | Use total position avg entry instead of level entry |
+| Sync Positions | Place TP for existing positions after restart |
+| 15-min Check | Reduced from 30 minutes |
+| Funding Rate | Monitor and alert on high funding |
+| Price Spike | Real-time WebSocket detection |
+| BTC Correlation | Leading indicator analysis |
+| Liquidity Check | Spread + depth monitoring |
+| Position Size | Exposure coordination |
+
+## Known Issues (All Fixed)
+
+1. ~~`send_message()` missing in TelegramNotifier~~ (Fixed 2026-01-08)
+2. ~~`realized_pnl` always 0~~ (Fixed 2026-01-08)
+3. ~~Position size not tracked accurately~~ (Fixed 2026-01-08)
+4. ~~TP calculated from level entry instead of total position~~ (Fixed 2026-01-08)
