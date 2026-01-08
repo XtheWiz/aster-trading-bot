@@ -1365,13 +1365,53 @@ class GridBot:
             new_side: "LONG", "SHORT", or "BOTH"
         """
         old_side = config.grid.GRID_SIDE
-        
+
         if old_side == new_side:
             logger.info(f"Already on {new_side} side, no switch needed")
             return
-        
+
+        # CRITICAL: Check for existing positions before switching
+        # Switching while holding position causes realized losses
+        try:
+            positions = await self.client.get_position_risk(config.trading.SYMBOL)
+            for pos in positions:
+                if pos.get("symbol") == config.trading.SYMBOL:
+                    position_amt = Decimal(pos.get("positionAmt", "0"))
+                    entry_price = Decimal(pos.get("entryPrice", "0"))
+
+                    # Block switch if we have LONG position and switching to SHORT (or vice versa)
+                    if old_side == "LONG" and new_side == "SHORT" and position_amt > 0:
+                        logger.warning(
+                            f"🚫 BLOCKED SIDE SWITCH: Have LONG position {position_amt} @ ${entry_price:.4f}. "
+                            f"Cannot switch to SHORT - would cause realized loss! Wait for TP to fill first."
+                        )
+                        await self.telegram.send_message(
+                            f"⚠️ Side Switch Blocked!\n\n"
+                            f"Cannot switch LONG → SHORT\n"
+                            f"Active position: {position_amt} @ ${entry_price:.4f}\n\n"
+                            f"Wait for TP to fill before switching."
+                        )
+                        return
+
+                    if old_side == "SHORT" and new_side == "LONG" and position_amt < 0:
+                        logger.warning(
+                            f"🚫 BLOCKED SIDE SWITCH: Have SHORT position {position_amt} @ ${entry_price:.4f}. "
+                            f"Cannot switch to LONG - would cause realized loss! Wait for TP to fill first."
+                        )
+                        await self.telegram.send_message(
+                            f"⚠️ Side Switch Blocked!\n\n"
+                            f"Cannot switch SHORT → LONG\n"
+                            f"Active position: {abs(position_amt)} @ ${entry_price:.4f}\n\n"
+                            f"Wait for TP to fill before switching."
+                        )
+                        return
+                    break
+        except Exception as e:
+            logger.error(f"Failed to check positions before switch: {e}")
+            # Continue with switch if we can't check (fail-open for flexibility)
+
         logger.warning(f"🔄 SWITCHING GRID SIDE: {old_side} → {new_side}")
-        
+
         try:
             # 1. Cancel all existing orders
             await self.cancel_all_orders()
