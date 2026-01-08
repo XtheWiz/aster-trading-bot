@@ -113,12 +113,15 @@ class TrendScore:
 class StrategyManager:
     """
     Quantitative analysis engine for the grid bot.
-    
+
     Enhanced features:
     - Telegram notifications when market state changes
     - Auto-pause on EXTREME_VOLATILITY
     - Auto Switch Side based on multi-indicator trend scoring
-    - 30-min check interval for faster response
+    - 15-min check interval for faster response
+    - Real-time price spike detection via WebSocket
+    - Funding rate monitoring with alerts
+    - BTC correlation analysis (leading indicator)
     """
     
     def __init__(self, client: AsterClient, bot_reference=None):
@@ -163,6 +166,14 @@ class StrategyManager:
         self.last_spike_alert: datetime | None = None
         self.spike_alert_cooldown = 60  # Seconds between alerts
         self._price_monitor_task: asyncio.Task | None = None
+
+        # BTC Correlation Analysis
+        self.btc_symbol = "BTCUSDT"
+        self.last_btc_analysis: MarketAnalysis | None = None
+        self.btc_trend_score: TrendScore | None = None
+        self.btc_rsi_danger_high = 70  # BTC overbought - danger for LONG
+        self.btc_rsi_danger_low = 30   # BTC oversold - danger for SHORT
+        self.btc_divergence_alert_sent = False
         
     async def start_monitoring(self):
         """Start the background monitoring loop."""
@@ -174,11 +185,15 @@ class StrategyManager:
 
         while self.is_running:
             try:
+                # Analyze main trading symbol (SOL)
                 analysis = await self.analyze_market()
                 await self.evaluate_safety(analysis)
 
                 # Check funding rate
                 await self._check_funding_rate()
+
+                # Check BTC correlation (leading indicator)
+                await self._check_btc_correlation()
 
                 # Sleep for interval
                 await asyncio.sleep(self.check_interval)
@@ -413,6 +428,128 @@ class StrategyManager:
                 f"Price moved {change_percent:+.2f}% against your {grid_side} grid!\n\n"
                 f"Consider immediate action!"
             )
+
+    async def _check_btc_correlation(self) -> None:
+        """
+        Analyze BTC as a leading indicator for altcoin movements.
+
+        BTC typically leads the crypto market:
+        - If BTC is bearish while we're LONG on altcoin → danger
+        - If BTC is overbought (RSI > 70) → potential reversal
+        - If BTC breaks key support/resistance → altcoins follow
+
+        This method compares BTC trend with current grid side and alerts
+        if there's a dangerous divergence.
+        """
+        try:
+            # Analyze BTC market
+            btc_analysis = await self.analyze_market(symbol=self.btc_symbol)
+            self.last_btc_analysis = btc_analysis
+
+            # Calculate BTC trend score
+            btc_score = self._calculate_trend_score(
+                btc_analysis.ema_fast,
+                btc_analysis.ema_slow,
+                btc_analysis.macd_histogram,
+                btc_analysis.rsi,
+                btc_analysis.volume_ratio
+            )
+            self.btc_trend_score = btc_score
+
+            # Get current grid side and SOL trend
+            grid_side = config.grid.GRID_SIDE
+            sol_score = self.current_trend_score.total if self.current_trend_score else 0
+
+            logger.info(
+                f"BTC Correlation Check: BTC={btc_score.total:+d} RSI={btc_analysis.rsi:.1f} | "
+                f"SOL={sol_score:+d} | Grid={grid_side}"
+            )
+
+            # Check for dangerous divergences
+            await self._evaluate_btc_divergence(btc_analysis, btc_score, grid_side)
+
+        except Exception as e:
+            logger.error(f"Error checking BTC correlation: {e}")
+
+    async def _evaluate_btc_divergence(
+        self,
+        btc_analysis: "MarketAnalysis",
+        btc_score: TrendScore,
+        grid_side: str
+    ) -> None:
+        """
+        Evaluate if BTC signals danger for current grid position.
+
+        Danger scenarios:
+        1. LONG grid + BTC strongly bearish (score <= -2)
+        2. LONG grid + BTC RSI > 70 (overbought, reversal likely)
+        3. SHORT grid + BTC strongly bullish (score >= +2)
+        4. SHORT grid + BTC RSI < 30 (oversold, bounce likely)
+        """
+        btc_rsi = btc_analysis.rsi
+        btc_total = btc_score.total
+        danger_detected = False
+        danger_reason = ""
+        severity = "WARNING"  # or "CRITICAL"
+
+        if grid_side == "LONG":
+            # Danger for LONG positions
+            if btc_total <= -2:
+                danger_detected = True
+                danger_reason = f"BTC strongly BEARISH (score: {btc_total:+d})"
+                severity = "CRITICAL" if btc_total <= -3 else "WARNING"
+
+            elif btc_rsi >= self.btc_rsi_danger_high:
+                danger_detected = True
+                danger_reason = f"BTC OVERBOUGHT (RSI: {btc_rsi:.1f})"
+                severity = "WARNING"
+
+            elif btc_analysis.macd_histogram < 0 and btc_rsi > 65:
+                danger_detected = True
+                danger_reason = f"BTC showing reversal signals (MACD-, RSI={btc_rsi:.1f})"
+                severity = "WARNING"
+
+        elif grid_side == "SHORT":
+            # Danger for SHORT positions
+            if btc_total >= 2:
+                danger_detected = True
+                danger_reason = f"BTC strongly BULLISH (score: {btc_total:+d})"
+                severity = "CRITICAL" if btc_total >= 3 else "WARNING"
+
+            elif btc_rsi <= self.btc_rsi_danger_low:
+                danger_detected = True
+                danger_reason = f"BTC OVERSOLD (RSI: {btc_rsi:.1f})"
+                severity = "WARNING"
+
+        # Send alert if danger detected (with cooldown)
+        if danger_detected:
+            # Avoid spam - only alert once per divergence
+            if not self.btc_divergence_alert_sent:
+                self.btc_divergence_alert_sent = True
+
+                icon = "🚨" if severity == "CRITICAL" else "⚠️"
+                sol_price = self.last_analysis.current_price if self.last_analysis else Decimal("0")
+                btc_price = btc_analysis.current_price
+
+                await self.telegram.send_message(
+                    f"{icon} BTC Correlation Alert!\n\n"
+                    f"Your Grid: {grid_side}\n"
+                    f"Danger: {danger_reason}\n\n"
+                    f"BTC Analysis:\n"
+                    f"  Price: ${btc_price:,.0f}\n"
+                    f"  RSI: {btc_rsi:.1f}\n"
+                    f"  Trend Score: {btc_total:+d}\n"
+                    f"  {btc_score}\n\n"
+                    f"SOL Price: ${sol_price:.2f}\n\n"
+                    f"{'🔴 Consider reducing exposure!' if severity == 'CRITICAL' else '⚠️ Monitor closely!'}"
+                )
+
+                logger.warning(f"BTC Divergence Alert: {danger_reason}")
+        else:
+            # Reset alert flag when divergence clears
+            if self.btc_divergence_alert_sent:
+                self.btc_divergence_alert_sent = False
+                logger.info("BTC correlation normalized - divergence alert cleared")
 
     async def analyze_market(self, symbol: str | None = None) -> MarketAnalysis:
         """
