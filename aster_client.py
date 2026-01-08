@@ -471,7 +471,92 @@ class AsterClient:
         if symbol:
             params["symbol"] = symbol
         return await self._request("GET", "/fapi/v1/openOrders", params, signed=True)
-    
+
+    async def get_user_trades(
+        self,
+        symbol: str,
+        limit: int = 50,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Get account trade history.
+
+        Returns filled trades with PnL information:
+        - symbol: Trading pair
+        - id: Trade ID
+        - orderId: Order ID
+        - side: BUY or SELL
+        - price: Execution price
+        - qty: Quantity
+        - realizedPnl: Realized PnL for this trade
+        - commission: Trading fee
+        - time: Trade timestamp
+
+        Args:
+            symbol: Trading pair
+            limit: Number of trades to return (default 50, max 1000)
+            start_time: Start time in milliseconds (optional)
+            end_time: End time in milliseconds (optional)
+
+        Returns:
+            List of trade records
+        """
+        if config.DRY_RUN:
+            logger.info("[DRY RUN] get_user_trades - returning empty list")
+            return []
+
+        params = {"symbol": symbol, "limit": limit}
+        if start_time:
+            params["startTime"] = start_time
+        if end_time:
+            params["endTime"] = end_time
+
+        return await self._request("GET", "/fapi/v1/userTrades", params, signed=True)
+
+    async def get_income_history(
+        self,
+        symbol: str | None = None,
+        income_type: str | None = None,
+        limit: int = 50,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Get income history (PnL, funding fees, commissions).
+
+        Income types:
+        - REALIZED_PNL: Realized profit/loss
+        - FUNDING_FEE: Funding fee
+        - COMMISSION: Trading commission
+        - TRANSFER: Transfer in/out
+
+        Args:
+            symbol: Trading pair (optional)
+            income_type: Filter by income type (optional)
+            limit: Number of records (default 50, max 1000)
+            start_time: Start time in milliseconds (optional)
+            end_time: End time in milliseconds (optional)
+
+        Returns:
+            List of income records
+        """
+        if config.DRY_RUN:
+            logger.info("[DRY RUN] get_income_history - returning empty list")
+            return []
+
+        params = {"limit": limit}
+        if symbol:
+            params["symbol"] = symbol
+        if income_type:
+            params["incomeType"] = income_type
+        if start_time:
+            params["startTime"] = start_time
+        if end_time:
+            params["endTime"] = end_time
+
+        return await self._request("GET", "/fapi/v3/income", params, signed=True)
+
     # =========================================================================
     # ORDER MANAGEMENT ENDPOINTS (Signed)
     # =========================================================================

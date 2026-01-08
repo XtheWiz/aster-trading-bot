@@ -660,6 +660,64 @@ def estimate_slippage(
     return slippage if not is_sell else -slippage
 
 
+async def cmd_history(limit: int = 20):
+    """Fetch trade history from exchange."""
+    print(f"📜 Fetching Trade History from Exchange (Last {limit})")
+    client = AsterClient()
+    symbol = config.trading.SYMBOL
+
+    try:
+        trades = await client.get_user_trades(symbol=symbol, limit=limit)
+
+        if not trades:
+            print("\n✅ No trades found on exchange")
+            return
+
+        print("\n" + "=" * 100)
+        print("TIME".ljust(20) + "SIDE".ljust(6) + "PRICE".rjust(12) +
+              "QTY".rjust(10) + "REALIZED PNL".rjust(14) + "COMMISSION".rjust(12) + "ORDER ID".rjust(16))
+        print("=" * 100)
+
+        from datetime import datetime
+
+        total_pnl = 0
+        total_commission = 0
+
+        for t in trades:
+            # Convert timestamp
+            ts_ms = t.get('time', 0)
+            ts = datetime.fromtimestamp(ts_ms / 1000).strftime('%Y-%m-%d %H:%M:%S') if ts_ms else ""
+
+            side = t.get('side', '')
+            price = float(t.get('price', 0))
+            qty = float(t.get('qty', 0))
+            realized_pnl = float(t.get('realizedPnl', 0))
+            commission = float(t.get('commission', 0))
+            order_id = t.get('orderId', '')
+
+            total_pnl += realized_pnl
+            total_commission += commission
+
+            # Icons
+            side_icon = "📈" if side == 'BUY' else "📉"
+            pnl_icon = "🟢" if realized_pnl > 0 else ("🔴" if realized_pnl < 0 else "  ")
+
+            print(f"{ts.ljust(20)}{side_icon}{side.ljust(5)}"
+                  f"{price:>12.4f}{qty:>10.4f}"
+                  f"{pnl_icon}{realized_pnl:>+12.4f}"
+                  f"{commission:>12.6f}"
+                  f"{str(order_id).rjust(16)}")
+
+        print("=" * 100)
+        pnl_color = "🟢" if total_pnl > 0 else ("🔴" if total_pnl < 0 else "")
+        print(f"TOTAL: {pnl_color} PnL: {total_pnl:+.4f} | Commission: {total_commission:.6f}")
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
+    finally:
+        await client.close()
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -720,6 +778,11 @@ def main():
         asyncio.run(run_optimization(days=days))
     elif cmd == "spread":
         asyncio.run(cmd_spread(arg))
+
+    # Trade History from Exchange
+    elif cmd == "history":
+        limit = int(arg) if arg else 20
+        asyncio.run(cmd_history(limit))
 
     else:
         print(f"❌ Unknown command: {cmd}")

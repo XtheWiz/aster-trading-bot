@@ -796,17 +796,36 @@ class GridBot:
         Place intelligent Take-Profit order based on market indicators.
 
         This method:
-        1. Uses cached analysis from StrategyManager if available
-        2. Falls back to fetching candle data if no cache
+        1. Gets TOTAL position avg entry from exchange (to avoid selling at loss)
+        2. Uses cached analysis from StrategyManager if available
         3. Determines optimal TP% based on market conditions
-        4. Places SELL order at calculated TP price
+        4. Places SELL order at calculated TP price (above total avg entry)
 
         Args:
             filled_level: The grid level that just got filled (BUY)
         """
         try:
-            # Use actual fill price, not grid price
-            entry_price = filled_level.entry_price if filled_level.entry_price > 0 else filled_level.price
+            # Get TOTAL position entry price from exchange
+            # This ensures TP is always above avg entry to avoid realized loss
+            positions = await self.client.get_position_risk(config.trading.SYMBOL)
+            total_entry_price = Decimal("0")
+
+            for pos in positions:
+                if pos.get("symbol") == config.trading.SYMBOL:
+                    pos_amt = Decimal(pos.get("positionAmt", "0"))
+                    if pos_amt > 0:  # LONG position
+                        total_entry_price = Decimal(pos.get("entryPrice", "0"))
+                        break
+
+            # Use total position entry if available, otherwise use level entry
+            level_entry = filled_level.entry_price if filled_level.entry_price > 0 else filled_level.price
+
+            if total_entry_price > 0:
+                entry_price = total_entry_price
+                logger.info(f"📊 Using TOTAL position avg entry: ${total_entry_price:.4f} (level entry: ${level_entry:.4f})")
+            else:
+                entry_price = level_entry
+                logger.info(f"📊 No total position, using level entry: ${entry_price:.4f}")
 
             # Get TP percentage
             if config.risk.USE_SMART_TP:
@@ -866,15 +885,16 @@ class GridBot:
 
             logger.info(
                 f"🎯 SMART TP PLACED: SELL @ ${tp_price:.4f} (+{tp_percent}%) | "
-                f"Entry: ${entry_price:.4f} | Qty: {filled_level.position_quantity} | OrderID: {order_id}"
+                f"Avg Entry: ${entry_price:.4f} | Qty: {quantity} | OrderID: {order_id}"
             )
-            
+
             # Send Telegram notification
             await self.telegram.send_message(
                 f"🎯 Smart TP Placed!\n"
-                f"Entry: ${entry_price:.4f}\n"
+                f"Avg Entry: ${entry_price:.4f}\n"
                 f"TP: ${tp_price:.4f} (+{tp_percent}%)\n"
-                f"Qty: {quantity}"
+                f"Qty: {quantity}\n"
+                f"(TP based on total position avg)"
             )
             
             # Log trade event for analysis
@@ -1112,16 +1132,16 @@ class GridBot:
 
                 logger.info(
                     f"🎯 SYNC TP PLACED: SELL @ ${tp_price:.4f} (+{tp_percent}%) | "
-                    f"Entry: ${entry_price:.4f} | Qty: {position_qty} | OrderID: {order_id}"
+                    f"Avg Entry: ${entry_price:.4f} | Qty: {position_qty} | OrderID: {order_id}"
                 )
 
                 # Send Telegram notification
                 await self.telegram.send_message(
                     f"🔄 Synced Existing Position\n\n"
-                    f"Entry: ${entry_price:.4f}\n"
+                    f"Avg Entry: ${entry_price:.4f}\n"
                     f"TP: ${tp_price:.4f} (+{tp_percent}%)\n"
                     f"Qty: {position_qty}\n\n"
-                    f"Position from before restart now has TP!"
+                    f"TP based on total position avg entry"
                 )
 
                 synced += 1
