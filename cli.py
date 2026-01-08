@@ -5,12 +5,18 @@ Aster DEX CLI Tool
 A command-line interface for interacting with Aster DEX API.
 
 Usage:
-    python cli.py balance          - Check account balance
-    python cli.py price [symbol]   - Get current price
-    python cli.py orders [symbol]  - List open orders
-    python cli.py positions        - List open positions
-    python cli.py analyze [symbol] - Analyze market trend & conditions
-    python cli.py test             - Test API connection
+    python cli.py balance             - Check account balance
+    python cli.py price [symbol]      - Get current price
+    python cli.py orders [symbol]     - List open orders
+    python cli.py positions           - List open positions
+    python cli.py analyze [symbol]    - Analyze market trend & conditions
+    python cli.py test                - Test API connection
+
+Analytics (Phase 4):
+    python cli.py stats [days]        - Show trading statistics
+    python cli.py daily [days]        - Show daily performance
+    python cli.py levels              - Show grid level performance
+    python cli.py trades [limit]      - Show recent trades
 """
 import asyncio
 import sys
@@ -196,7 +202,26 @@ async def cmd_analyze(symbol: str = None):
         print(f"🎯 Trend:      {direction}")
         print(f"🌡️  State:      {state_desc}")
         print(f"📐 Volatility: {analysis.volatility_score:.2f}%")
-        
+
+        # Display Trend Score details
+        print("\n" + "-" * 60)
+        print("📊 TREND SCORE BREAKDOWN:")
+        trend_score = sm.current_trend_score
+        if trend_score:
+            ema_icon = "🟢" if trend_score.ema_score > 0 else ("🔴" if trend_score.ema_score < 0 else "⚪")
+            macd_icon = "🟢" if trend_score.macd_score > 0 else ("🔴" if trend_score.macd_score < 0 else "⚪")
+            rsi_icon = "🟢" if trend_score.rsi_score > 0 else ("🔴" if trend_score.rsi_score < 0 else "⚪")
+            vol_icon = "🟢" if trend_score.volume_score > 0 else ("🔴" if trend_score.volume_score < 0 else "⚪")
+            total_icon = "🟢" if trend_score.total > 0 else ("🔴" if trend_score.total < 0 else "⚪")
+
+            print(f"   {ema_icon} EMA (7/25):    {trend_score.ema_score:+d}  (Fast: ${float(analysis.ema_fast):.2f}, Slow: ${float(analysis.ema_slow):.2f})")
+            print(f"   {macd_icon} MACD Hist:    {trend_score.macd_score:+d}  ({analysis.macd_histogram:+.4f})")
+            print(f"   {rsi_icon} RSI (14):     {trend_score.rsi_score:+d}  ({analysis.rsi:.1f})")
+            vol_status = "confirms" if trend_score.volume_score != 0 else "neutral"
+            print(f"   {vol_icon} Volume:       {trend_score.volume_score:+d}  (ratio: {trend_score.volume_ratio:.2f}x, {vol_status})")
+            print(f"   {total_icon} Total Score:  {trend_score.total:+d}  (Range: -4 to +4)")
+            print(f"\n   ➡️  Recommended Side: {trend_score.recommended_side}")
+
         print("\n" + "-" * 60)
         print("💡 RECOMMENDATION:")
         print(f"   {recommendation}")
@@ -281,11 +306,11 @@ async def cmd_order(symbol: str, side: str, quantity: str, order_type: str = "MA
     symbol = symbol.upper()
     side = side.upper()
     order_type = order_type.upper()
-    
+
     print(f"📝 Placing {side} {order_type} order for {quantity} {symbol}...")
-    
+
     client = AsterClient()
-    
+
     try:
         kwargs = {
             "symbol": symbol,
@@ -293,12 +318,12 @@ async def cmd_order(symbol: str, side: str, quantity: str, order_type: str = "MA
             "quantity": Decimal(quantity),
             "order_type": order_type,
         }
-        
+
         if price and order_type == "LIMIT":
             kwargs["price"] = Decimal(price)
-        
+
         result = await client.place_order(**kwargs)
-        
+
         print(f"\n✅ Order placed!")
         print(f"   Order ID: {result.get('orderId')}")
         print(f"   Symbol: {symbol}")
@@ -307,21 +332,201 @@ async def cmd_order(symbol: str, side: str, quantity: str, order_type: str = "MA
         print(f"   Quantity: {quantity}")
         if price:
             print(f"   Price: ${price}")
-        
+
     except Exception as e:
         print(f"\n❌ Failed to place order: {e}")
     finally:
         await client.close()
 
 
+# =============================================================================
+# Phase 4: Analytics Commands
+# =============================================================================
+
+async def cmd_stats(days: int = 7):
+    """Show comprehensive trading statistics."""
+    from trade_logger import TradeLogger
+
+    print(f"📊 Trading Statistics (Last {days} days)")
+
+    logger = TradeLogger()
+    await logger.initialize()
+
+    try:
+        stats = await logger.get_analytics(days)
+
+        print("\n" + "=" * 60)
+        print("📈 PERFORMANCE METRICS")
+        print("=" * 60)
+
+        # Win/Loss
+        print(f"\n🎯 Win Rate:        {stats['win_rate']}%")
+        print(f"   Winning Trades:  {stats['winning_trades']}")
+        print(f"   Losing Trades:   {stats['losing_trades']}")
+        print(f"   Total Trades:    {stats['total_trades']}")
+
+        # PnL
+        pnl_icon = "🟢" if stats['total_pnl'] >= 0 else "🔴"
+        print(f"\n💰 Total PnL:       {pnl_icon} {stats['total_pnl']:+.4f} USDT")
+        print(f"   Avg Win:         +{stats['avg_win']:.4f} USDT")
+        print(f"   Avg Loss:        {stats['avg_loss']:.4f} USDT")
+        print(f"   Avg Trade:       {stats['avg_trade']:+.4f} USDT")
+
+        # Risk Metrics
+        print(f"\n📊 Risk Metrics:")
+        print(f"   Profit Factor:   {stats['profit_factor']}")
+        print(f"   Sharpe Ratio:    {stats['sharpe_ratio']}")
+        print(f"   Max Drawdown:    -{stats['max_drawdown']:.4f} USDT")
+
+        # Best/Worst
+        print(f"\n🏆 Best Trade:      +{stats['best_trade']:.4f} USDT")
+        print(f"💀 Worst Trade:     {stats['worst_trade']:.4f} USDT")
+
+        print("=" * 60)
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+    finally:
+        await logger.close()
+
+
+async def cmd_daily(days: int = 7):
+    """Show daily performance breakdown."""
+    from trade_logger import TradeLogger
+
+    print(f"📅 Daily Performance (Last {days} days)")
+
+    logger = TradeLogger()
+    await logger.initialize()
+
+    try:
+        daily = await logger.get_daily_stats(days)
+
+        if not daily:
+            print("\n✅ No trades found in this period")
+            return
+
+        print("\n" + "=" * 70)
+        print("DATE".ljust(12) + "TRADES".rjust(8) + "WINS".rjust(8) +
+              "LOSSES".rjust(8) + "WIN%".rjust(8) + "PNL".rjust(14))
+        print("=" * 70)
+
+        total_pnl = 0
+        for d in daily:
+            pnl_str = f"{d['pnl']:+.4f}"
+            pnl_icon = "🟢" if d['pnl'] >= 0 else "🔴"
+            print(f"{d['date'].ljust(12)}{str(d['trades']).rjust(8)}"
+                  f"{str(d['wins']).rjust(8)}{str(d['losses']).rjust(8)}"
+                  f"{str(d['win_rate']).rjust(7)}%{pnl_icon}{pnl_str.rjust(12)}")
+            total_pnl += d['pnl']
+
+        print("=" * 70)
+        total_icon = "🟢" if total_pnl >= 0 else "🔴"
+        print(f"{'TOTAL'.ljust(44)}{total_icon}{total_pnl:+.4f} USDT".rjust(14))
+        print("=" * 70)
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+    finally:
+        await logger.close()
+
+
+async def cmd_levels():
+    """Show grid level performance."""
+    from trade_logger import TradeLogger
+
+    print("📊 Grid Level Performance")
+
+    logger = TradeLogger()
+    await logger.initialize()
+
+    try:
+        levels = await logger.get_grid_level_stats()
+
+        if not levels:
+            print("\n✅ No trades found")
+            return
+
+        print("\n" + "=" * 65)
+        print("LEVEL".ljust(8) + "FILLS".rjust(8) + "BUYS".rjust(8) +
+              "SELLS".rjust(8) + "PNL".rjust(14) + "AVG PNL".rjust(14))
+        print("=" * 65)
+
+        for l in levels:
+            pnl_icon = "🟢" if l['pnl'] >= 0 else "🔴"
+            print(f"{str(l['level']).ljust(8)}{str(l['total_fills']).rjust(8)}"
+                  f"{str(l['buys']).rjust(8)}{str(l['sells']).rjust(8)}"
+                  f"{pnl_icon}{l['pnl']:+.4f}".rjust(13) +
+                  f"{l['avg_pnl']:+.4f}".rjust(14))
+
+        print("=" * 65)
+
+        # Summary
+        total_pnl = sum(l['pnl'] for l in levels)
+        best_level = max(levels, key=lambda x: x['pnl']) if levels else None
+        worst_level = min(levels, key=lambda x: x['pnl']) if levels else None
+
+        print(f"\n💰 Total PnL: {total_pnl:+.4f} USDT")
+        if best_level:
+            print(f"🏆 Best Level: {best_level['level']} ({best_level['pnl']:+.4f} USDT)")
+        if worst_level:
+            print(f"💀 Worst Level: {worst_level['level']} ({worst_level['pnl']:+.4f} USDT)")
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+    finally:
+        await logger.close()
+
+
+async def cmd_trades(limit: int = 20):
+    """Show recent trades."""
+    from trade_logger import TradeLogger
+
+    print(f"📋 Recent Trades (Last {limit})")
+
+    logger = TradeLogger()
+    await logger.initialize()
+
+    try:
+        trades = await logger.get_recent_trades(limit)
+
+        if not trades:
+            print("\n✅ No trades found")
+            return
+
+        print("\n" + "=" * 90)
+        print("TIME".ljust(20) + "SIDE".ljust(6) + "PRICE".rjust(12) +
+              "QTY".rjust(10) + "LEVEL".rjust(6) + "PNL".rjust(14) + "STATUS".rjust(12))
+        print("=" * 90)
+
+        for t in trades:
+            ts = t['timestamp'][:19] if t['timestamp'] else ""
+            pnl = float(t.get('pnl') or 0)
+            pnl_str = f"{pnl:+.4f}" if pnl != 0 else "-"
+            pnl_icon = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "  ")
+            side_icon = "📈" if t['side'] == 'BUY' else "📉"
+
+            print(f"{ts.ljust(20)}{side_icon}{t['side'].ljust(5)}"
+                  f"{t['price'].rjust(12)}{t['quantity'].rjust(10)}"
+                  f"{str(t['grid_level']).rjust(6)}"
+                  f"{pnl_icon}{pnl_str.rjust(12)}{t['status'].rjust(12)}")
+
+        print("=" * 90)
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+    finally:
+        await logger.close()
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
         return
-    
+
     cmd = sys.argv[1].lower()
     arg = sys.argv[2] if len(sys.argv) > 2 else None
-    
+
     if cmd == "balance":
         asyncio.run(cmd_balance())
     elif cmd == "price":
@@ -349,6 +554,20 @@ def main():
         order_type = sys.argv[5] if len(sys.argv) > 5 else "MARKET"
         price = sys.argv[6] if len(sys.argv) > 6 else None
         asyncio.run(cmd_order(symbol, side, qty, order_type, price))
+
+    # Phase 4: Analytics Commands
+    elif cmd == "stats":
+        days = int(arg) if arg else 7
+        asyncio.run(cmd_stats(days))
+    elif cmd == "daily":
+        days = int(arg) if arg else 7
+        asyncio.run(cmd_daily(days))
+    elif cmd == "levels":
+        asyncio.run(cmd_levels())
+    elif cmd == "trades":
+        limit = int(arg) if arg else 20
+        asyncio.run(cmd_trades(limit))
+
     else:
         print(f"❌ Unknown command: {cmd}")
         print(__doc__)

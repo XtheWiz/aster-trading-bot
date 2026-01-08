@@ -290,25 +290,25 @@ class TradeLogger:
     async def get_trade_summary(self, hours: int = 24) -> dict:
         """
         Get trading summary for the last N hours.
-        
+
         Args:
             hours: Number of hours to look back
-            
+
         Returns:
             Summary statistics dict
         """
         async with self._lock:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(None, self._get_summary, hours)
-    
+
     def _get_summary(self, hours: int) -> dict:
         """Get summary (sync)."""
         conn = self._get_connection()
         cursor = conn.cursor()
-        
+
         # Get trade count and PnL
         cursor.execute("""
-            SELECT 
+            SELECT
                 COUNT(*) as total_trades,
                 SUM(CASE WHEN side = 'BUY' THEN 1 ELSE 0 END) as buy_count,
                 SUM(CASE WHEN side = 'SELL' THEN 1 ELSE 0 END) as sell_count,
@@ -316,15 +316,211 @@ class TradeLogger:
             FROM trades
             WHERE timestamp > datetime('now', ?)
         """, (f'-{hours} hours',))
-        
+
         row = cursor.fetchone()
-        
+
         return {
             "total_trades": row["total_trades"] or 0,
             "buy_count": row["buy_count"] or 0,
             "sell_count": row["sell_count"] or 0,
             "total_pnl": row["total_pnl"] or 0,
         }
+
+    # =========================================================================
+    # Phase 4: Analytics Functions
+    # =========================================================================
+
+    async def get_analytics(self, days: int = 7) -> dict:
+        """
+        Get comprehensive trading analytics (Phase 4).
+
+        Returns:
+            Analytics dict with win_rate, sharpe_ratio, etc.
+        """
+        async with self._lock:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self._get_analytics, days)
+
+    def _get_analytics(self, days: int) -> dict:
+        """Calculate comprehensive analytics (sync)."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        # Get all SELL trades with PnL (only SELL has realized PnL)
+        cursor.execute("""
+            SELECT
+                timestamp,
+                CAST(pnl AS REAL) as pnl,
+                CAST(price AS REAL) as price,
+                CAST(quantity AS REAL) as quantity
+            FROM trades
+            WHERE side = 'SELL'
+              AND status = 'FILLED'
+              AND timestamp > datetime('now', ?)
+            ORDER BY timestamp ASC
+        """, (f'-{days} days',))
+
+        trades = cursor.fetchall()
+
+        if not trades:
+            return {
+                "total_trades": 0,
+                "winning_trades": 0,
+                "losing_trades": 0,
+                "win_rate": 0.0,
+                "total_pnl": 0.0,
+                "avg_win": 0.0,
+                "avg_loss": 0.0,
+                "profit_factor": 0.0,
+                "sharpe_ratio": 0.0,
+                "max_drawdown": 0.0,
+                "best_trade": 0.0,
+                "worst_trade": 0.0,
+                "avg_trade": 0.0,
+            }
+
+        # Calculate metrics
+        pnls = [t["pnl"] for t in trades if t["pnl"] is not None]
+        winning = [p for p in pnls if p > 0]
+        losing = [p for p in pnls if p < 0]
+
+        total_trades = len(pnls)
+        winning_trades = len(winning)
+        losing_trades = len(losing)
+
+        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+        total_pnl = sum(pnls)
+        avg_win = sum(winning) / winning_trades if winning_trades > 0 else 0
+        avg_loss = sum(losing) / losing_trades if losing_trades > 0 else 0
+
+        # Profit Factor = Gross Profit / Gross Loss
+        gross_profit = sum(winning) if winning else 0
+        gross_loss = abs(sum(losing)) if losing else 0
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf') if gross_profit > 0 else 0
+
+        # Sharpe Ratio (simplified: mean / std of returns)
+        import statistics
+        if len(pnls) >= 2:
+            mean_return = statistics.mean(pnls)
+            std_return = statistics.stdev(pnls)
+            # Annualized (assuming daily trades)
+            sharpe_ratio = (mean_return / std_return) * (365 ** 0.5) if std_return > 0 else 0
+        else:
+            sharpe_ratio = 0
+
+        # Max Drawdown (from cumulative PnL)
+        cumulative = 0
+        peak = 0
+        max_drawdown = 0
+        for pnl in pnls:
+            cumulative += pnl
+            if cumulative > peak:
+                peak = cumulative
+            drawdown = peak - cumulative
+            if drawdown > max_drawdown:
+                max_drawdown = drawdown
+
+        return {
+            "total_trades": total_trades,
+            "winning_trades": winning_trades,
+            "losing_trades": losing_trades,
+            "win_rate": round(win_rate, 2),
+            "total_pnl": round(total_pnl, 4),
+            "avg_win": round(avg_win, 4),
+            "avg_loss": round(avg_loss, 4),
+            "profit_factor": round(profit_factor, 2) if profit_factor != float('inf') else "∞",
+            "sharpe_ratio": round(sharpe_ratio, 2),
+            "max_drawdown": round(max_drawdown, 4),
+            "best_trade": round(max(pnls), 4) if pnls else 0,
+            "worst_trade": round(min(pnls), 4) if pnls else 0,
+            "avg_trade": round(total_pnl / total_trades, 4) if total_trades > 0 else 0,
+        }
+
+    async def get_daily_stats(self, days: int = 7) -> list[dict]:
+        """
+        Get daily trading statistics.
+
+        Returns:
+            List of daily stats dicts
+        """
+        async with self._lock:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self._get_daily_stats, days)
+
+    def _get_daily_stats(self, days: int) -> list[dict]:
+        """Get daily stats (sync)."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT
+                DATE(timestamp) as date,
+                COUNT(*) as trades,
+                SUM(CASE WHEN side = 'SELL' AND CAST(pnl AS REAL) > 0 THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN side = 'SELL' AND CAST(pnl AS REAL) < 0 THEN 1 ELSE 0 END) as losses,
+                SUM(CASE WHEN side = 'SELL' THEN CAST(pnl AS REAL) ELSE 0 END) as pnl
+            FROM trades
+            WHERE timestamp > datetime('now', ?)
+            GROUP BY DATE(timestamp)
+            ORDER BY date DESC
+        """, (f'-{days} days',))
+
+        rows = cursor.fetchall()
+        return [
+            {
+                "date": row["date"],
+                "trades": row["trades"],
+                "wins": row["wins"] or 0,
+                "losses": row["losses"] or 0,
+                "pnl": round(row["pnl"] or 0, 4),
+                "win_rate": round((row["wins"] or 0) / ((row["wins"] or 0) + (row["losses"] or 0)) * 100, 1)
+                           if (row["wins"] or 0) + (row["losses"] or 0) > 0 else 0
+            }
+            for row in rows
+        ]
+
+    async def get_grid_level_stats(self) -> list[dict]:
+        """
+        Get statistics by grid level.
+
+        Returns:
+            List of grid level stats
+        """
+        async with self._lock:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self._get_grid_level_stats)
+
+    def _get_grid_level_stats(self) -> list[dict]:
+        """Get grid level stats (sync)."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT
+                grid_level,
+                COUNT(*) as total_fills,
+                SUM(CASE WHEN side = 'BUY' THEN 1 ELSE 0 END) as buys,
+                SUM(CASE WHEN side = 'SELL' THEN 1 ELSE 0 END) as sells,
+                SUM(CASE WHEN side = 'SELL' THEN CAST(pnl AS REAL) ELSE 0 END) as pnl,
+                AVG(CASE WHEN side = 'SELL' THEN CAST(pnl AS REAL) END) as avg_pnl
+            FROM trades
+            WHERE status = 'FILLED'
+            GROUP BY grid_level
+            ORDER BY grid_level
+        """)
+
+        rows = cursor.fetchall()
+        return [
+            {
+                "level": row["grid_level"],
+                "total_fills": row["total_fills"],
+                "buys": row["buys"] or 0,
+                "sells": row["sells"] or 0,
+                "pnl": round(row["pnl"] or 0, 4),
+                "avg_pnl": round(row["avg_pnl"] or 0, 4),
+            }
+            for row in rows
+        ]
     
     async def get_recent_trades(self, limit: int = 10) -> list[dict]:
         """
