@@ -130,7 +130,10 @@ class GridConfig:
     
     # Quantity per grid level - Conservative for low-risk trading
     # 25 USDF per grid with 3x = ~0.6 SOL per grid (small position)
-    QUANTITY_PER_GRID_USDT: Decimal = Decimal("25.0")
+    # Reduced from 25 to 18 for better position size management
+    # At 5x leverage: $18 × 5 = $90 notional per level
+    # Max 5 positions = $450 total (within 80% limit of ~$380 balance)
+    QUANTITY_PER_GRID_USDT: Decimal = Decimal("18.0")
     
     # Maximum number of open orders allowed
     MAX_OPEN_ORDERS: int = 20
