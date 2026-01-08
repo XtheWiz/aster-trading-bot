@@ -193,7 +193,7 @@ class GridLevel:
 class GridState:
     """
     Complete state of the grid trading system.
-    
+
     This tracks all grid levels, orders, and financial metrics
     for monitoring and decision-making.
     """
@@ -202,17 +202,22 @@ class GridState:
     upper_price: Decimal = Decimal("0")
     grid_step: Decimal = Decimal("0")
     entry_price: Decimal = Decimal("0")
-    
+
     # Grid levels
     levels: list[GridLevel] = field(default_factory=list)
-    
+
     # Financial tracking
     initial_balance: Decimal = Decimal("0")
     current_balance: Decimal = Decimal("0")
     unrealized_pnl: Decimal = Decimal("0")
     realized_pnl: Decimal = Decimal("0")
     total_trades: int = 0
-    
+
+    # Phase 3: Risk Management Tracking
+    daily_realized_pnl: Decimal = Decimal("0")  # Resets daily
+    daily_start_time: datetime | None = None
+    session_high_price: Decimal = Decimal("0")  # For trailing stop
+
     # Timing
     start_time: datetime | None = None
     
@@ -234,6 +239,23 @@ class GridState:
     def active_orders_count(self) -> int:
         """Count of grid levels with active orders."""
         return sum(1 for level in self.levels if level.order_id is not None)
+
+    @property
+    def positions_count(self) -> int:
+        """Count of grid levels currently holding positions."""
+        return sum(
+            1 for level in self.levels
+            if level.state in (GridLevelState.POSITION_HELD, GridLevelState.TP_PLACED)
+        )
+
+    @property
+    def daily_loss_percent(self) -> Decimal:
+        """Calculate daily loss as percentage of initial balance."""
+        if self.initial_balance <= 0:
+            return Decimal("0")
+        if self.daily_realized_pnl >= 0:
+            return Decimal("0")
+        return abs(self.daily_realized_pnl) / self.initial_balance * 100
     
     @property
     def step_size(self) -> Decimal:
@@ -492,21 +514,42 @@ class GridBot:
     async def place_grid_orders(self) -> None:
         """
         Place initial grid orders based on calculated levels.
-        
+
         - BUY orders placed at levels below current price
         - SELL orders placed at levels above current price
-        
+        - Respects MAX_POSITIONS limit (Phase 3 risk management)
+
         In HARVEST_MODE, initial orders may use MARKET type
         for airdrop point optimization.
         """
         orders_placed = 0
-        
+        max_positions = config.risk.MAX_POSITIONS
+
+        # Check current position count before placing new orders
+        current_positions = self.state.positions_count
+        if current_positions >= max_positions:
+            logger.warning(
+                f"Max positions reached ({current_positions}/{max_positions}), "
+                f"skipping new order placement"
+            )
+            return
+
         for level in self.state.levels:
             if level.side is None:
                 continue
-            
+
             if level.order_id is not None:
                 continue  # Already has an order
+
+            # Check max positions limit for BUY orders (Phase 3)
+            if level.side == OrderSide.BUY:
+                potential_positions = self.state.positions_count + orders_placed
+                if potential_positions >= max_positions:
+                    logger.info(
+                        f"Max positions limit ({max_positions}) reached, "
+                        f"skipping remaining BUY orders"
+                    )
+                    break
             
             try:
                 quantity = self.calculate_quantity_for_level(level.price)
@@ -1040,11 +1083,13 @@ class GridBot:
     async def check_circuit_breaker(self) -> bool:
         """
         Check if circuit breaker should trigger.
-        
-        Circuit Breaker Conditions:
-        1. Drawdown exceeds MAX_DRAWDOWN_PERCENT
-        2. Balance falls below MIN_BALANCE_USDT
-        
+
+        Circuit Breaker Conditions (Phase 3):
+        1. Drawdown exceeds MAX_DRAWDOWN_PERCENT (20%)
+        2. Daily loss exceeds DAILY_LOSS_LIMIT_PERCENT (10%)
+        3. Trailing stop triggered (price dropped 8% from session high)
+        4. Balance falls below MIN_BALANCE_USDT
+
         Returns:
             True if circuit breaker triggered (bot should stop)
         """
@@ -1052,40 +1097,106 @@ class GridBot:
         try:
             balances = await self.client.get_account_balance()
             positions = await self.client.get_position_risk(config.trading.SYMBOL)
-            
-            # Find USDT balance
+            current_price = Decimal("0")
+
+            # Find balance
             for balance in balances:
                 if balance.get("asset") == config.trading.MARGIN_ASSET:
                     self.state.current_balance = Decimal(balance.get("availableBalance", "0"))
                     break
-            
-            # Get unrealized PnL
+
+            # Get unrealized PnL and current price
             for position in positions:
                 if position.get("symbol") == config.trading.SYMBOL:
                     self.state.unrealized_pnl = Decimal(position.get("unRealizedProfit", "0"))
+                    mark_price = position.get("markPrice", "0")
+                    if mark_price:
+                        current_price = Decimal(mark_price)
                     break
-            
+
+            # Update session high price for trailing stop
+            if current_price > self.state.session_high_price:
+                self.state.session_high_price = current_price
+
         except Exception as e:
             logger.error(f"Error fetching balance/position: {e}")
             return False
-        
-        # Check conditions
+
+        # Check 1: Max Drawdown
         drawdown = self.state.drawdown_percent
-        
         if drawdown >= config.risk.MAX_DRAWDOWN_PERCENT:
             logger.critical(
                 f"🚨 CIRCUIT BREAKER: Drawdown {drawdown:.2f}% >= "
                 f"MAX {config.risk.MAX_DRAWDOWN_PERCENT}%"
             )
+            await self.telegram.send_message(
+                f"🚨 *CIRCUIT BREAKER TRIGGERED*\n\n"
+                f"Reason: Max Drawdown\n"
+                f"Drawdown: {drawdown:.2f}%\n"
+                f"Limit: {config.risk.MAX_DRAWDOWN_PERCENT}%\n\n"
+                f"Bot is stopping to protect capital."
+            )
             return True
-        
+
+        # Check 2: Daily Loss Limit
+        daily_loss = self.state.daily_loss_percent
+        if daily_loss >= config.risk.DAILY_LOSS_LIMIT_PERCENT:
+            logger.critical(
+                f"🚨 DAILY LOSS LIMIT: Loss {daily_loss:.2f}% >= "
+                f"LIMIT {config.risk.DAILY_LOSS_LIMIT_PERCENT}%"
+            )
+            await self.telegram.send_message(
+                f"🚨 *DAILY LOSS LIMIT REACHED*\n\n"
+                f"Daily Loss: {daily_loss:.2f}%\n"
+                f"Limit: {config.risk.DAILY_LOSS_LIMIT_PERCENT}%\n\n"
+                f"Bot pausing until tomorrow."
+            )
+            # Pause instead of full stop for daily limit
+            await self.pause()
+            return False  # Don't trigger full shutdown
+
+        # Check 3: Trailing Stop
+        if (
+            config.risk.TRAILING_STOP_PERCENT
+            and self.state.session_high_price > 0
+            and current_price > 0
+            and self.state.positions_count > 0  # Only if we have positions
+        ):
+            drop_from_high = (
+                (self.state.session_high_price - current_price)
+                / self.state.session_high_price * 100
+            )
+            if drop_from_high >= config.risk.TRAILING_STOP_PERCENT:
+                logger.critical(
+                    f"🚨 TRAILING STOP: Price dropped {drop_from_high:.2f}% from high "
+                    f"${self.state.session_high_price:.2f}"
+                )
+                await self.telegram.send_message(
+                    f"🚨 *TRAILING STOP TRIGGERED*\n\n"
+                    f"Session High: ${self.state.session_high_price:.2f}\n"
+                    f"Current: ${current_price:.2f}\n"
+                    f"Drop: {drop_from_high:.2f}%\n"
+                    f"Limit: {config.risk.TRAILING_STOP_PERCENT}%\n\n"
+                    f"Closing all positions to protect profits."
+                )
+                # For trailing stop, we might want to close positions
+                # For now, just trigger emergency shutdown
+                return True
+
+        # Check 4: Minimum Balance
         if self.state.current_balance < config.risk.MIN_BALANCE_USDT:
             logger.critical(
                 f"🚨 CIRCUIT BREAKER: Balance {self.state.current_balance} < "
                 f"MIN {config.risk.MIN_BALANCE_USDT}"
             )
+            await self.telegram.send_message(
+                f"🚨 *MINIMUM BALANCE REACHED*\n\n"
+                f"Balance: {self.state.current_balance:.2f}\n"
+                f"Minimum: {config.risk.MIN_BALANCE_USDT}\n\n"
+                f"Bot is stopping."
+            )
             return True
-        
+
         return False
     
     async def emergency_shutdown(self) -> None:
@@ -1290,10 +1401,12 @@ class GridBot:
                     # SELL (TP) filled: calculate realized PnL
                     pnl = (fill_price - level.entry_price) * level.position_quantity
                     self.state.realized_pnl += pnl
+                    self.state.daily_realized_pnl += pnl  # Track daily PnL
                     logger.info(
                         f"Order FILLED: SELL @ {price} | Level {level.index} | "
                         f"Entry: {level.entry_price} | Qty: {level.position_quantity} | "
-                        f"PnL: {pnl:+.4f} | Total Realized: {self.state.realized_pnl:+.4f}{slippage_info}"
+                        f"PnL: {pnl:+.4f} | Total Realized: {self.state.realized_pnl:+.4f} | "
+                        f"Daily: {self.state.daily_realized_pnl:+.4f}{slippage_info}"
                     )
                 else:
                     pnl = Decimal("0")
@@ -1456,6 +1569,11 @@ class GridBot:
         logger.info(f"Capital: {config.INITIAL_CAPITAL_USDT} USDT")
         logger.info(f"Dry Run: {config.DRY_RUN}")
         logger.info(f"Harvest Mode: {config.harvest.HARVEST_MODE}")
+        logger.info("--- Phase 3: Risk Management ---")
+        logger.info(f"Max Drawdown: {config.risk.MAX_DRAWDOWN_PERCENT}%")
+        logger.info(f"Daily Loss Limit: {config.risk.DAILY_LOSS_LIMIT_PERCENT}%")
+        logger.info(f"Max Positions: {config.risk.MAX_POSITIONS}")
+        logger.info(f"Trailing Stop: {config.risk.TRAILING_STOP_PERCENT}%")
         logger.info("=" * 60)
         
         try:
@@ -1540,7 +1658,12 @@ class GridBot:
                 return False
             
             logger.info(f"Current price: {current_price}")
-            
+
+            # Initialize session tracking for Phase 3 risk management
+            self.state.session_high_price = current_price
+            self.state.daily_start_time = datetime.now()
+            self.state.daily_realized_pnl = Decimal("0")
+
             # Cancel all existing orders before placing new grid
             # This prevents duplicate orders on bot restart/redeploy
             logger.info("Cancelling existing orders before placing new grid...")
@@ -1611,19 +1734,36 @@ class GridBot:
         """Run periodic monitoring for circuit breaker and status."""
         while not self._shutdown_event.is_set():
             try:
+                # Phase 3: Check if daily reset is needed (24 hours passed)
+                if self.state.daily_start_time:
+                    hours_elapsed = (datetime.now() - self.state.daily_start_time).total_seconds() / 3600
+                    if hours_elapsed >= 24:
+                        old_daily_pnl = self.state.daily_realized_pnl
+                        self.state.daily_realized_pnl = Decimal("0")
+                        self.state.daily_start_time = datetime.now()
+                        logger.info(
+                            f"📅 Daily PnL Reset: {old_daily_pnl:+.4f} USDT → 0 | "
+                            f"New day started"
+                        )
+                        # Resume if was paused due to daily loss limit
+                        if self.bot_state == BotState.PAUSED:
+                            await self.resume()
+
                 # Check circuit breaker
                 if await self.check_circuit_breaker():
                     await self.emergency_shutdown()
                     return
-                
-                # Log status periodically
+
+                # Log status periodically with Phase 3 risk metrics
                 runtime = datetime.now() - self.state.start_time if self.state.start_time else None
                 logger.info(
                     f"STATUS | Balance: {self.state.current_balance:.2f} | "
                     f"uPnL: {self.state.unrealized_pnl:.4f} | "
                     f"Drawdown: {self.state.drawdown_percent:.2f}% | "
+                    f"Daily: {self.state.daily_realized_pnl:+.4f} | "
+                    f"Positions: {self.state.positions_count}/{config.risk.MAX_POSITIONS} | "
+                    f"High: ${self.state.session_high_price:.2f} | "
                     f"Trades: {self.state.total_trades} | "
-                    f"Orders: {self.state.active_orders_count} | "
                     f"Runtime: {runtime}"
                 )
                 

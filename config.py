@@ -98,6 +98,24 @@ class GridConfig:
     # Tighter Range: ±4% for closer grid (~$127 - $138 at current price)
     # Grid closer to price for faster fills in trending market
     GRID_RANGE_PERCENT: Decimal = Decimal("3.0")
+
+    # ==========================================================================
+    # Dynamic Grid Spacing: Adjust grid range based on ATR (volatility)
+    # ==========================================================================
+
+    # Enable dynamic grid spacing based on ATR
+    # When enabled, GRID_RANGE_PERCENT is adjusted based on market volatility
+    DYNAMIC_GRID_SPACING_ENABLED: bool = True
+
+    # ATR multiplier for grid range calculation
+    # Grid Range = ATR% × multiplier (e.g., 1.5% ATR × 2.0 = 3% grid range)
+    ATR_GRID_MULTIPLIER: Decimal = Decimal("2.5")
+
+    # Minimum grid range (even in low volatility)
+    MIN_GRID_RANGE_PERCENT: Decimal = Decimal("2.0")
+
+    # Maximum grid range (even in high volatility)
+    MAX_GRID_RANGE_PERCENT: Decimal = Decimal("6.0")
     
     # Dynamic Grid Rebalancing: DISABLED for safety
     # Static Grid prevents position accumulation during trends
@@ -122,7 +140,8 @@ class GridConfig:
     AUTO_REGRID_ENABLED: bool = True
     
     # Re-grid threshold: if price moves more than this % from grid center, re-grid
-    REGRID_THRESHOLD_PERCENT: Decimal = Decimal("3.5")
+    # 5% threshold = less frequent re-gridding, waits for clearer trend
+    REGRID_THRESHOLD_PERCENT: Decimal = Decimal("5.0")
     
     # How often to check for re-grid (in minutes)
     REGRID_CHECK_INTERVAL_MINUTES: int = 30
@@ -171,17 +190,33 @@ class GridConfig:
 class RiskConfig:
     """
     Risk management and safety parameters.
-    
+
     The circuit breaker is a critical safety feature that stops the bot
     when losses exceed acceptable thresholds. This prevents catastrophic
     losses during black swan events or API issues.
+
+    Phase 3 Risk Settings (Moderate Profile):
+    - Circuit Breaker: 20% (protects 80% of capital)
+    - Daily Loss Limit: 10% (max daily loss before pause)
+    - Max Positions: 5 (limits exposure per symbol)
+    - Trailing Stop: 8% (locks profit when price reverses)
     """
     # Maximum drawdown before circuit breaker triggers (percentage of initial balance)
-    # 10% drawdown on 500 USDT = 50 USDT max loss before emergency stop
-    # Note: Margin lock for open orders is counted as drawdown
-    # Stop bot if drawdown exceeds this percentage
-    # 80% threshold - higher because margin lock is included in calculation
-    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("80.0")
+    # 20% drawdown = bot stops to protect remaining 80% of capital
+    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("20.0")
+
+    # Daily loss limit - pause trading if daily loss exceeds this percentage
+    # Resets every 24 hours from session start
+    DAILY_LOSS_LIMIT_PERCENT: Decimal = Decimal("10.0")
+
+    # Maximum number of grid positions that can be held simultaneously
+    # Prevents over-exposure to a single asset during trends
+    MAX_POSITIONS: int = 5
+
+    # Trailing stop percentage - close all positions if price drops this much
+    # from the highest price seen during the session
+    # Set to None to disable trailing stop
+    TRAILING_STOP_PERCENT: Decimal | None = Decimal("8.0")
     
     # Stop loss per individual position (not recommended for grid, but available)
     STOP_LOSS_PERCENT: Decimal | None = None
@@ -305,8 +340,8 @@ class BotConfig:
         # Risk validation
         if self.risk.MAX_DRAWDOWN_PERCENT <= 0:
             errors.append("MAX_DRAWDOWN_PERCENT must be positive")
-        if self.risk.MAX_DRAWDOWN_PERCENT > Decimal("80"):
-            errors.append("MAX_DRAWDOWN_PERCENT > 80% is extremely risky")
+        if self.risk.MAX_DRAWDOWN_PERCENT > Decimal("50"):
+            errors.append("MAX_DRAWDOWN_PERCENT > 50% is extremely risky - recommend 20% for safety")
         
         # Capital validation
         if self.INITIAL_CAPITAL_USDT < Decimal("100"):
