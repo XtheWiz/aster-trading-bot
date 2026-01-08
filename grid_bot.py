@@ -82,17 +82,31 @@ class BotState(Enum):
     ERROR = "ERROR"
 
 
+class GridLevelState(Enum):
+    """State machine for grid level lifecycle."""
+    EMPTY = "EMPTY"                    # No order, no position
+    BUY_PLACED = "BUY_PLACED"          # BUY order placed, waiting fill
+    POSITION_HELD = "POSITION_HELD"    # BUY filled, holding position
+    TP_PLACED = "TP_PLACED"            # TP SELL order placed, waiting fill
+    SELL_PLACED = "SELL_PLACED"        # Regular SELL order placed
+
+
 @dataclass
 class GridLevel:
     """
-    Represents a single grid level with its order state.
-    
+    Represents a single grid level with its order and position state.
+
     Attributes:
         index: Grid level index (0 = lowest price)
         price: Price at this grid level
         side: BUY or SELL (determined by position relative to entry price)
         order_id: Active order ID at this level (None if no order)
+        client_order_id: Client order ID for tracking
         filled: Whether order at this level has been filled
+        state: Current state in the lifecycle (EMPTY -> BUY_PLACED -> POSITION_HELD -> TP_PLACED)
+        entry_price: Price at which position was entered (BUY fill price)
+        position_quantity: Quantity held at this level
+        tp_order_id: Take profit order ID (separate from regular order_id)
     """
     index: int
     price: Decimal
@@ -100,10 +114,32 @@ class GridLevel:
     order_id: int | None = None
     client_order_id: str | None = None
     filled: bool = False
-    
+    # New fields for position tracking
+    state: GridLevelState = GridLevelState.EMPTY
+    entry_price: Decimal = Decimal("0")
+    position_quantity: Decimal = Decimal("0")
+    tp_order_id: int | None = None
+
     def __repr__(self) -> str:
-        status = "FILLED" if self.filled else f"ORDER:{self.order_id}" if self.order_id else "EMPTY"
+        if self.state == GridLevelState.POSITION_HELD:
+            status = f"HOLDING:{self.position_quantity:.2f}@{self.entry_price:.4f}"
+        elif self.state == GridLevelState.TP_PLACED:
+            status = f"TP:{self.tp_order_id}"
+        elif self.order_id:
+            status = f"ORDER:{self.order_id}"
+        else:
+            status = self.state.value
         return f"Grid[{self.index}] {self.price:.4f} {self.side.value if self.side else 'N/A'} ({status})"
+
+    def reset(self) -> None:
+        """Reset level to empty state after TP fill."""
+        self.filled = False
+        self.state = GridLevelState.EMPTY
+        self.entry_price = Decimal("0")
+        self.position_quantity = Decimal("0")
+        self.order_id = None
+        self.tp_order_id = None
+        self.client_order_id = None
 
 
 @dataclass
@@ -158,18 +194,36 @@ class GridState:
         return self.grid_step
     
     def get_level_by_order_id(self, order_id: int) -> GridLevel | None:
-        """Find grid level by order ID."""
+        """Find grid level by order ID (includes both regular and TP orders)."""
         for level in self.levels:
-            if level.order_id == order_id:
+            if level.order_id == order_id or level.tp_order_id == order_id:
                 return level
         return None
-    
+
+    def get_level_by_tp_order_id(self, tp_order_id: int) -> GridLevel | None:
+        """Find grid level by TP order ID specifically."""
+        for level in self.levels:
+            if level.tp_order_id == tp_order_id:
+                return level
+        return None
+
     def get_level_by_price(self, price: Decimal, tolerance: Decimal = Decimal("0.0001")) -> GridLevel | None:
         """Find grid level closest to given price within tolerance."""
         for level in self.levels:
             if abs(level.price - price) <= tolerance:
                 return level
         return None
+
+    def get_total_position_quantity(self) -> Decimal:
+        """Get total position quantity across all grid levels."""
+        return sum(level.position_quantity for level in self.levels)
+
+    def get_levels_with_position(self) -> list[GridLevel]:
+        """Get all levels that are holding a position."""
+        return [
+            level for level in self.levels
+            if level.state in (GridLevelState.POSITION_HELD, GridLevelState.TP_PLACED)
+        ]
 
 
 class GridBot:
@@ -216,22 +270,73 @@ class GridBot:
     # =========================================================================
     # GRID CALCULATION
     # =========================================================================
-    
-    def calculate_grid_levels(self, current_price: Decimal) -> list[GridLevel]:
+
+    async def get_dynamic_grid_range(self, current_price: Decimal) -> Decimal:
+        """
+        Calculate dynamic grid range based on ATR (volatility).
+
+        Formula:
+            grid_range = ATR% × ATR_GRID_MULTIPLIER
+            clamped to [MIN_GRID_RANGE_PERCENT, MAX_GRID_RANGE_PERCENT]
+
+        Returns:
+            Grid range percentage (e.g., 3.0 for ±3%)
+        """
+        if not config.grid.DYNAMIC_GRID_SPACING_ENABLED:
+            return config.grid.GRID_RANGE_PERCENT
+
+        try:
+            # Get ATR from strategy manager's last analysis or calculate fresh
+            atr_percent = Decimal("0")
+
+            if self.strategy_manager.last_analysis:
+                atr_value = self.strategy_manager.last_analysis.atr_value
+                if atr_value > 0 and current_price > 0:
+                    atr_percent = (atr_value / current_price) * 100
+            else:
+                # Fetch fresh analysis
+                analysis = await self.strategy_manager.analyze_market()
+                if analysis.atr_value > 0 and current_price > 0:
+                    atr_percent = (analysis.atr_value / current_price) * 100
+
+            if atr_percent <= 0:
+                logger.warning("ATR is zero, using default grid range")
+                return config.grid.GRID_RANGE_PERCENT
+
+            # Calculate dynamic range
+            dynamic_range = atr_percent * config.grid.ATR_GRID_MULTIPLIER
+
+            # Clamp to min/max bounds
+            dynamic_range = max(dynamic_range, config.grid.MIN_GRID_RANGE_PERCENT)
+            dynamic_range = min(dynamic_range, config.grid.MAX_GRID_RANGE_PERCENT)
+
+            logger.info(
+                f"Dynamic Grid: ATR={atr_percent:.2f}% × {config.grid.ATR_GRID_MULTIPLIER} = "
+                f"{dynamic_range:.2f}% (bounds: {config.grid.MIN_GRID_RANGE_PERCENT}-{config.grid.MAX_GRID_RANGE_PERCENT}%)"
+            )
+
+            return dynamic_range
+
+        except Exception as e:
+            logger.error(f"Error calculating dynamic grid range: {e}")
+            return config.grid.GRID_RANGE_PERCENT
+
+    def calculate_grid_levels(self, current_price: Decimal, grid_range_percent: Decimal | None = None) -> list[GridLevel]:
         """
         Calculate grid price levels using arithmetic spacing.
-        
+
         Arithmetic Grid Formula:
         =======================
         grid_step = (upper_price - lower_price) / (grid_count - 1)
         level[i] = lower_price + (i * grid_step)
-        
+
         This creates evenly spaced price levels. Each level represents
         a potential order placement point.
-        
+
         Args:
             current_price: Current market price for centering the grid
-            
+            grid_range_percent: Optional override for grid range (from dynamic calculation)
+
         Returns:
             List of GridLevel objects with calculated prices
         """
@@ -240,8 +345,8 @@ class GridBot:
             lower = config.grid.LOWER_PRICE
             upper = config.grid.UPPER_PRICE
         else:
-            # Calculate range from current price
-            range_pct = config.grid.GRID_RANGE_PERCENT / 100
+            # Use provided range or fall back to config
+            range_pct = (grid_range_percent or config.grid.GRID_RANGE_PERCENT) / 100
             lower = current_price * (1 - range_pct)
             upper = current_price * (1 + range_pct)
         
@@ -387,8 +492,13 @@ class GridBot:
                 )
                 
                 level.order_id = response.get("orderId")
+                # Set state based on side
+                if level.side == OrderSide.BUY:
+                    level.state = GridLevelState.BUY_PLACED
+                else:
+                    level.state = GridLevelState.SELL_PLACED
                 orders_placed += 1
-                
+
                 logger.info(
                     f"Placed {level.side.value} {order_type} @ {level.price:.4f} | "
                     f"Qty: {quantity} | OrderID: {level.order_id}"
@@ -409,19 +519,28 @@ class GridBot:
         """Cancel all open orders for the trading symbol."""
         try:
             await self.client.cancel_all_orders(config.trading.SYMBOL)
-            
-            # Clear order IDs from levels
+
+            # Clear order IDs and reset states (preserve position info for levels with positions)
             for level in self.state.levels:
                 level.order_id = None
-            
+                level.tp_order_id = None
+                # Only reset state if no position held
+                if level.state not in (GridLevelState.POSITION_HELD,):
+                    level.state = GridLevelState.EMPTY
+
             logger.info("All orders canceled")
         except AsterAPIError as e:
             logger.error(f"Failed to cancel all orders: {e}")
     
-    async def rebalance_on_fill(self, filled_level: GridLevel) -> None:
+    async def rebalance_on_fill(
+        self,
+        filled_level: GridLevel,
+        fill_price: Decimal | None = None,
+        fill_qty: Decimal | None = None
+    ) -> None:
         """
         Rebalance grid after an order fill.
-        
+
         Dynamic Grid Rebalancing (when DYNAMIC_GRID_REBALANCE=True):
         ============================================================
         After each fill:
@@ -429,20 +548,25 @@ class GridBot:
         2. Get current market price
         3. Recalculate grid centered on current price
         4. Place new grid orders
-        
+
         This makes the grid "follow" the price, ideal for trending markets.
-        
+
         Static Grid Rebalancing (when DYNAMIC_GRID_REBALANCE=False):
         ============================================================
         - When BUY order fills: Place SELL at one grid step HIGHER
         - When SELL order fills: Place BUY at one grid step LOWER
-        
+
         Args:
             filled_level: The grid level whose order just filled
+            fill_price: Price at which order was filled (for logging)
+            fill_qty: Quantity that was filled (for logging)
         """
         self.state.total_trades += 1
         filled_level.filled = True
-        filled_level.order_id = None
+
+        # Clear regular order_id (tp_order_id handled separately)
+        if filled_level.state != GridLevelState.TP_PLACED:
+            filled_level.order_id = None
         
         # Check if Dynamic Grid Rebalancing is enabled
         if getattr(config.grid, 'DYNAMIC_GRID_REBALANCE', False):
@@ -461,29 +585,32 @@ class GridBot:
             f"🔄 DYNAMIC REBALANCE: {filled_side.value} filled @ {filled_level.price:.4f} | "
             f"Trade #{self.state.total_trades}"
         )
-        
+
         try:
             # Cancel all existing orders
             await self.cancel_all_orders()
-            
+
             # Get current market price
             ticker = await self.client.get_ticker_price(config.trading.SYMBOL)
             current_price = Decimal(ticker["price"])
-            
+
             logger.info(f"🔄 DYNAMIC REBALANCE: Recalculating grid from ${current_price:.4f}")
-            
+
+            # Calculate dynamic grid range
+            grid_range = await self.get_dynamic_grid_range(current_price)
+
             # Recalculate grid levels centered on current price
-            self.state.levels = self.calculate_grid_levels(current_price)
+            self.state.levels = self.calculate_grid_levels(current_price, grid_range)
             self.state.entry_price = current_price
-            
+
             # Place new grid orders
             await self.place_grid_orders()
-            
+
             logger.info(
                 f"🔄 DYNAMIC REBALANCE: Complete! New grid: "
-                f"${self.state.lower_price:.4f} - ${self.state.upper_price:.4f}"
+                f"${self.state.lower_price:.4f} - ${self.state.upper_price:.4f} (±{grid_range:.2f}%)"
             )
-            
+
         except AsterAPIError as e:
             logger.error(f"Dynamic rebalance failed: {e}")
     
@@ -575,34 +702,41 @@ class GridBot:
     async def _place_smart_tp(self, filled_level: GridLevel) -> None:
         """
         Place intelligent Take-Profit order based on market indicators.
-        
+
         This method:
-        1. Fetches candle data from API
-        2. Calculates RSI, MACD, and other indicators
+        1. Uses cached analysis from StrategyManager if available
+        2. Falls back to fetching candle data if no cache
         3. Determines optimal TP% based on market conditions
         4. Places SELL order at calculated TP price
-        
+
         Args:
             filled_level: The grid level that just got filled (BUY)
         """
         try:
             entry_price = filled_level.price
-            
+
             # Get TP percentage
             if config.risk.USE_SMART_TP:
-                # Fetch candle data for indicator calculation
-                candles = await self.client.get_klines(
-                    symbol=config.trading.SYMBOL,
-                    interval="1h",
-                    limit=50
-                )
-                
-                if candles:
-                    tp_percent = await get_smart_tp(candles)
-                    logger.info(f"🧠 Smart TP calculated: {tp_percent}%")
+                # First try to use cached analysis from StrategyManager
+                cached_analysis = self.strategy_manager.last_analysis
+
+                if cached_analysis and cached_analysis.rsi > 0:
+                    tp_percent = await get_smart_tp(market_analysis=cached_analysis)
+                    logger.info(f"🧠 Smart TP (cached): {tp_percent}%")
                 else:
-                    tp_percent = config.risk.DEFAULT_TP_PERCENT
-                    logger.warning(f"No candle data, using default TP: {tp_percent}%")
+                    # Fallback: Fetch candle data for indicator calculation
+                    candles = await self.client.get_klines(
+                        symbol=config.trading.SYMBOL,
+                        interval="1h",
+                        limit=50
+                    )
+
+                    if candles:
+                        tp_percent = await get_smart_tp(candles=candles)
+                        logger.info(f"🧠 Smart TP (calculated): {tp_percent}%")
+                    else:
+                        tp_percent = config.risk.DEFAULT_TP_PERCENT
+                        logger.warning(f"No candle data, using default TP: {tp_percent}%")
             else:
                 tp_percent = config.risk.DEFAULT_TP_PERCENT
                 logger.info(f"Smart TP disabled, using default: {tp_percent}%")
@@ -628,15 +762,18 @@ class GridBot:
             )
             
             order_id = response.get("orderId")
-            
-            # CRITICAL: Store order_id so TP fill can be tracked
-            filled_level.order_id = order_id
+
+            # Store TP order info separately from BUY order
+            filled_level.tp_order_id = order_id
+            filled_level.state = GridLevelState.TP_PLACED
             filled_level.side = OrderSide.SELL
             filled_level.client_order_id = client_order_id
-            
+            # Keep order_id pointing to TP for backward compatibility with get_level_by_order_id
+            filled_level.order_id = order_id
+
             logger.info(
                 f"🎯 SMART TP PLACED: SELL @ ${tp_price:.4f} (+{tp_percent}%) | "
-                f"Entry: ${entry_price:.4f} | OrderID: {order_id}"
+                f"Entry: ${entry_price:.4f} | Qty: {filled_level.position_quantity} | OrderID: {order_id}"
             )
             
             # Send Telegram notification
@@ -665,15 +802,22 @@ class GridBot:
     async def _handle_tp_sell_filled(self, filled_level: GridLevel) -> None:
         """
         Handle TP SELL fill with Dynamic Re-Grid logic.
-        
+
         Sequence:
-        1. Ask StrategyManager what to do
-        2. REPLACE → re-place BUY at original level
-        3. REGRID → cancel all and re-grid
-        4. WAIT → do nothing, wait for more confirmation
+        1. Reset level position tracking
+        2. Ask StrategyManager what to do
+        3. REPLACE → re-place BUY at original level
+        4. REGRID → cancel all and re-grid
+        5. WAIT → do nothing, wait for more confirmation
         """
         try:
-            logger.info(f"🎯 TP SELL filled at level {filled_level.index}")
+            logger.info(
+                f"🎯 TP SELL filled at level {filled_level.index} | "
+                f"PnL already calculated in on_order_update"
+            )
+
+            # Reset level after TP fill (position is closed)
+            filled_level.reset()
             
             # Get recommendation from strategy manager
             action = await self.strategy_manager.should_regrid_on_tp()
@@ -691,27 +835,32 @@ class GridBot:
             elif action == "REGRID":
                 # Full re-grid
                 logger.warning("🔄 Trend changed - Full Re-Grid triggered")
-                
+
                 await self.telegram.send_message(
                     f"🔄 Trend Changed → Full Re-Grid\n\n"
                     f"Canceling all orders and repositioning..."
                 )
-                
+
                 await self.cancel_all_orders()
-                
+
                 ticker = await self.client.get_ticker_price(config.trading.SYMBOL)
                 current_price = Decimal(ticker["price"])
+
+                # Calculate dynamic grid range
+                grid_range = await self.get_dynamic_grid_range(current_price)
+
                 self.state.entry_price = current_price
-                self.state.levels = self.calculate_grid_levels(current_price)
-                
+                self.state.levels = self.calculate_grid_levels(current_price, grid_range)
+
                 await self.place_grid_orders()
-                
+
                 # Record new grid placement
                 self.strategy_manager.record_grid_placement()
-                
+
                 await self.telegram.send_message(
                     f"✅ Re-Grid Complete!\n\n"
                     f"New Center: ${current_price:.2f}\n"
+                    f"Range: ±{grid_range:.2f}%\n"
                     f"Orders: {len([l for l in self.state.levels if l.order_id])}"
                 )
                 
@@ -729,10 +878,12 @@ class GridBot:
         try:
             quantity = self.calculate_quantity_for_level(level.price)
             client_order_id = f"grid_{level.index}_{int(datetime.now().timestamp())}"
-            
+
             level.side = OrderSide.BUY
             level.client_order_id = client_order_id
-            
+            level.state = GridLevelState.BUY_PLACED
+            level.filled = False
+
             response = await self.client.place_order(
                 symbol=config.trading.SYMBOL,
                 side="BUY",
@@ -741,12 +892,11 @@ class GridBot:
                 price=level.price,
                 client_order_id=client_order_id,
             )
-            
+
             level.order_id = response.get("orderId")
-            self.state.active_orders_count += 1
-            
+
             logger.info(f"📥 BUY re-placed: ${level.price:.4f} | Level {level.index}")
-            
+
         except AsterAPIError as e:
             logger.error(f"Failed to re-place BUY: {e}")
     
@@ -968,17 +1118,20 @@ class GridBot:
             ticker = await self.client.get_ticker_price(config.trading.SYMBOL)
             current_price = Decimal(ticker["price"])
             logger.info(f"Current price for new grid: ${current_price:.4f}")
-            
-            # 4. Recalculate grid levels
-            self.state.levels = self.calculate_grid_levels(current_price)
+
+            # 4. Calculate dynamic grid range
+            grid_range = await self.get_dynamic_grid_range(current_price)
+
+            # 5. Recalculate grid levels
+            self.state.levels = self.calculate_grid_levels(current_price, grid_range)
             self.state.entry_price = current_price
-            
-            # 5. Place new orders
+
+            # 6. Place new orders
             await self.place_grid_orders()
-            
+
             logger.info(
                 f"✅ Side switch complete: {old_side} → {new_side} | "
-                f"New grid: ${self.state.lower_price:.2f} - ${self.state.upper_price:.2f}"
+                f"New grid: ${self.state.lower_price:.2f} - ${self.state.upper_price:.2f} (±{grid_range:.2f}%)"
             )
             
             # Log trade event
@@ -1029,15 +1182,43 @@ class GridBot:
         if status in ("FILLED", "PARTIALLY_FILLED"):
             # Find the grid level for this order
             level = self.state.get_level_by_order_id(order_id)
-            
+
             if level and status == "FILLED":
+                fill_price = Decimal(price or "0")
+                fill_qty = Decimal(exec_qty or "0")
+
+                # Update position tracking based on side
+                if side == "BUY":
+                    # BUY filled: record entry position
+                    level.entry_price = fill_price
+                    level.position_quantity = fill_qty
+                    level.state = GridLevelState.POSITION_HELD
+                    logger.info(
+                        f"Order FILLED: BUY @ {price} | Level {level.index} | "
+                        f"Position: {fill_qty} @ {fill_price}"
+                    )
+                    pnl = Decimal("0")
+
+                elif side == "SELL" and level.entry_price > 0:
+                    # SELL (TP) filled: calculate realized PnL
+                    pnl = (fill_price - level.entry_price) * level.position_quantity
+                    self.state.realized_pnl += pnl
+                    logger.info(
+                        f"Order FILLED: SELL @ {price} | Level {level.index} | "
+                        f"Entry: {level.entry_price} | PnL: {pnl:+.4f} | "
+                        f"Total Realized: {self.state.realized_pnl:+.4f}"
+                    )
+                    # Reset level after TP fill (will be handled in rebalance)
+                else:
+                    pnl = Decimal("0")
+                    logger.info(f"Order FILLED: {side} @ {price} | Level {level.index}")
+
                 # Schedule rebalancing (can't await in callback)
-                asyncio.create_task(self.rebalance_on_fill(level))
-                logger.info(f"Order FILLED: {side} @ {price} | Level {level.index}")
-                
+                asyncio.create_task(self.rebalance_on_fill(level, fill_price, fill_qty))
+
                 # Log trade and send telegram notification
                 asyncio.create_task(self._log_and_notify_fill(
-                    side, price, exec_qty, level.index
+                    side, price, exec_qty, level.index, pnl
                 ))
             
             elif status == "PARTIALLY_FILLED":
@@ -1093,11 +1274,16 @@ class GridBot:
         logger.debug(f"Balance: {asset} = {wallet_balance:.4f}")
     
     async def _log_and_notify_fill(
-        self, side: str, price: str, quantity: str, grid_level: int
+        self,
+        side: str,
+        price: str,
+        quantity: str,
+        grid_level: int,
+        pnl: Decimal = Decimal("0")
     ) -> None:
         """Log trade to database and send Telegram notification."""
         try:
-            # Log to SQLite
+            # Log to SQLite with PnL
             trade = create_trade_record(
                 symbol=config.trading.SYMBOL,
                 side=side,
@@ -1108,16 +1294,28 @@ class GridBot:
                 client_order_id="",
                 status="FILLED",
                 grid_level=grid_level,
+                pnl=pnl,
             )
             await self.trade_logger.log_trade(trade)
-            
-            # Send Telegram alert
-            await self.telegram.send_order_filled(
-                side=side,
-                price=Decimal(price),
-                quantity=Decimal(quantity or "0"),
-                grid_level=grid_level,
-            )
+
+            # Send Telegram alert with PnL info for SELL orders
+            if side == "SELL" and pnl != 0:
+                await self.telegram.send_message(
+                    f"💰 *TP Filled!*\n\n"
+                    f"📊 Side: `SELL`\n"
+                    f"💵 Price: `{Decimal(price):.4f}`\n"
+                    f"📦 Qty: `{Decimal(quantity or '0'):.2f}`\n"
+                    f"🔢 Level: `{grid_level}`\n"
+                    f"💵 PnL: `{pnl:+.4f} USDT`\n"
+                    f"📈 Total Realized: `{self.state.realized_pnl:+.4f} USDT`"
+                )
+            else:
+                await self.telegram.send_order_filled(
+                    side=side,
+                    price=Decimal(price),
+                    quantity=Decimal(quantity or "0"),
+                    grid_level=grid_level,
+                )
         except Exception as e:
             logger.error(f"Error logging trade: {e}")
     
@@ -1239,9 +1437,13 @@ class GridBot:
             logger.info("Cancelling existing orders before placing new grid...")
             await self.cancel_all_orders()
             await asyncio.sleep(1)  # Wait for orders to be cancelled
-            
-            # Calculate grid levels
-            self.state.levels = self.calculate_grid_levels(current_price)
+
+            # Calculate dynamic grid range based on ATR
+            grid_range = await self.get_dynamic_grid_range(current_price)
+            logger.info(f"Grid Range: ±{grid_range:.2f}% (Dynamic: {config.grid.DYNAMIC_GRID_SPACING_ENABLED})")
+
+            # Calculate grid levels with dynamic range
+            self.state.levels = self.calculate_grid_levels(current_price, grid_range)
             
             # Log grid levels
             logger.info("Grid Levels:")
@@ -1410,21 +1612,26 @@ class GridBot:
                     
                     # Cancel all orders
                     await self.cancel_all_orders()
-                    
+
+                    # Calculate dynamic grid range
+                    grid_range = await self.get_dynamic_grid_range(current_price)
+
                     # Recalculate grid centered on current price
                     self.state.entry_price = current_price
-                    self.state.levels = self.calculate_grid_levels(current_price)
-                    
+                    self.state.levels = self.calculate_grid_levels(current_price, grid_range)
+
                     # Place new orders
                     await self.place_grid_orders()
-                    
+
                     logger.info(
-                        f"✅ Re-Grid complete: New grid ${self.state.lower_price:.2f} - ${self.state.upper_price:.2f}"
+                        f"✅ Re-Grid complete: New grid ${self.state.lower_price:.2f} - ${self.state.upper_price:.2f} "
+                        f"(Range: ±{grid_range:.2f}%)"
                     )
-                    
+
                     await self.telegram.send_message(
                         f"✅ Re-Grid Complete!\n"
-                        f"New Grid: ${self.state.lower_price:.2f} - ${self.state.upper_price:.2f}"
+                        f"New Grid: ${self.state.lower_price:.2f} - ${self.state.upper_price:.2f}\n"
+                        f"Range: ±{grid_range:.2f}%"
                     )
                     
             except Exception as e:

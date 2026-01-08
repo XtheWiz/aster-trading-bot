@@ -165,6 +165,19 @@ class TelegramNotifier:
         """Queue a message for sending (non-blocking)."""
         if self.config.is_configured:
             self._message_queue.put_nowait(text)
+
+    async def send_message(self, text: str, parse_mode: str = "Markdown") -> bool:
+        """
+        Public method to send a message directly.
+
+        Args:
+            text: Message text (Markdown supported)
+            parse_mode: Telegram parse mode (Markdown or HTML)
+
+        Returns:
+            True if sent successfully
+        """
+        return await self._send_message(text, parse_mode)
     
     # =========================================================================
     # NOTIFICATION METHODS
