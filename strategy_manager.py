@@ -123,6 +123,7 @@ class StrategyManager:
     - Funding rate monitoring with alerts
     - BTC correlation analysis (leading indicator)
     - Liquidity monitoring (spread and depth)
+    - Position size coordination (exposure limits)
     """
     
     def __init__(self, client: AsterClient, bot_reference=None):
@@ -184,6 +185,14 @@ class StrategyManager:
         self.last_bid_depth: Decimal = Decimal("0")
         self.last_ask_depth: Decimal = Decimal("0")
         self.liquidity_warning_sent = False
+
+        # Max Position Size Coordination
+        self.position_warning_threshold = Decimal("0.7")  # 70% of max = warning
+        self.position_danger_threshold = Decimal("0.9")   # 90% of max = danger
+        self.last_position_size: Decimal = Decimal("0")
+        self.last_position_value: Decimal = Decimal("0")
+        self.max_position_alert_sent = False
+        self.exposure_mismatch_alerted = False
         
     async def start_monitoring(self):
         """Start the background monitoring loop."""
@@ -207,6 +216,9 @@ class StrategyManager:
 
                 # Check liquidity (spread and depth)
                 await self._check_liquidity()
+
+                # Check position size coordination
+                await self._check_position_size()
 
                 # Sleep for interval
                 await asyncio.sleep(self.check_interval)
@@ -703,6 +715,165 @@ class StrategyManager:
                     f"Ask Depth: ${ask_depth:,.0f}\n\n"
                     "Trading conditions improved."
                 )
+
+    async def _check_position_size(self) -> None:
+        """
+        Check current position size against max limits.
+
+        Monitors:
+        1. Current position vs MAX_POSITION_PERCENT of balance
+        2. Grid configuration vs actual exposure potential
+        3. Warns if approaching limits
+
+        This prevents over-exposure scenarios where all grid levels
+        filling at once would exceed safe position limits.
+        """
+        try:
+            symbol = config.trading.SYMBOL
+
+            # Get current balance
+            balances = await self.client.get_account_balance()
+            available_balance = Decimal("0")
+            for bal in balances:
+                if bal.get("asset") == config.trading.MARGIN_ASSET:
+                    available_balance = Decimal(bal.get("availableBalance", "0"))
+                    break
+
+            if available_balance <= 0:
+                return
+
+            # Get current position
+            positions = await self.client.get_position_risk(symbol)
+            current_position_size = Decimal("0")
+            current_position_value = Decimal("0")
+            entry_price = Decimal("0")
+
+            for pos in positions:
+                if pos.get("symbol") == symbol:
+                    pos_amt = abs(Decimal(pos.get("positionAmt", "0")))
+                    if pos_amt > 0:
+                        current_position_size = pos_amt
+                        entry_price = Decimal(pos.get("entryPrice", "0"))
+                        current_position_value = pos_amt * entry_price
+                        break
+
+            self.last_position_size = current_position_size
+            self.last_position_value = current_position_value
+
+            # Calculate max allowed position value
+            max_position_percent = config.risk.MAX_POSITION_PERCENT / 100
+            leverage = Decimal(config.trading.LEVERAGE)
+            max_position_value = available_balance * max_position_percent * leverage
+
+            # Calculate potential exposure from grid config
+            grid_count = config.grid.GRID_COUNT
+            qty_per_grid = config.grid.QUANTITY_PER_GRID_USDT
+            max_positions = config.risk.MAX_POSITIONS
+            potential_exposure = qty_per_grid * min(grid_count, max_positions) * leverage
+
+            # Check for config mismatch (one-time alert)
+            if potential_exposure > max_position_value and not self.exposure_mismatch_alerted:
+                self.exposure_mismatch_alerted = True
+                await self.telegram.send_message(
+                    f"⚠️ Grid Exposure Mismatch!\n\n"
+                    f"Grid Config:\n"
+                    f"  • {grid_count} levels × ${qty_per_grid} × {leverage}x\n"
+                    f"  • Potential: ${potential_exposure:,.0f}\n\n"
+                    f"Balance Limit:\n"
+                    f"  • Balance: ${available_balance:,.2f}\n"
+                    f"  • Max {max_position_percent*100:.0f}%: ${max_position_value:,.0f}\n\n"
+                    f"⚠️ Consider reducing QUANTITY_PER_GRID_USDT\n"
+                    f"or GRID_COUNT to match limits."
+                )
+                logger.warning(
+                    f"Grid exposure mismatch: potential ${potential_exposure:,.0f} > "
+                    f"max ${max_position_value:,.0f}"
+                )
+
+            # Check current position vs limits
+            if current_position_value > 0:
+                usage_ratio = current_position_value / max_position_value
+
+                logger.info(
+                    f"Position Size Check: ${current_position_value:,.0f} / "
+                    f"${max_position_value:,.0f} ({usage_ratio*100:.1f}%)"
+                )
+
+                await self._evaluate_position_usage(
+                    current_position_value,
+                    max_position_value,
+                    usage_ratio,
+                    current_position_size,
+                    entry_price
+                )
+
+        except Exception as e:
+            logger.error(f"Error checking position size: {e}")
+
+    async def _evaluate_position_usage(
+        self,
+        current_value: Decimal,
+        max_value: Decimal,
+        usage_ratio: Decimal,
+        position_size: Decimal,
+        entry_price: Decimal
+    ) -> None:
+        """
+        Evaluate position usage and alert if approaching limits.
+
+        Args:
+            current_value: Current position value in USDT
+            max_value: Maximum allowed position value
+            usage_ratio: Current / Max ratio
+            position_size: Position size in base asset
+            entry_price: Average entry price
+        """
+        grid_side = config.grid.GRID_SIDE
+        severity = None
+
+        if usage_ratio >= self.position_danger_threshold:
+            severity = "CRITICAL"
+        elif usage_ratio >= self.position_warning_threshold:
+            severity = "WARNING"
+
+        if severity:
+            if not self.max_position_alert_sent:
+                self.max_position_alert_sent = True
+
+                icon = "🚨" if severity == "CRITICAL" else "⚠️"
+                usage_percent = float(usage_ratio * 100)
+
+                await self.telegram.send_message(
+                    f"{icon} Position Size Alert!\n\n"
+                    f"Grid: {grid_side}\n"
+                    f"Symbol: {config.trading.SYMBOL}\n\n"
+                    f"Current Position:\n"
+                    f"  • Size: {position_size:.4f}\n"
+                    f"  • Entry: ${entry_price:.2f}\n"
+                    f"  • Value: ${current_value:,.0f}\n\n"
+                    f"Limit:\n"
+                    f"  • Max: ${max_value:,.0f}\n"
+                    f"  • Usage: {usage_percent:.1f}%\n\n"
+                    f"{'🔴 Near maximum! New orders may be blocked.' if severity == 'CRITICAL' else '⚠️ Approaching limit. Monitor closely.'}"
+                )
+
+                logger.warning(f"Position usage alert: {usage_percent:.1f}% of max")
+
+                # If critical, could auto-reduce exposure
+                if severity == "CRITICAL":
+                    await self.telegram.send_message(
+                        "💡 Suggestions:\n"
+                        "• Wait for TP orders to fill\n"
+                        "• Manually close some positions\n"
+                        "• Reduce QUANTITY_PER_GRID_USDT\n"
+                        "• Or pause new BUY orders"
+                    )
+        else:
+            # Reset alert when usage drops
+            if self.max_position_alert_sent:
+                self.max_position_alert_sent = False
+                usage_percent = float(usage_ratio * 100)
+                logger.info(f"Position usage normalized: {usage_percent:.1f}%")
 
     async def analyze_market(self, symbol: str | None = None) -> MarketAnalysis:
         """
