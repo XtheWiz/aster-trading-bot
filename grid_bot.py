@@ -102,11 +102,13 @@ class GridLevel:
         side: BUY or SELL (determined by position relative to entry price)
         order_id: Active order ID at this level (None if no order)
         client_order_id: Client order ID for tracking
-        filled: Whether order at this level has been filled
+        filled: Whether order at this level has been filled (fully)
         state: Current state in the lifecycle (EMPTY -> BUY_PLACED -> POSITION_HELD -> TP_PLACED)
         entry_price: Price at which position was entered (BUY fill price)
-        position_quantity: Quantity held at this level
+        position_quantity: Quantity held at this level (accumulated from partial fills)
         tp_order_id: Take profit order ID (separate from regular order_id)
+        partial_tp_order_ids: List of TP order IDs for partial fills
+        intended_price: Original intended price for slippage calculation
     """
     index: int
     price: Decimal
@@ -114,15 +116,23 @@ class GridLevel:
     order_id: int | None = None
     client_order_id: str | None = None
     filled: bool = False
-    # New fields for position tracking
+    # Position tracking
     state: GridLevelState = GridLevelState.EMPTY
     entry_price: Decimal = Decimal("0")
     position_quantity: Decimal = Decimal("0")
     tp_order_id: int | None = None
+    # Partial fill tracking
+    partial_tp_order_ids: list[int] = field(default_factory=list)
+    partial_fill_count: int = 0
+    # Slippage tracking
+    intended_price: Decimal = Decimal("0")
+    actual_fill_price: Decimal = Decimal("0")
+    slippage_percent: Decimal = Decimal("0")
 
     def __repr__(self) -> str:
         if self.state == GridLevelState.POSITION_HELD:
-            status = f"HOLDING:{self.position_quantity:.2f}@{self.entry_price:.4f}"
+            partial_info = f" ({self.partial_fill_count} partial)" if self.partial_fill_count > 0 else ""
+            status = f"HOLDING:{self.position_quantity:.2f}@{self.entry_price:.4f}{partial_info}"
         elif self.state == GridLevelState.TP_PLACED:
             status = f"TP:{self.tp_order_id}"
         elif self.order_id:
@@ -140,6 +150,43 @@ class GridLevel:
         self.order_id = None
         self.tp_order_id = None
         self.client_order_id = None
+        self.partial_tp_order_ids = []
+        self.partial_fill_count = 0
+        self.intended_price = Decimal("0")
+        self.actual_fill_price = Decimal("0")
+        self.slippage_percent = Decimal("0")
+
+    def add_partial_fill(self, price: Decimal, quantity: Decimal) -> None:
+        """
+        Add a partial fill to this level's position.
+
+        Updates entry_price as weighted average if there are multiple partial fills.
+        """
+        if self.position_quantity == 0:
+            # First fill
+            self.entry_price = price
+            self.position_quantity = quantity
+        else:
+            # Weighted average entry price
+            total_qty = self.position_quantity + quantity
+            self.entry_price = (
+                (self.entry_price * self.position_quantity + price * quantity) / total_qty
+            )
+            self.position_quantity = total_qty
+
+        self.partial_fill_count += 1
+        self.state = GridLevelState.POSITION_HELD
+
+    def calculate_slippage(self, fill_price: Decimal) -> Decimal:
+        """Calculate slippage percentage from intended price."""
+        if self.intended_price <= 0:
+            return Decimal("0")
+
+        self.actual_fill_price = fill_price
+        self.slippage_percent = (
+            (fill_price - self.intended_price) / self.intended_price * 100
+        )
+        return self.slippage_percent
 
 
 @dataclass
@@ -492,6 +539,8 @@ class GridBot:
                 )
                 
                 level.order_id = response.get("orderId")
+                # Set intended price for slippage tracking
+                level.intended_price = level.price
                 # Set state based on side
                 if level.side == OrderSide.BUY:
                     level.state = GridLevelState.BUY_PLACED
@@ -909,10 +958,10 @@ class GridBot:
     ) -> None:
         """
         Handle partial fill by placing a TP order for the filled portion.
-        
+
         This ensures we don't miss profit opportunities on partial fills.
-        The TP order is placed at the next grid level in the opposite direction.
-        
+        The TP order is placed using Smart TP calculation for BUY fills.
+
         Args:
             level: The grid level that was partially filled
             side: BUY or SELL
@@ -920,40 +969,63 @@ class GridBot:
             quantity: Filled quantity
         """
         try:
-            # Calculate TP price (next grid step in opposite direction)
-            grid_step = self.state.step_size
-            
-            if side == "BUY":
-                tp_price = price + grid_step
-                tp_side = "SELL"
+            if side != "BUY":
+                # For now, only handle BUY partial fills (LONG mode)
+                return
+
+            # Use Smart TP if enabled, otherwise use grid step
+            if config.risk.USE_SMART_TP and config.risk.AUTO_TP_ENABLED:
+                # Get Smart TP percentage
+                try:
+                    candles = await self.client.get_klines(
+                        symbol=config.trading.SYMBOL,
+                        interval="1h",
+                        limit=50
+                    )
+                    if candles:
+                        from indicator_analyzer import get_smart_tp
+                        tp_percent = await get_smart_tp(candles=candles)
+                    else:
+                        tp_percent = config.risk.DEFAULT_TP_PERCENT
+                except Exception:
+                    tp_percent = config.risk.DEFAULT_TP_PERCENT
+
+                tp_price = price * (Decimal("1") + tp_percent / Decimal("100"))
             else:
-                tp_price = price - grid_step
-                tp_side = "BUY"
-            
+                # Fallback: use grid step
+                grid_step = self.state.step_size
+                tp_price = price + grid_step
+
             # Round price to tick size
             tp_price = self._round_price(tp_price)
-            
+
             # Check minimum notional
             notional = quantity * tp_price
             if notional < self.min_notional:
                 logger.info(f"Partial TP notional too small ({notional:.2f}), skipping")
                 return
-            
+
             # Place TP order
-            client_order_id = f"partial_tp_{level.index}_{int(datetime.now().timestamp())}"
-            
+            client_order_id = f"partial_tp_{level.index}_{level.partial_fill_count}_{int(datetime.now().timestamp())}"
+
             response = await self.client.place_order(
                 symbol=config.trading.SYMBOL,
-                side=tp_side,
+                side="SELL",
                 order_type="LIMIT",
                 quantity=quantity,
                 price=tp_price,
                 client_order_id=client_order_id,
             )
-            
+
+            partial_tp_order_id = response.get("orderId")
+
+            # Track partial TP order ID
+            level.partial_tp_order_ids.append(partial_tp_order_id)
+
             logger.info(
-                f"PARTIAL TP: {tp_side} {quantity} @ {tp_price:.4f} | "
-                f"OrderID: {response.get('orderId')}"
+                f"PARTIAL TP: SELL {quantity} @ {tp_price:.4f} | "
+                f"Entry: {price:.4f} | OrderID: {partial_tp_order_id} | "
+                f"Partial TPs: {len(level.partial_tp_order_ids)}"
             )
             
         except AsterAPIError as e:
@@ -1187,16 +1259,31 @@ class GridBot:
                 fill_price = Decimal(price or "0")
                 fill_qty = Decimal(exec_qty or "0")
 
+                # Calculate slippage
+                slippage = level.calculate_slippage(fill_price)
+                slippage_info = f" | Slippage: {slippage:+.3f}%" if slippage != 0 else ""
+
                 # Update position tracking based on side
                 if side == "BUY":
-                    # BUY filled: record entry position
-                    level.entry_price = fill_price
-                    level.position_quantity = fill_qty
-                    level.state = GridLevelState.POSITION_HELD
-                    logger.info(
-                        f"Order FILLED: BUY @ {price} | Level {level.index} | "
-                        f"Position: {fill_qty} @ {fill_price}"
-                    )
+                    # BUY filled: record entry position (handles both full and accumulated partial)
+                    if level.partial_fill_count > 0:
+                        # Already had partial fills, this is the final fill
+                        level.add_partial_fill(fill_price, fill_qty)
+                        logger.info(
+                            f"Order FILLED: BUY @ {price} | Level {level.index} | "
+                            f"Total Position: {level.position_quantity:.4f} @ {level.entry_price:.4f} "
+                            f"({level.partial_fill_count} fills){slippage_info}"
+                        )
+                    else:
+                        # Clean full fill
+                        level.entry_price = fill_price
+                        level.position_quantity = fill_qty
+                        level.actual_fill_price = fill_price
+                        level.state = GridLevelState.POSITION_HELD
+                        logger.info(
+                            f"Order FILLED: BUY @ {price} | Level {level.index} | "
+                            f"Position: {fill_qty} @ {fill_price}{slippage_info}"
+                        )
                     pnl = Decimal("0")
 
                 elif side == "SELL" and level.entry_price > 0:
@@ -1205,43 +1292,50 @@ class GridBot:
                     self.state.realized_pnl += pnl
                     logger.info(
                         f"Order FILLED: SELL @ {price} | Level {level.index} | "
-                        f"Entry: {level.entry_price} | PnL: {pnl:+.4f} | "
-                        f"Total Realized: {self.state.realized_pnl:+.4f}"
+                        f"Entry: {level.entry_price} | Qty: {level.position_quantity} | "
+                        f"PnL: {pnl:+.4f} | Total Realized: {self.state.realized_pnl:+.4f}{slippage_info}"
                     )
-                    # Reset level after TP fill (will be handled in rebalance)
                 else:
                     pnl = Decimal("0")
-                    logger.info(f"Order FILLED: {side} @ {price} | Level {level.index}")
+                    logger.info(f"Order FILLED: {side} @ {price} | Level {level.index}{slippage_info}")
 
                 # Schedule rebalancing (can't await in callback)
                 asyncio.create_task(self.rebalance_on_fill(level, fill_price, fill_qty))
 
                 # Log trade and send telegram notification
                 asyncio.create_task(self._log_and_notify_fill(
-                    side, price, exec_qty, level.index, pnl
+                    side, price, exec_qty, level.index, pnl, slippage
                 ))
             
             elif status == "PARTIALLY_FILLED":
                 exec_qty_decimal = Decimal(exec_qty or "0")
                 price_decimal = Decimal(price or "0")
                 notional = exec_qty_decimal * price_decimal
-                
-                logger.info(f"Order PARTIAL: {side} @ {price} | Qty: {exec_qty} | Notional: {notional:.2f}")
-                
+
                 # Only handle partial fill if significant enough (> min_notional)
                 if notional >= self.min_notional and level:
+                    # Track partial fill in level (accumulate position)
+                    if side == "BUY":
+                        level.add_partial_fill(price_decimal, exec_qty_decimal)
+
+                    logger.info(
+                        f"Order PARTIAL: {side} @ {price} | Qty: {exec_qty} | "
+                        f"Accumulated: {level.position_quantity:.4f} @ {level.entry_price:.4f} "
+                        f"({level.partial_fill_count} fills)"
+                    )
+
                     # Log trade for this partial fill
                     asyncio.create_task(self._log_and_notify_fill(
-                        side, price, exec_qty, level.index
+                        side, price, exec_qty, level.index, Decimal("0"), Decimal("0"),
+                        is_partial=True
                     ))
-                    
+
                     # Schedule a partial rebalance to place TP for filled portion
-                    # This creates a separate TP order for the partial fill
                     asyncio.create_task(self._handle_partial_fill(
                         level, side, price_decimal, exec_qty_decimal
                     ))
                 else:
-                    logger.info(f"Partial fill too small ({notional:.2f} < {self.min_notional}), skipping TP")
+                    logger.info(f"Partial fill too small ({notional:.2f} < {self.min_notional}), skipping")
     
     def on_position_update(self, position_data: dict) -> None:
         """Handle position update from WebSocket."""
@@ -1279,11 +1373,14 @@ class GridBot:
         price: str,
         quantity: str,
         grid_level: int,
-        pnl: Decimal = Decimal("0")
+        pnl: Decimal = Decimal("0"),
+        slippage: Decimal = Decimal("0"),
+        is_partial: bool = False
     ) -> None:
         """Log trade to database and send Telegram notification."""
         try:
             # Log to SQLite with PnL
+            status = "PARTIALLY_FILLED" if is_partial else "FILLED"
             trade = create_trade_record(
                 symbol=config.trading.SYMBOL,
                 side=side,
@@ -1292,11 +1389,14 @@ class GridBot:
                 quantity=Decimal(quantity or "0"),
                 order_id=0,
                 client_order_id="",
-                status="FILLED",
+                status=status,
                 grid_level=grid_level,
                 pnl=pnl,
             )
             await self.trade_logger.log_trade(trade)
+
+            # Build slippage info if significant
+            slippage_str = f"\n📉 Slippage: `{slippage:+.3f}%`" if abs(slippage) > Decimal("0.01") else ""
 
             # Send Telegram alert with PnL info for SELL orders
             if side == "SELL" and pnl != 0:
@@ -1307,7 +1407,16 @@ class GridBot:
                     f"📦 Qty: `{Decimal(quantity or '0'):.2f}`\n"
                     f"🔢 Level: `{grid_level}`\n"
                     f"💵 PnL: `{pnl:+.4f} USDT`\n"
-                    f"📈 Total Realized: `{self.state.realized_pnl:+.4f} USDT`"
+                    f"📈 Total Realized: `{self.state.realized_pnl:+.4f} USDT`{slippage_str}"
+                )
+            elif is_partial:
+                # Partial fill notification (less verbose)
+                await self.telegram.send_message(
+                    f"📦 *Partial Fill*\n\n"
+                    f"📊 Side: `{side}`\n"
+                    f"💵 Price: `{Decimal(price):.4f}`\n"
+                    f"📦 Qty: `{Decimal(quantity or '0'):.2f}`\n"
+                    f"🔢 Level: `{grid_level}`{slippage_str}"
                 )
             else:
                 await self.telegram.send_order_filled(

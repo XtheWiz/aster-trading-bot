@@ -28,17 +28,17 @@
 
 ---
 
-## Phase 2: Order Management Improvement
+## Phase 2: Order Management Improvement ✅
 
 > Priority: **HIGH** | Goal: More accurate order lifecycle tracking
 
 | # | Task | Status | Notes | Date |
 |---|------|--------|-------|------|
 | 2.1 | Implement Grid Level State Machine | ✅ | Added `GridLevelState` enum: EMPTY → BUY_PLACED → POSITION_HELD → TP_PLACED | 2026-01-08 |
-| 2.2 | Proper Partial Fill handling | ❌ | Track remaining quantity separately | |
-| 2.3 | Slippage tracking | ❌ | Log actual fill price vs intended price | |
+| 2.2 | Proper Partial Fill handling | ✅ | `add_partial_fill()` for weighted avg entry, `partial_tp_order_ids` tracking | 2026-01-08 |
+| 2.3 | Slippage tracking | ✅ | `intended_price`, `actual_fill_price`, `slippage_percent` fields | 2026-01-08 |
 
-### Phase 2 Progress: 1/3 (33%)
+### Phase 2 Progress: 3/3 (100%) ✅
 
 ---
 
@@ -92,12 +92,12 @@
 | Phase | Progress | Status |
 |-------|----------|--------|
 | Phase 1: Critical Fixes | 100% | ✅ Complete |
-| Phase 2: Order Management | 33% | 🔄 Partial (State Machine done) |
+| Phase 2: Order Management | 100% | ✅ Complete |
 | Phase 3: Risk Management | 0% | ❌ Not Started |
 | Phase 4: Analytics | 0% | ❌ Not Started |
 | Phase 5: Advanced | 0% | ❌ Not Started |
 
-**Total: 4/18 tasks completed (22%)**
+**Total: 6/18 tasks completed (33%)**
 
 ---
 
@@ -120,6 +120,16 @@
   - Added `get_level_by_tp_order_id()`, `get_total_position_quantity()`, `get_levels_with_position()` to GridState
   - Updated `place_grid_orders()`, `cancel_all_orders()`, `_place_smart_tp()`, `_re_place_buy()` to manage states
 - Completed 2.1: Implemented Grid Level State Machine (bonus from 1.3)
+- **Phase 2 Complete!**
+- Completed 2.2: Proper Partial Fill handling
+  - Added `add_partial_fill()` method for weighted average entry price
+  - Track multiple partial fills with `partial_fill_count`
+  - Store partial TP order IDs in `partial_tp_order_ids` list
+  - Use Smart TP for partial fill TPs
+- Completed 2.3: Slippage tracking
+  - Added `intended_price`, `actual_fill_price`, `slippage_percent` to GridLevel
+  - `calculate_slippage()` method computes slippage on fill
+  - Slippage logged and shown in Telegram notifications (if > 0.01%)
 
 ---
 
