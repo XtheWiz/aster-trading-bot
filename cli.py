@@ -17,6 +17,11 @@ Analytics (Phase 4):
     python cli.py daily [days]        - Show daily performance
     python cli.py levels              - Show grid level performance
     python cli.py trades [limit]      - Show recent trades
+
+Backtesting (Phase 5):
+    python cli.py backtest [days]     - Run backtest with current settings
+    python cli.py optimize [days]     - Find optimal grid parameters
+    python cli.py spread [symbol]     - Analyze orderbook spread
 """
 import asyncio
 import sys
@@ -519,6 +524,142 @@ async def cmd_trades(limit: int = 20):
         await logger.close()
 
 
+# =============================================================================
+# Phase 5: Orderbook Spread Analysis
+# =============================================================================
+
+async def cmd_spread(symbol: str = None):
+    """Analyze orderbook spread and liquidity."""
+    symbol = symbol or config.trading.SYMBOL
+    print(f"📊 Orderbook Analysis: {symbol}")
+
+    client = AsterClient()
+
+    try:
+        # Get orderbook depth
+        depth = await client.get_depth(symbol, limit=20)
+
+        # Get current price
+        ticker = await client.get_ticker_price(symbol)
+        current_price = Decimal(ticker['price'])
+
+        bids = depth.get('bids', [])
+        asks = depth.get('asks', [])
+
+        if not bids or not asks:
+            print("\n❌ No orderbook data available")
+            return
+
+        # Calculate spread
+        best_bid = Decimal(bids[0][0])
+        best_ask = Decimal(asks[0][0])
+        spread = best_ask - best_bid
+        spread_pct = (spread / current_price) * 100
+
+        # Calculate depth (liquidity at each level)
+        bid_depth = sum(Decimal(b[1]) for b in bids[:10])
+        ask_depth = sum(Decimal(a[1]) for a in asks[:10])
+        total_depth = bid_depth + ask_depth
+        imbalance = (bid_depth - ask_depth) / total_depth * 100 if total_depth > 0 else 0
+
+        # Calculate weighted average prices
+        bid_value = sum(Decimal(b[0]) * Decimal(b[1]) for b in bids[:10])
+        ask_value = sum(Decimal(a[0]) * Decimal(a[1]) for a in asks[:10])
+        vwap_bid = bid_value / bid_depth if bid_depth > 0 else best_bid
+        vwap_ask = ask_value / ask_depth if ask_depth > 0 else best_ask
+
+        # Slippage estimation for different order sizes
+        print("\n" + "=" * 60)
+        print("📈 ORDERBOOK ANALYSIS")
+        print("=" * 60)
+
+        print(f"\n💰 Current Price: ${current_price:.4f}")
+        print(f"\n📊 Spread:")
+        print(f"   Best Bid:      ${best_bid:.4f}")
+        print(f"   Best Ask:      ${best_ask:.4f}")
+        print(f"   Spread:        ${spread:.4f} ({spread_pct:.4f}%)")
+
+        print(f"\n📦 Depth (Top 10 levels):")
+        print(f"   Bid Depth:     {bid_depth:.2f} {symbol.replace('USDT', '')}")
+        print(f"   Ask Depth:     {ask_depth:.2f} {symbol.replace('USDT', '')}")
+        print(f"   Imbalance:     {imbalance:+.2f}%")
+
+        # Imbalance interpretation
+        if imbalance > 10:
+            print(f"   → 🟢 Bullish (more buy orders)")
+        elif imbalance < -10:
+            print(f"   → 🔴 Bearish (more sell orders)")
+        else:
+            print(f"   → ⚪ Neutral")
+
+        print(f"\n📏 VWAP (Volume Weighted):")
+        print(f"   VWAP Bid:      ${vwap_bid:.4f}")
+        print(f"   VWAP Ask:      ${vwap_ask:.4f}")
+
+        # Slippage estimation
+        print(f"\n💸 Estimated Slippage:")
+        order_sizes = [10, 50, 100, 500]  # USDT
+
+        for size in order_sizes:
+            qty_needed = Decimal(size) / current_price
+            buy_slippage = estimate_slippage(asks, qty_needed, current_price)
+            sell_slippage = estimate_slippage(bids, qty_needed, current_price, is_sell=True)
+
+            print(f"   ${size} order:   BUY {buy_slippage:+.3f}% | SELL {sell_slippage:+.3f}%")
+
+        # Grid trading recommendation
+        print(f"\n💡 Grid Trading Impact:")
+        grid_qty = config.grid.QUANTITY_PER_GRID_USDT / current_price
+        grid_slippage = estimate_slippage(asks, grid_qty, current_price)
+
+        if spread_pct < Decimal("0.05"):
+            spread_rating = "🟢 Excellent (< 0.05%)"
+        elif spread_pct < Decimal("0.1"):
+            spread_rating = "🟡 Good (< 0.1%)"
+        else:
+            spread_rating = "🔴 Wide (> 0.1%)"
+
+        print(f"   Spread Rating: {spread_rating}")
+        print(f"   Grid Order Slippage: ~{grid_slippage:.3f}%")
+
+        print("=" * 60)
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+    finally:
+        await client.close()
+
+
+def estimate_slippage(
+    orders: list,
+    qty_needed: Decimal,
+    current_price: Decimal,
+    is_sell: bool = False
+) -> Decimal:
+    """Estimate slippage for a given order size."""
+    remaining = qty_needed
+    total_cost = Decimal("0")
+
+    for order in orders:
+        price = Decimal(order[0])
+        available = Decimal(order[1])
+
+        if remaining <= 0:
+            break
+
+        fill_qty = min(remaining, available)
+        total_cost += fill_qty * price
+        remaining -= fill_qty
+
+    if qty_needed - remaining == 0:
+        return Decimal("0")
+
+    avg_price = total_cost / (qty_needed - remaining)
+    slippage = (avg_price - current_price) / current_price * 100
+
+    return slippage if not is_sell else -slippage
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -567,6 +708,18 @@ def main():
     elif cmd == "trades":
         limit = int(arg) if arg else 20
         asyncio.run(cmd_trades(limit))
+
+    # Phase 5: Backtesting Commands
+    elif cmd == "backtest":
+        from backtester import run_backtest
+        days = int(arg) if arg else 30
+        asyncio.run(run_backtest(days=days))
+    elif cmd == "optimize":
+        from backtester import run_optimization
+        days = int(arg) if arg else 30
+        asyncio.run(run_optimization(days=days))
+    elif cmd == "spread":
+        asyncio.run(cmd_spread(arg))
 
     else:
         print(f"❌ Unknown command: {cmd}")

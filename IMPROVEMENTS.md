@@ -1,6 +1,6 @@
 # Aster Grid Bot - Improvement Tracker
 
-> Last Updated: 2026-01-08 (Phase 4 Complete)
+> Last Updated: 2026-01-08 (Phase 5 Complete)
 
 ## Status Legend
 
@@ -81,18 +81,23 @@
 
 ---
 
-## Phase 5: Advanced Features
+## Phase 5: Advanced Features ✅
 
 > Priority: **LOW** | Goal: Optimization and expansion
 
 | # | Task | Status | Notes | Date |
 |---|------|--------|-------|------|
-| 5.1 | Backtesting engine | ❌ | Replay historical data | |
-| 5.2 | Multi-symbol support | ❌ | Run multiple pairs concurrently | |
-| 5.3 | ML-based optimal TP | ❌ | Train model on historical fills | |
-| 5.4 | Orderbook spread analysis | ❌ | Track bid-ask spread impact | |
+| 5.1 | Backtesting engine | ✅ | `backtester.py` with optimization mode | 2026-01-08 |
+| 5.2 | Multi-symbol support | ⏸️ | Deferred - requires major refactoring | - |
+| 5.3 | ML-based optimal TP | ⏸️ | Deferred - needs ML infrastructure | - |
+| 5.4 | Orderbook spread analysis | ✅ | `python cli.py spread` command | 2026-01-08 |
 
-### Phase 5 Progress: 0/4 (0%)
+### Phase 5 Progress: 2/4 (50%) - Core features complete
+
+**CLI Commands:**
+- `python cli.py backtest [days]` - Run backtest with current settings
+- `python cli.py optimize [days]` - Find optimal grid parameters
+- `python cli.py spread [symbol]` - Analyze orderbook spread & liquidity
 
 ---
 
@@ -104,13 +109,33 @@
 | Phase 2: Order Management | 100% | ✅ Complete |
 | Phase 3: Risk Management | 100% | ✅ Complete |
 | Phase 4: Analytics | 100% | ✅ Complete |
-| Phase 5: Advanced | 0% | ❌ Not Started |
+| Phase 5: Advanced | 50% | ✅ Core Complete |
 
-**Total: 15/19 tasks completed (79%)**
+**Total: 17/19 tasks completed (89%)**
+
+*Note: 5.2 (Multi-symbol) and 5.3 (ML TP) are deferred to future versions*
 
 ---
 
 ## Changelog
+
+### 2026-01-08 (Phase 5)
+- **Phase 5 Core Complete!** - Advanced Features
+- Completed 5.1: Backtesting engine
+  - Created `backtester.py` with full grid trading simulation
+  - Fetches historical klines data from API
+  - Simulates BUY fills at grid levels, SELL at TP targets
+  - Calculates: ROI, win rate, max drawdown, trade count
+  - Parameter optimization mode tests 64 combinations
+  - CLI commands: `backtest [days]`, `optimize [days]`
+- Completed 5.4: Orderbook spread analysis
+  - Analyzes bid/ask spread and liquidity depth
+  - Calculates order book imbalance (bullish/bearish signal)
+  - Estimates slippage for different order sizes
+  - Shows VWAP (volume-weighted average price)
+  - CLI command: `spread [symbol]`
+- Deferred 5.2: Multi-symbol support (requires major refactoring)
+- Deferred 5.3: ML-based optimal TP (needs ML infrastructure)
 
 ### 2026-01-08 (Phase 4)
 - **Phase 4 Complete!** - Analytics & Reporting
