@@ -2,7 +2,7 @@
 Strategy Manager for Aster DEX Grid Bot
 
 This module acts as the "Quantitative Supervisor" for the grid bot.
-It periodically analyzes market conditions (Trend, Volatility) and 
+It periodically analyzes market conditions (Trend, Volatility) and
 recommends configuration changes or safety actions.
 
 Core Responsibilities:
@@ -10,16 +10,21 @@ Core Responsibilities:
 2. Calculate technical indicators (ATR, SMA/EMA)
 3. Determine Market State (Ranging, Trending, Volatile)
 4. Trigger circuit breakers or config updates if conditions are dangerous
+5. Real-time price spike detection via WebSocket
+6. Funding rate monitoring
 """
-import logging
 import asyncio
+import json
+import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 from typing import Literal
 
 import pandas as pd
+import websockets
+
 from aster_client import AsterClient
 from config import config
 from telegram_notifier import TelegramNotifier
@@ -124,8 +129,8 @@ class StrategyManager:
         self.previous_state: MarketState | None = None  # Track state changes
         self.is_running = False
         
-        # Strategy Parameters - reduced to 30 min for faster response
-        self.check_interval = 1800  # Check every 30 minutes (was 1 hour)
+        # Strategy Parameters - reduced to 15 min for faster response
+        self.check_interval = 900  # Check every 15 minutes (was 30 min)
         self.atr_period = 14
         self.ma_fast_period = 7
         self.ma_slow_period = 25
@@ -144,30 +149,270 @@ class StrategyManager:
         self.last_analysis_time: datetime | None = None
         self.last_regrid_time: datetime | None = None
         self.pending_regrid_count: int = 0
+
+        # Funding rate monitoring
+        self.funding_rate_threshold = Decimal("0.001")  # 0.1% - alert if higher
+        self.funding_rate_extreme = Decimal("0.003")  # 0.3% - consider pausing
+        self.last_funding_rate: Decimal = Decimal("0")
+        self.next_funding_time: datetime | None = None
+
+        # Real-time price spike detection
+        self.price_spike_threshold = Decimal("0.03")  # 3% move triggers alert
+        self.price_spike_window = 300  # 5 minutes window for spike detection
+        self.price_history: list[tuple[datetime, Decimal]] = []
+        self.last_spike_alert: datetime | None = None
+        self.spike_alert_cooldown = 60  # Seconds between alerts
+        self._price_monitor_task: asyncio.Task | None = None
         
     async def start_monitoring(self):
         """Start the background monitoring loop."""
         self.is_running = True
         logger.info("Strategy Manager started - monitoring market conditions...")
-        
+
+        # Start real-time price monitoring in background
+        self._price_monitor_task = asyncio.create_task(self._monitor_price_spikes())
+
         while self.is_running:
             try:
                 analysis = await self.analyze_market()
                 await self.evaluate_safety(analysis)
-                
+
+                # Check funding rate
+                await self._check_funding_rate()
+
                 # Sleep for interval
                 await asyncio.sleep(self.check_interval)
-                
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in strategy monitoring loop: {e}")
-                await asyncio.sleep(60) # Short retry on error
+                await asyncio.sleep(60)  # Short retry on error
 
     async def stop(self):
         """Stop the monitoring loop."""
         self.is_running = False
+
+        # Stop price monitor
+        if self._price_monitor_task:
+            self._price_monitor_task.cancel()
+            try:
+                await self._price_monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._price_monitor_task = None
+
         logger.info("Strategy Manager stopped")
+
+    async def _check_funding_rate(self) -> None:
+        """
+        Check current funding rate and alert if extreme.
+
+        High funding rate considerations:
+        - Positive rate > 0.1%: Longs pay shorts, unfavorable for LONG grid
+        - Negative rate < -0.1%: Shorts pay longs, favorable for LONG grid
+        - Extreme rate > 0.3%: Consider closing positions before funding
+        """
+        try:
+            symbol = config.trading.SYMBOL
+            funding_data = await self.client.get_funding_rate(symbol)
+
+            if not funding_data:
+                return
+
+            rate_str = funding_data.get("lastFundingRate", "0")
+            self.last_funding_rate = Decimal(rate_str)
+            next_funding_ms = funding_data.get("nextFundingTime", 0)
+            self.next_funding_time = datetime.fromtimestamp(next_funding_ms / 1000) if next_funding_ms else None
+
+            # Calculate minutes until next funding
+            minutes_until_funding = 0
+            if self.next_funding_time:
+                delta = self.next_funding_time - datetime.now()
+                minutes_until_funding = max(0, delta.total_seconds() / 60)
+
+            rate_percent = float(self.last_funding_rate * 100)
+            logger.info(f"Funding Rate: {rate_percent:.4f}% | Next funding in {minutes_until_funding:.0f} min")
+
+            # Get current grid side
+            grid_side = config.grid.GRID_SIDE
+
+            # Alert if funding rate is significant
+            abs_rate = abs(self.last_funding_rate)
+
+            if abs_rate >= self.funding_rate_extreme:
+                # Extreme funding rate
+                direction = "LONGS pay" if self.last_funding_rate > 0 else "SHORTS pay"
+                impact = "UNFAVORABLE" if (
+                    (grid_side == "LONG" and self.last_funding_rate > 0) or
+                    (grid_side == "SHORT" and self.last_funding_rate < 0)
+                ) else "FAVORABLE"
+
+                await self.telegram.send_message(
+                    f"🚨 EXTREME Funding Rate Alert!\n\n"
+                    f"Rate: {rate_percent:.4f}%\n"
+                    f"Direction: {direction}\n"
+                    f"Grid Side: {grid_side}\n"
+                    f"Impact: {impact}\n"
+                    f"Next Funding: {minutes_until_funding:.0f} min\n\n"
+                    f"⚠️ Consider closing positions before funding!"
+                )
+
+            elif abs_rate >= self.funding_rate_threshold:
+                # High but not extreme
+                direction = "LONGS pay" if self.last_funding_rate > 0 else "SHORTS pay"
+                impact = "unfavorable" if (
+                    (grid_side == "LONG" and self.last_funding_rate > 0) or
+                    (grid_side == "SHORT" and self.last_funding_rate < 0)
+                ) else "favorable"
+
+                logger.warning(f"High funding rate ({rate_percent:.4f}%) - {impact} for {grid_side}")
+
+                # Only alert if close to funding time (< 30 min) and unfavorable
+                if minutes_until_funding <= 30 and impact == "unfavorable":
+                    await self.telegram.send_message(
+                        f"⚠️ High Funding Rate Warning\n\n"
+                        f"Rate: {rate_percent:.4f}%\n"
+                        f"Direction: {direction}\n"
+                        f"Grid Side: {grid_side}\n"
+                        f"Next Funding: {minutes_until_funding:.0f} min\n\n"
+                        f"Consider reducing position size."
+                    )
+
+        except Exception as e:
+            logger.error(f"Error checking funding rate: {e}")
+
+    async def _monitor_price_spikes(self) -> None:
+        """
+        Real-time price monitoring via WebSocket to detect sudden spikes.
+
+        Connects to mark price stream and tracks price changes over
+        a 5-minute window. Alerts if price moves more than 3%.
+        """
+        symbol = config.trading.SYMBOL.lower()
+        logger.info(f"Starting real-time price spike monitor for {symbol}")
+
+        while self.is_running:
+            try:
+                # Connect to mark price stream (updates every second)
+                ws_url = f"{self.client.ws_url}/ws/{symbol}@markPrice"
+                logger.debug(f"Connecting to price stream: {ws_url}")
+
+                async with websockets.connect(ws_url) as ws:
+                    logger.info("Price spike monitor connected")
+
+                    async for message in ws:
+                        if not self.is_running:
+                            break
+
+                        try:
+                            data = json.loads(message)
+                            mark_price = Decimal(data.get("p", "0"))
+
+                            if mark_price > 0:
+                                await self._process_price_update(mark_price)
+
+                        except Exception as e:
+                            logger.debug(f"Error processing price message: {e}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"Price monitor connection error: {e}")
+                await asyncio.sleep(5)  # Retry after 5 seconds
+
+    async def _process_price_update(self, current_price: Decimal) -> None:
+        """
+        Process price update and check for spikes.
+
+        Args:
+            current_price: Current mark price
+        """
+        now = datetime.now()
+
+        # Add to history
+        self.price_history.append((now, current_price))
+
+        # Clean old entries (older than window)
+        cutoff = now - timedelta(seconds=self.price_spike_window)
+        self.price_history = [
+            (ts, price) for ts, price in self.price_history
+            if ts >= cutoff
+        ]
+
+        # Need at least 2 points to detect spike
+        if len(self.price_history) < 2:
+            return
+
+        # Get oldest price in window
+        oldest_price = self.price_history[0][1]
+
+        # Calculate change percentage
+        if oldest_price > 0:
+            change = (current_price - oldest_price) / oldest_price
+            abs_change = abs(change)
+
+            # Check if spike threshold exceeded
+            if abs_change >= self.price_spike_threshold:
+                await self._handle_price_spike(current_price, oldest_price, change)
+
+    async def _handle_price_spike(
+        self,
+        current_price: Decimal,
+        reference_price: Decimal,
+        change: Decimal
+    ) -> None:
+        """
+        Handle detected price spike.
+
+        Args:
+            current_price: Current price
+            reference_price: Price at start of window
+            change: Percentage change (as decimal, e.g., 0.03 = 3%)
+        """
+        now = datetime.now()
+
+        # Check cooldown to avoid alert spam
+        if self.last_spike_alert:
+            seconds_since_alert = (now - self.last_spike_alert).total_seconds()
+            if seconds_since_alert < self.spike_alert_cooldown:
+                return
+
+        self.last_spike_alert = now
+        change_percent = float(change * 100)
+        direction = "📈 UP" if change > 0 else "📉 DOWN"
+
+        logger.warning(
+            f"Price spike detected! {direction}: {change_percent:+.2f}% "
+            f"(${reference_price:.2f} → ${current_price:.2f})"
+        )
+
+        # Determine impact on current grid
+        grid_side = config.grid.GRID_SIDE
+        if grid_side == "LONG":
+            impact = "FAVORABLE" if change > 0 else "UNFAVORABLE"
+        else:
+            impact = "FAVORABLE" if change < 0 else "UNFAVORABLE"
+
+        await self.telegram.send_message(
+            f"🚨 Price Spike Alert!\n\n"
+            f"Direction: {direction}\n"
+            f"Change: {change_percent:+.2f}%\n"
+            f"Price: ${reference_price:.2f} → ${current_price:.2f}\n"
+            f"Window: {self.price_spike_window // 60} min\n\n"
+            f"Grid: {grid_side}\n"
+            f"Impact: {impact}\n\n"
+            f"⚠️ Check your positions!"
+        )
+
+        # If extreme move (>5%) and unfavorable, trigger safety check
+        if abs(change) >= Decimal("0.05") and impact == "UNFAVORABLE":
+            logger.critical(f"EXTREME price move detected: {change_percent:+.2f}%")
+            await self.telegram.send_message(
+                f"🚨🚨 EXTREME MOVE ALERT 🚨🚨\n\n"
+                f"Price moved {change_percent:+.2f}% against your {grid_side} grid!\n\n"
+                f"Consider immediate action!"
+            )
 
     async def analyze_market(self, symbol: str | None = None) -> MarketAnalysis:
         """

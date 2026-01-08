@@ -373,21 +373,73 @@ class AsterClient:
     ) -> list[list]:
         """
         Get candlestick/kline data.
-        
+
         Args:
             symbol: Trading pair
             interval: Kline interval (1m, 5m, 15m, 1h, 4h, 1d, etc.)
             limit: Number of klines (max 1500)
-            
+
         Returns:
             List of klines: [open_time, open, high, low, close, volume, ...]
         """
         symbol = symbol or config.trading.SYMBOL
         return await self._request(
-            "GET", 
-            "/fapi/v1/klines", 
+            "GET",
+            "/fapi/v1/klines",
             {"symbol": symbol, "interval": interval, "limit": limit}
         )
+
+    async def get_funding_rate(self, symbol: str | None = None) -> dict[str, Any]:
+        """
+        Get current funding rate and next funding time.
+
+        Funding rate is charged/paid every 8 hours.
+        Positive rate = longs pay shorts
+        Negative rate = shorts pay longs
+
+        Args:
+            symbol: Trading pair
+
+        Returns:
+            {
+                "symbol": "SOLUSDT",
+                "markPrice": "135.5",
+                "indexPrice": "135.4",
+                "lastFundingRate": "0.0001",
+                "nextFundingTime": 1704067200000,
+                ...
+            }
+        """
+        symbol = symbol or config.trading.SYMBOL
+        return await self._request("GET", "/fapi/v1/premiumIndex", {"symbol": symbol})
+
+    async def get_funding_rate_history(
+        self,
+        symbol: str | None = None,
+        limit: int = 10,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Get historical funding rate data.
+
+        Args:
+            symbol: Trading pair
+            limit: Number of records (max 1000)
+            start_time: Start timestamp in milliseconds
+            end_time: End timestamp in milliseconds
+
+        Returns:
+            List of funding rate records:
+            [{"symbol": "SOLUSDT", "fundingRate": "0.0001", "fundingTime": 1704067200000}, ...]
+        """
+        symbol = symbol or config.trading.SYMBOL
+        params = {"symbol": symbol, "limit": limit}
+        if start_time:
+            params["startTime"] = start_time
+        if end_time:
+            params["endTime"] = end_time
+        return await self._request("GET", "/fapi/v1/fundingRate", params)
     
     # =========================================================================
     # ACCOUNT ENDPOINTS (Signed - Requires authentication)
