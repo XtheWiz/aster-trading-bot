@@ -49,36 +49,44 @@ class MarketAnalysis:
     ema_fast: Decimal = Decimal("0")
     ema_slow: Decimal = Decimal("0")
     rsi: float = 50.0
+    macd: float = 0.0
+    macd_signal: float = 0.0
     macd_histogram: float = 0.0
+    sma_20: float = 0.0
+    sma_50: float = 0.0
+    volume_ratio: float = 1.0  # Current volume / avg volume
 
 
 @dataclass
 class TrendScore:
     """
     Multi-indicator trend scoring for auto-switch decisions.
-    
+
     Score Components:
     - EMA: +1 if fast > slow (bullish), -1 if fast < slow (bearish)
-    - MACD Histogram: +1 if positive, -1 if negative  
-    - RSI: +1 if > 50, -1 if < 50
-    
-    Total Score Range: -3 (strong bearish) to +3 (strong bullish)
+    - MACD Histogram: +1 if positive, -1 if negative
+    - RSI: +1 if > 55, -1 if < 45
+    - Volume: +1 if volume confirms trend, 0 if neutral/weak
+
+    Total Score Range: -4 (strong bearish) to +4 (strong bullish)
     """
     ema_score: int = 0  # -1, 0, or +1
     macd_score: int = 0  # -1, 0, or +1
     rsi_score: int = 0  # -1, 0, or +1
-    
+    volume_score: int = 0  # -1, 0, or +1
+    volume_ratio: float = 1.0  # For display purposes
+
     @property
     def total(self) -> int:
-        """Total trend score from -3 to +3."""
-        return self.ema_score + self.macd_score + self.rsi_score
-    
+        """Total trend score from -4 to +4."""
+        return self.ema_score + self.macd_score + self.rsi_score + self.volume_score
+
     @property
     def recommended_side(self) -> Literal["LONG", "SHORT", "STAY", "PAUSE"]:
         """Get recommended grid side based on score."""
         score = self.total
         min_score = config.grid.MIN_SWITCH_SCORE
-        
+
         if score >= min_score:
             return "LONG"
         elif score <= -min_score:
@@ -86,9 +94,15 @@ class TrendScore:
         else:
             # Unclear signal
             return config.grid.UNCLEAR_TREND_ACTION
-    
+
+    @property
+    def volume_confirmed(self) -> bool:
+        """Check if volume confirms the trend direction."""
+        return self.volume_score != 0
+
     def __str__(self) -> str:
-        return f"TrendScore(EMA={self.ema_score:+d}, MACD={self.macd_score:+d}, RSI={self.rsi_score:+d}, Total={self.total:+d})"
+        vol_str = f"Vol={self.volume_score:+d}" if self.volume_score != 0 else "Vol=0"
+        return f"TrendScore(EMA={self.ema_score:+d}, MACD={self.macd_score:+d}, RSI={self.rsi_score:+d}, {vol_str}, Total={self.total:+d})"
 
 
 class StrategyManager:
@@ -201,14 +215,10 @@ class StrategyManager:
             df['ema_fast'] = df['close'].ewm(span=self.ma_fast_period, adjust=False).mean()
             df['ema_slow'] = df['close'].ewm(span=self.ma_slow_period, adjust=False).mean()
             
-            # SMA (Simple Moving Averages) - keep for backward compatibility
-            df['ma_fast'] = df['close'].rolling(window=self.ma_fast_period).mean()
-            df['ma_slow'] = df['close'].rolling(window=self.ma_slow_period).mean()
-            
-            # RSI (14-period)
+            # RSI (14-period) - Wilder's RSI using EMA
             delta = df['close'].diff()
-            gain = delta.where(delta > 0, 0).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
+            loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
             rs = gain / loss
             df['rsi'] = 100 - (100 / (1 + rs))
             
@@ -218,31 +228,42 @@ class StrategyManager:
             df['macd'] = ema_12 - ema_26
             df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
             df['macd_hist'] = df['macd'] - df['macd_signal']
-            
+
+            # SMA for support/resistance (used by indicator_analyzer)
+            df['sma_20'] = df['close'].rolling(window=20).mean()
+            df['sma_50'] = df['close'].rolling(window=50).mean()
+
+            # Volume analysis (use completed candle, not current partial candle)
+            df['volume_sma'] = df['volume'].rolling(window=20).mean()
+            df['volume_ratio'] = df['volume'].shift(1) / df['volume_sma'].shift(1)
+
             # Get latest values
             latest = df.iloc[-1]
             current_price = Decimal(str(latest['close']))
             atr = Decimal(str(latest['atr'])) if not pd.isna(latest['atr']) else Decimal("0")
-            ma_fast = Decimal(str(latest['ma_fast']))
-            ma_slow = Decimal(str(latest['ma_slow']))
             ema_fast = Decimal(str(latest['ema_fast']))
             ema_slow = Decimal(str(latest['ema_slow']))
             rsi = float(latest['rsi']) if not pd.isna(latest['rsi']) else 50.0
+            macd_val = float(latest['macd']) if not pd.isna(latest['macd']) else 0.0
+            macd_signal_val = float(latest['macd_signal']) if not pd.isna(latest['macd_signal']) else 0.0
             macd_hist = float(latest['macd_hist']) if not pd.isna(latest['macd_hist']) else 0.0
+            sma_20 = float(latest['sma_20']) if not pd.isna(latest['sma_20']) else 0.0
+            sma_50 = float(latest['sma_50']) if not pd.isna(latest['sma_50']) else 0.0
+            volume_ratio = float(latest['volume_ratio']) if not pd.isna(latest['volume_ratio']) else 1.0
             
-            # 4. Calculate Trend Score for Auto-Switch
-            trend_score = self._calculate_trend_score(ema_fast, ema_slow, macd_hist, rsi)
+            # 4. Calculate Trend Score for Auto-Switch (with volume confirmation)
+            trend_score = self._calculate_trend_score(ema_fast, ema_slow, macd_hist, rsi, volume_ratio)
             self.current_trend_score = trend_score
             
             # 5. Determine State
-            
+
             # Volatility Ratio (ATR / Price)
             vol_ratio = atr / current_price if current_price > 0 else Decimal("0")
-            
-            # Trend Check (using SMA for state classification)
-            if ma_fast > ma_slow * Decimal("1.02"):  # 2% buffer
+
+            # Trend Check (using EMA with 1.5% buffer for consistency)
+            if ema_fast > ema_slow * Decimal("1.015"):  # 1.5% buffer
                 trend = "UP"
-            elif ma_fast < ma_slow * Decimal("0.98"):
+            elif ema_fast < ema_slow * Decimal("0.985"):
                 trend = "DOWN"
             else:
                 trend = "FLAT"
@@ -272,7 +293,12 @@ class StrategyManager:
                 ema_fast=ema_fast,
                 ema_slow=ema_slow,
                 rsi=rsi,
+                macd=macd_val,
+                macd_signal=macd_signal_val,
                 macd_histogram=macd_hist,
+                sma_20=sma_20,
+                sma_50=sma_50,
+                volume_ratio=volume_ratio,
             )
             
             self.last_analysis = analysis
@@ -303,27 +329,29 @@ class StrategyManager:
         ema_fast: Decimal,
         ema_slow: Decimal,
         macd_hist: float,
-        rsi: float
+        rsi: float,
+        volume_ratio: float = 1.0
     ) -> TrendScore:
         """
         Calculate trend score from multiple indicators.
-        
+
         Scoring:
-        - EMA: +1 if fast > slow × 1.01 (bullish), -1 if fast < slow × 0.99 (bearish)
+        - EMA: +1 if fast > slow × 1.005 (bullish), -1 if fast < slow × 0.995 (bearish)
         - MACD Histogram: +1 if > 0, -1 if < 0
-        - RSI: +1 if > 50, -1 if < 50
-        
+        - RSI: +1 if > 55, -1 if < 45 (with neutral zone 45-55)
+        - Volume: +1/-1 if volume confirms trend direction (ratio > 1.2)
+
         Returns:
             TrendScore with individual and total scores
         """
-        # EMA Score (with 1% buffer to avoid noise)
-        if ema_fast > ema_slow * Decimal("1.01"):
+        # EMA Score (with 0.5% buffer - more sensitive for trend scoring)
+        if ema_fast > ema_slow * Decimal("1.005"):
             ema_score = 1
-        elif ema_fast < ema_slow * Decimal("0.99"):
+        elif ema_fast < ema_slow * Decimal("0.995"):
             ema_score = -1
         else:
             ema_score = 0
-        
+
         # MACD Histogram Score
         if macd_hist > 0:
             macd_score = 1
@@ -331,19 +359,36 @@ class StrategyManager:
             macd_score = -1
         else:
             macd_score = 0
-        
-        # RSI Score
-        if rsi > 50:
+
+        # RSI Score (with neutral zone 45-55)
+        if rsi > 55:
             rsi_score = 1
-        elif rsi < 50:
+        elif rsi < 45:
             rsi_score = -1
         else:
             rsi_score = 0
-        
+
+        # Volume Confirmation Score
+        # Volume confirms trend if ratio > 1.2 (20% above average)
+        # Direction determined by other indicators
+        volume_score = 0
+        if volume_ratio > 1.2:
+            # High volume - determine if it confirms bullish or bearish
+            other_score = ema_score + macd_score + rsi_score
+            if other_score > 0:
+                volume_score = 1  # High volume confirms bullish
+                logger.debug(f"Volume confirms bullish: ratio={volume_ratio:.2f}")
+            elif other_score < 0:
+                volume_score = -1  # High volume confirms bearish
+                logger.debug(f"Volume confirms bearish: ratio={volume_ratio:.2f}")
+            # If other_score == 0, volume is neutral (no clear direction to confirm)
+
         return TrendScore(
             ema_score=ema_score,
             macd_score=macd_score,
-            rsi_score=rsi_score
+            rsi_score=rsi_score,
+            volume_score=volume_score,
+            volume_ratio=volume_ratio
         )
     
     async def _check_auto_switch(self, analysis: MarketAnalysis) -> None:

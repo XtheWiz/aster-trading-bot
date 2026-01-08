@@ -805,7 +805,8 @@ class GridBot:
             filled_level: The grid level that just got filled (BUY)
         """
         try:
-            entry_price = filled_level.price
+            # Use actual fill price, not grid price
+            entry_price = filled_level.entry_price if filled_level.entry_price > 0 else filled_level.price
 
             # Get TP percentage
             if config.risk.USE_SMART_TP:
@@ -836,9 +837,9 @@ class GridBot:
             # Calculate TP price
             tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
             tp_price = self._round_price(tp_price)
-            
-            # Calculate quantity (same as filled order)
-            quantity = self.calculate_quantity_for_level(entry_price)
+
+            # Use actual position quantity, not recalculated
+            quantity = filled_level.position_quantity if filled_level.position_quantity > 0 else self.calculate_quantity_for_level(entry_price)
             
             # Generate client order ID
             client_order_id = f"tp_{filled_level.index}_{int(datetime.now().timestamp())}"
@@ -1000,10 +1001,11 @@ class GridBot:
         quantity: Decimal
     ) -> None:
         """
-        Handle partial fill by placing a TP order for the filled portion.
+        Handle partial fill - track position but don't place TP yet.
 
-        This ensures we don't miss profit opportunities on partial fills.
-        The TP order is placed using Smart TP calculation for BUY fills.
+        Approach C (Single TP): We wait until the order is fully FILLED,
+        then place a single TP for the entire position. This is simpler
+        and avoids over-hedging issues.
 
         Args:
             level: The grid level that was partially filled
@@ -1011,70 +1013,14 @@ class GridBot:
             price: Fill price
             quantity: Filled quantity
         """
-        try:
-            if side != "BUY":
-                # For now, only handle BUY partial fills (LONG mode)
-                return
-
-            # Use Smart TP if enabled, otherwise use grid step
-            if config.risk.USE_SMART_TP and config.risk.AUTO_TP_ENABLED:
-                # Get Smart TP percentage
-                try:
-                    candles = await self.client.get_klines(
-                        symbol=config.trading.SYMBOL,
-                        interval="1h",
-                        limit=50
-                    )
-                    if candles:
-                        from indicator_analyzer import get_smart_tp
-                        tp_percent = await get_smart_tp(candles=candles)
-                    else:
-                        tp_percent = config.risk.DEFAULT_TP_PERCENT
-                except Exception:
-                    tp_percent = config.risk.DEFAULT_TP_PERCENT
-
-                tp_price = price * (Decimal("1") + tp_percent / Decimal("100"))
-            else:
-                # Fallback: use grid step
-                grid_step = self.state.step_size
-                tp_price = price + grid_step
-
-            # Round price to tick size
-            tp_price = self._round_price(tp_price)
-
-            # Check minimum notional
-            notional = quantity * tp_price
-            if notional < self.min_notional:
-                logger.info(f"Partial TP notional too small ({notional:.2f}), skipping")
-                return
-
-            # Place TP order
-            client_order_id = f"partial_tp_{level.index}_{level.partial_fill_count}_{int(datetime.now().timestamp())}"
-
-            response = await self.client.place_order(
-                symbol=config.trading.SYMBOL,
-                side="SELL",
-                order_type="LIMIT",
-                quantity=quantity,
-                price=tp_price,
-                client_order_id=client_order_id,
-            )
-
-            partial_tp_order_id = response.get("orderId")
-
-            # Track partial TP order ID
-            level.partial_tp_order_ids.append(partial_tp_order_id)
-
-            logger.info(
-                f"PARTIAL TP: SELL {quantity} @ {tp_price:.4f} | "
-                f"Entry: {price:.4f} | OrderID: {partial_tp_order_id} | "
-                f"Partial TPs: {len(level.partial_tp_order_ids)}"
-            )
-            
-        except AsterAPIError as e:
-            logger.error(f"Failed to place partial TP order: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error in partial fill handler: {e}")
+        # Approach C: Don't place partial TPs
+        # Position is already tracked via add_partial_fill() in on_order_update
+        # Single TP will be placed when order is fully FILLED
+        logger.info(
+            f"PARTIAL FILL tracked: {side} {quantity} @ {price:.4f} | "
+            f"Level {level.index} | Accumulated: {level.position_quantity:.4f} @ {level.entry_price:.4f} | "
+            f"Waiting for full fill to place TP"
+        )
     
     # =========================================================================
     # RISK MANAGEMENT
