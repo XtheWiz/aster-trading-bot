@@ -161,10 +161,11 @@ class TelegramCommandHandler:
                                 self._last_update_id = update["update_id"]
                     elif resp.status == 409:
                         # Conflict - another polling session is active
-                        # Wait longer and clear pending updates
-                        logger.warning("Telegram 409 conflict - clearing and retrying in 30s")
-                        await asyncio.sleep(30)
+                        # Wait longer for old session to timeout (Telegram long poll timeout is 30s)
+                        logger.debug("Telegram 409 conflict - waiting 60s for old session to timeout")
+                        await asyncio.sleep(60)
                         await self._clear_pending_updates()
+                        await asyncio.sleep(5)  # Extra delay after clear
                     else:
                         logger.error(f"Telegram API error: {resp.status}")
                         await asyncio.sleep(5)
