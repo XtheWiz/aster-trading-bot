@@ -102,10 +102,15 @@ class AsterClient:
         self._backoff_max = 60.0  # Maximum delay
         self._backoff_factor = 2.0  # Exponential factor
         self._current_backoff = 0.0
-        
+
         # Request statistics for monitoring
         self._request_count = 0
         self._error_count = 0
+
+        # Exchange info cache for precision rounding
+        self._symbol_precision_cache: dict[str, dict] = {}
+        self._precision_cache_time: float = 0
+        self._precision_cache_ttl: float = 3600  # 1 hour TTL
     
     async def __aenter__(self) -> "AsterClient":
         """Async context manager entry - creates HTTP session."""
@@ -654,36 +659,54 @@ class AsterClient:
         Returns:
             Order response including orderId, status, etc.
         """
+        # Get precision info and round values (prevents API rejections)
+        precision_info = await self.get_symbol_precision(symbol)
+        qty_precision = precision_info.get("quantityPrecision", 3)
+        price_precision = precision_info.get("pricePrecision", 2)
+
+        # Round quantity down to avoid exceeding balance
+        rounded_qty = self._round_to_precision(Decimal(str(quantity)), qty_precision)
+
+        # Round price to correct precision
+        rounded_price = None
+        if price is not None:
+            rounded_price = self._round_to_precision(Decimal(str(price)), price_precision)
+
+        logger.debug(
+            f"Order precision: qty {quantity} -> {rounded_qty} ({qty_precision}dp), "
+            f"price {price} -> {rounded_price} ({price_precision}dp)"
+        )
+
         params = {
             "symbol": symbol,
             "side": side,
             "type": order_type,
-            "quantity": str(quantity),
+            "quantity": str(rounded_qty),
             "positionSide": position_side,
         }
-        
+
         # Add price for limit orders
         if order_type == "LIMIT":
-            if price is None:
+            if rounded_price is None:
                 raise ValueError("Price is required for LIMIT orders")
-            params["price"] = str(price)
+            params["price"] = str(rounded_price)
             params["timeInForce"] = time_in_force
-        
+
         if reduce_only:
             params["reduceOnly"] = "true"
-        
+
         if client_order_id:
             params["newClientOrderId"] = client_order_id
-        
+
         if config.DRY_RUN:
-            logger.info(f"[DRY RUN] place_order: {side} {order_type} {quantity} @ {price}")
+            logger.info(f"[DRY RUN] place_order: {side} {order_type} {rounded_qty} @ {rounded_price}")
             return {
                 "orderId": int(time.time() * 1000),
                 "symbol": symbol,
                 "status": "NEW",
                 "clientOrderId": client_order_id or f"dry_{int(time.time())}",
-                "price": str(price) if price else "0",
-                "origQty": str(quantity),
+                "price": str(rounded_price) if rounded_price else "0",
+                "origQty": str(rounded_qty),
                 "executedQty": "0",
                 "side": side,
                 "type": order_type,
@@ -954,7 +977,95 @@ class AsterClient:
     # =========================================================================
     # UTILITY METHODS
     # =========================================================================
-    
+
+    async def get_symbol_precision(self, symbol: str) -> dict[str, int]:
+        """
+        Get price and quantity precision for a symbol (with caching).
+
+        This is critical for order placement - APIs reject orders with
+        incorrect precision. Results are cached for 1 hour.
+
+        Args:
+            symbol: Trading pair (e.g., "SOLUSDT")
+
+        Returns:
+            {
+                'pricePrecision': 2,      # Decimal places for price
+                'quantityPrecision': 3,   # Decimal places for quantity
+                'minQty': '0.001',        # Minimum order quantity
+                'minNotional': '5.0'      # Minimum order value
+            }
+        """
+        current_time = time.time()
+
+        # Check cache validity
+        if (
+            symbol in self._symbol_precision_cache
+            and current_time - self._precision_cache_time < self._precision_cache_ttl
+        ):
+            return self._symbol_precision_cache[symbol]
+
+        # Fetch fresh data
+        try:
+            exchange_info = await self.get_exchange_info(symbol)
+            symbols = exchange_info.get("symbols", [])
+
+            # Parse and cache all symbols
+            self._precision_cache_time = current_time
+            for sym_info in symbols:
+                sym_name = sym_info.get("symbol", "")
+                precision_data = {
+                    "pricePrecision": sym_info.get("pricePrecision", 2),
+                    "quantityPrecision": sym_info.get("quantityPrecision", 3),
+                    "minQty": "0.001",
+                    "minNotional": "5.0",
+                }
+
+                # Extract from filters if available
+                for f in sym_info.get("filters", []):
+                    if f.get("filterType") == "LOT_SIZE":
+                        precision_data["minQty"] = f.get("minQty", "0.001")
+                    elif f.get("filterType") == "MIN_NOTIONAL":
+                        precision_data["minNotional"] = f.get("notional", "5.0")
+
+                self._symbol_precision_cache[sym_name] = precision_data
+
+            # Return requested symbol (or defaults if not found)
+            return self._symbol_precision_cache.get(symbol, {
+                "pricePrecision": 2,
+                "quantityPrecision": 3,
+                "minQty": "0.001",
+                "minNotional": "5.0",
+            })
+
+        except Exception as e:
+            logger.warning(f"Failed to get precision for {symbol}: {e}, using defaults")
+            return {
+                "pricePrecision": 2,
+                "quantityPrecision": 3,
+                "minQty": "0.001",
+                "minNotional": "5.0",
+            }
+
+    def _round_to_precision(self, value: Decimal, precision: int) -> Decimal:
+        """
+        Round a Decimal value to specified precision (round down).
+
+        Uses ROUND_DOWN to avoid exceeding available balance/size.
+
+        Args:
+            value: The value to round
+            precision: Number of decimal places
+
+        Returns:
+            Rounded Decimal value
+        """
+        from decimal import ROUND_DOWN
+        if precision <= 0:
+            return value.quantize(Decimal("1"), rounding=ROUND_DOWN)
+        quantizer = Decimal(10) ** -precision
+        return value.quantize(quantizer, rounding=ROUND_DOWN)
+
     async def test_connection(self) -> bool:
         """
         Test API connectivity.
