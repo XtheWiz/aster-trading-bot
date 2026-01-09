@@ -87,13 +87,34 @@ class TelegramCommandHandler:
         if not self.is_configured:
             logger.warning("Telegram commands not configured - disabled")
             return False
-        
+
         self._session = aiohttp.ClientSession()
         self._running = True
+
+        # Clear pending updates to avoid conflict with previous sessions
+        await self._clear_pending_updates()
+
         self._polling_task = asyncio.create_task(self._poll_updates())
-        
+
         logger.info("Telegram command handler started")
         return True
+
+    async def _clear_pending_updates(self) -> None:
+        """Clear pending updates to avoid 409 conflict."""
+        try:
+            url = f"{self.API_URL.format(token=self.bot_token)}/getUpdates"
+            params = {"offset": -1, "timeout": 1}
+            async with self._session.get(url, params=params, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("ok") and data.get("result"):
+                        # Set offset to latest update + 1
+                        updates = data["result"]
+                        if updates:
+                            self._last_update_id = updates[-1]["update_id"]
+                            logger.info(f"Cleared {len(updates)} pending Telegram updates")
+        except Exception as e:
+            logger.warning(f"Could not clear pending updates: {e}")
     
     async def stop(self) -> None:
         """Stop command polling."""
@@ -131,6 +152,12 @@ class TelegramCommandHandler:
                             for update in data["result"]:
                                 await self._process_update(update)
                                 self._last_update_id = update["update_id"]
+                    elif resp.status == 409:
+                        # Conflict - another polling session is active
+                        # Wait longer and clear pending updates
+                        logger.warning("Telegram 409 conflict - clearing and retrying in 30s")
+                        await asyncio.sleep(30)
+                        await self._clear_pending_updates()
                     else:
                         logger.error(f"Telegram API error: {resp.status}")
                         await asyncio.sleep(5)
