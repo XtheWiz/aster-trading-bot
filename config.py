@@ -126,7 +126,7 @@ class GridConfig:
     # LONG = only BUY orders (for bullish market)
     # SHORT = only SELL orders (for bearish market)
     # Currently: LONG-only for bullish trend (Strong Buy signal)
-    GRID_SIDE: Literal["BOTH", "LONG", "SHORT"] = "LONG"
+    GRID_SIDE: Literal["BOTH", "LONG", "SHORT"] = "SHORT"
     
     # Quantity per grid level - Conservative for low-risk trading
     # 25 USDF per grid with 3x = ~0.6 SOL per grid (small position)
