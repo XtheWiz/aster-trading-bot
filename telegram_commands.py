@@ -102,17 +102,24 @@ class TelegramCommandHandler:
     async def _clear_pending_updates(self) -> None:
         """Clear pending updates to avoid 409 conflict."""
         try:
+            # First, delete any webhook and drop pending updates
+            # This forces Telegram to terminate any existing polling sessions
+            delete_url = f"{self.API_URL.format(token=self.bot_token)}/deleteWebhook"
+            async with self._session.post(delete_url, json={"drop_pending_updates": True}, timeout=10) as resp:
+                if resp.status == 200:
+                    logger.info("Cleared Telegram webhook and pending updates")
+
+            # Then get latest update ID
             url = f"{self.API_URL.format(token=self.bot_token)}/getUpdates"
             params = {"offset": -1, "timeout": 1}
             async with self._session.get(url, params=params, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("ok") and data.get("result"):
-                        # Set offset to latest update + 1
                         updates = data["result"]
                         if updates:
                             self._last_update_id = updates[-1]["update_id"]
-                            logger.info(f"Cleared {len(updates)} pending Telegram updates")
+                            logger.info(f"Set update offset to {self._last_update_id}")
         except Exception as e:
             logger.warning(f"Could not clear pending updates: {e}")
     
