@@ -1089,11 +1089,13 @@ class GridBot:
                 )
 
                 # Check if TP already exists for this position
+                # LONG position: TP is SELL order, SHORT position: TP is BUY order
+                tp_side_to_check = "SELL" if position_amt > 0 else "BUY"
                 open_orders = await self.client.get_open_orders(config.trading.SYMBOL)
                 has_tp = False
                 for order in open_orders:
-                    # Check if there's a SELL order (TP) for roughly this quantity
-                    if order.get("side") == "SELL":
+                    # Check if there's a TP order for roughly this quantity
+                    if order.get("side") == tp_side_to_check:
                         order_qty = Decimal(order.get("origQty", "0"))
                         if abs(order_qty - position_qty) < Decimal("0.01"):
                             has_tp = True
@@ -1113,7 +1115,13 @@ class GridBot:
                 else:
                     tp_percent = config.risk.DEFAULT_TP_PERCENT
 
-                tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
+                # LONG: TP above entry (SELL higher), SHORT: TP below entry (BUY lower)
+                if position_amt > 0:
+                    # LONG position - TP is SELL at higher price
+                    tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
+                else:
+                    # SHORT position - TP is BUY at lower price
+                    tp_price = entry_price * (Decimal("1") - tp_percent / Decimal("100"))
                 tp_price = self._round_price(tp_price)
 
                 # Place TP order
@@ -1129,17 +1137,20 @@ class GridBot:
                 )
 
                 order_id = response.get("orderId")
+                tp_side = "SELL" if position_amt > 0 else "BUY"
+                tp_sign = "+" if position_amt > 0 else "-"
 
                 logger.info(
-                    f"🎯 SYNC TP PLACED: SELL @ ${tp_price:.4f} (+{tp_percent}%) | "
+                    f"🎯 SYNC TP PLACED: {tp_side} @ ${tp_price:.4f} ({tp_sign}{tp_percent}%) | "
                     f"Avg Entry: ${entry_price:.4f} | Qty: {position_qty} | OrderID: {order_id}"
                 )
 
                 # Send Telegram notification
+                position_side = "LONG" if position_amt > 0 else "SHORT"
                 await self.telegram.send_message(
-                    f"🔄 Synced Existing Position\n\n"
+                    f"🔄 Synced Existing Position ({position_side})\n\n"
                     f"Avg Entry: ${entry_price:.4f}\n"
-                    f"TP: ${tp_price:.4f} (+{tp_percent}%)\n"
+                    f"TP ({tp_side}): ${tp_price:.4f} ({tp_sign}{tp_percent}%)\n"
                     f"Qty: {position_qty}\n\n"
                     f"TP based on total position avg entry"
                 )
