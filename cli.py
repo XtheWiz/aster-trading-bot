@@ -5,6 +5,7 @@ Aster DEX CLI Tool
 A command-line interface for interacting with Aster DEX API.
 
 Usage:
+    python cli.py status              - Show full status (balance, position, orders, analysis)
     python cli.py balance             - Check account balance
     python cli.py price [symbol]      - Get current price
     python cli.py orders [symbol]     - List open orders
@@ -39,6 +40,149 @@ os.environ["DRY_RUN"] = "false"
 from decimal import Decimal
 from aster_client import AsterClient
 from config import config
+
+
+async def cmd_status():
+    """Show comprehensive status: balance, positions, orders, and market analysis."""
+    from strategy_manager import StrategyManager
+
+    print("🔄 Fetching Status...")
+
+    client = AsterClient()
+    sm = StrategyManager(client)
+    symbol = config.trading.SYMBOL
+
+    try:
+        # Fetch all data in parallel
+        balance_task = client.get_account_balance()
+        position_task = client.get_position_risk(symbol)
+        orders_task = client.get_open_orders(symbol)
+        ticker_task = client.get_ticker_price(symbol)
+        analysis_task = sm.analyze_market(symbol)
+
+        balances, positions, orders, ticker, analysis = await asyncio.gather(
+            balance_task, position_task, orders_task, ticker_task, analysis_task
+        )
+
+        current_price = Decimal(ticker['price'])
+
+        print("\n" + "=" * 70)
+        print("📊 ASTER DEX STATUS")
+        print("=" * 70)
+
+        # === CONFIG ===
+        print(f"\n⚙️  CONFIG:")
+        print(f"   Symbol:     {symbol}")
+        print(f"   Grid Side:  {config.grid.GRID_SIDE}")
+        print(f"   Leverage:   {config.trading.LEVERAGE}x")
+        print(f"   Grid Count: {config.grid.GRID_COUNT}")
+        print(f"   Grid Range: ±{config.grid.GRID_RANGE_PERCENT}%")
+        print(f"   Qty/Grid:   ${config.grid.QUANTITY_PER_GRID_USDT}")
+
+        # === BALANCE ===
+        print(f"\n💰 BALANCE:")
+        for b in balances:
+            bal = Decimal(b.get("balance", "0"))
+            avail = Decimal(b.get("availableBalance", "0"))
+            if bal > 0 or avail > 0:
+                print(f"   {b['asset']}: {avail:.4f} available / {bal:.4f} total")
+
+        # === PRICE ===
+        print(f"\n📈 PRICE:")
+        print(f"   {symbol}: ${current_price:.4f}")
+
+        # === POSITION ===
+        print(f"\n📍 POSITION:")
+        active_pos = [p for p in positions if Decimal(p.get("positionAmt", "0")) != 0]
+        if not active_pos:
+            print("   ✅ No open position")
+        else:
+            for p in active_pos:
+                amt = Decimal(p['positionAmt'])
+                side = "LONG 📈" if amt > 0 else "SHORT 📉"
+                entry = Decimal(p['entryPrice'])
+                mark = Decimal(p['markPrice'])
+                upnl = Decimal(p.get('unRealizedProfit', '0'))
+                liq = p.get('liquidationPrice', 'N/A')
+
+                pnl_icon = "🟢" if upnl >= 0 else "🔴"
+                pnl_pct = ((mark - entry) / entry * 100) if entry > 0 else Decimal(0)
+                if amt < 0:  # SHORT position
+                    pnl_pct = -pnl_pct
+
+                print(f"   Side:      {side}")
+                print(f"   Size:      {abs(amt)} ({abs(amt) * mark:.2f} USDT)")
+                print(f"   Entry:     ${entry:.4f}")
+                print(f"   Mark:      ${mark:.4f}")
+                print(f"   uPnL:      {pnl_icon} ${upnl:.4f} ({pnl_pct:+.2f}%)")
+                print(f"   Liq Price: ${liq}")
+
+        # === ORDERS ===
+        print(f"\n📋 OPEN ORDERS: {len(orders)}")
+        if orders:
+            buy_orders = [o for o in orders if o['side'] == 'BUY']
+            sell_orders = [o for o in orders if o['side'] == 'SELL']
+            print(f"   BUY:  {len(buy_orders)} orders")
+            print(f"   SELL: {len(sell_orders)} orders")
+
+            # Show price range
+            if buy_orders:
+                buy_prices = [Decimal(o['price']) for o in buy_orders]
+                print(f"   BUY range:  ${min(buy_prices):.4f} - ${max(buy_prices):.4f}")
+            if sell_orders:
+                sell_prices = [Decimal(o['price']) for o in sell_orders]
+                print(f"   SELL range: ${min(sell_prices):.4f} - ${max(sell_prices):.4f}")
+        else:
+            print("   ✅ No open orders")
+
+        # === MARKET ANALYSIS ===
+        print(f"\n🎯 MARKET ANALYSIS:")
+
+        # Trend direction
+        trend = analysis.trend_direction
+        if trend == "UP":
+            trend_str = "🟢 BULLISH"
+        elif trend == "DOWN":
+            trend_str = "🔴 BEARISH"
+        else:
+            trend_str = "🟡 FLAT"
+
+        print(f"   Trend:     {trend_str}")
+        print(f"   State:     {analysis.state.value}")
+
+        # Trend Score
+        trend_score = sm.current_trend_score
+        if trend_score:
+            score_icon = "🟢" if trend_score.total > 0 else ("🔴" if trend_score.total < 0 else "⚪")
+            print(f"   Score:     {score_icon} {trend_score.total:+d} (EMA:{trend_score.ema_score:+d} MACD:{trend_score.macd_score:+d} RSI:{trend_score.rsi_score:+d} Vol:{trend_score.volume_score:+d})")
+            print(f"   Recommend: {trend_score.recommended_side}")
+
+        # Indicators
+        print(f"   RSI:       {analysis.rsi:.1f}")
+        print(f"   ATR:       ${float(analysis.atr_value):.4f} ({float(analysis.atr_value)/float(current_price)*100:.2f}%)")
+
+        # === ALIGNMENT CHECK ===
+        print(f"\n🔄 ALIGNMENT:")
+        current_side = config.grid.GRID_SIDE
+        recommended = trend_score.recommended_side if trend_score else "STAY"
+
+        if current_side == recommended or recommended == "STAY":
+            print(f"   ✅ Grid side ({current_side}) aligned with recommendation ({recommended})")
+        else:
+            print(f"   ⚠️  Grid side ({current_side}) differs from recommendation ({recommended})")
+            if active_pos:
+                print(f"   ⛔ Side switch blocked - position open")
+            else:
+                print(f"   💡 Consider switching to {recommended}")
+
+        print("\n" + "=" * 70)
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        await client.close()
 
 
 async def cmd_balance():
@@ -726,7 +870,9 @@ def main():
     cmd = sys.argv[1].lower()
     arg = sys.argv[2] if len(sys.argv) > 2 else None
 
-    if cmd == "balance":
+    if cmd == "status":
+        asyncio.run(cmd_status())
+    elif cmd == "balance":
         asyncio.run(cmd_balance())
     elif cmd == "price":
         asyncio.run(cmd_price(arg))

@@ -1412,19 +1412,99 @@ class GridBot:
         except Exception as e:
             logger.error(f"Error during pause_buying: {e}")
 
+    async def _smart_startup_side_check(self) -> None:
+        """
+        Smart startup: Check if we should switch grid side immediately.
+
+        Called during initialization BEFORE placing grid orders.
+        Skips the 2-confirmation requirement if:
+        1. Analysis recommends a different side
+        2. No open position is blocking the switch
+
+        This prevents waiting 15+ minutes for side switch after restart.
+        """
+        logger.info("🔍 Smart Startup: Checking optimal grid side...")
+
+        try:
+            # Run market analysis
+            analysis = await self.strategy_manager.analyze_market(config.trading.SYMBOL)
+            trend_score = self.strategy_manager.current_trend_score
+
+            if not trend_score:
+                logger.info("Smart Startup: No trend score available, keeping current side")
+                return
+
+            current_side = config.grid.GRID_SIDE
+            recommended_side = trend_score.recommended_side
+
+            logger.info(
+                f"Smart Startup: Current={current_side} | Recommended={recommended_side} | "
+                f"Score={trend_score.total:+d} (EMA:{trend_score.ema_score:+d} MACD:{trend_score.macd_score:+d} "
+                f"RSI:{trend_score.rsi_score:+d} Vol:{trend_score.volume_score:+d})"
+            )
+
+            # Check if switch is needed
+            if recommended_side == "STAY" or recommended_side == current_side:
+                logger.info(f"Smart Startup: ✅ Current side ({current_side}) is optimal")
+                return
+
+            # Check for existing positions that would block switch
+            positions = await self.client.get_position_risk(config.trading.SYMBOL)
+            has_blocking_position = False
+
+            for pos in positions:
+                if pos.get("symbol") == config.trading.SYMBOL:
+                    position_amt = Decimal(pos.get("positionAmt", "0"))
+
+                    if position_amt != 0:
+                        # Check if position blocks this switch direction
+                        if current_side == "LONG" and recommended_side == "SHORT" and position_amt > 0:
+                            has_blocking_position = True
+                            logger.warning(
+                                f"Smart Startup: ⛔ LONG position ({position_amt}) blocks switch to SHORT"
+                            )
+                        elif current_side == "SHORT" and recommended_side == "LONG" and position_amt < 0:
+                            has_blocking_position = True
+                            logger.warning(
+                                f"Smart Startup: ⛔ SHORT position ({position_amt}) blocks switch to LONG"
+                            )
+                    break
+
+            if has_blocking_position:
+                logger.info(f"Smart Startup: Keeping {current_side} due to open position")
+                return
+
+            # No blocking position - switch immediately!
+            logger.warning(f"🔄 Smart Startup: SWITCHING {current_side} → {recommended_side}")
+            config.grid.GRID_SIDE = recommended_side
+
+            await self.telegram.send_message(
+                f"🚀 Smart Startup Switch\n\n"
+                f"Switched: {current_side} → {recommended_side}\n"
+                f"Trend Score: {trend_score.total:+d}\n"
+                f"Reason: Analysis recommends {recommended_side}, no position blocking\n\n"
+                f"Skipped 2-confirmation wait on startup."
+            )
+
+            logger.info(f"Smart Startup: ✅ Grid side updated to {recommended_side}")
+
+        except Exception as e:
+            logger.error(f"Smart Startup check failed: {e}")
+            logger.info("Continuing with current grid side")
+
     async def switch_grid_side(self, new_side: str) -> None:
         """
         Switch grid direction (LONG/SHORT/BOTH).
-        
+
         Called by StrategyManager when trend score confirms new direction.
-        
+
         Process:
         1. Cancel all existing orders
         2. Update GRID_SIDE in runtime config
         3. Get current price
         4. Recalculate grid levels
         5. Place new orders
-        
+
         Args:
             new_side: "LONG", "SHORT", or "BOTH"
         """
@@ -1858,6 +1938,10 @@ class GridBot:
             logger.info("Cancelling existing orders before placing new grid...")
             await self.cancel_all_orders()
             await asyncio.sleep(1)  # Wait for orders to be cancelled
+
+            # Smart Startup: Check if we should switch grid side immediately
+            # This runs analysis and switches if no position is blocking
+            await self._smart_startup_side_check()
 
             # Calculate dynamic grid range based on ATR
             grid_range = await self.get_dynamic_grid_range(current_price)

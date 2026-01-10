@@ -46,7 +46,7 @@ You need to create a new file (e.g., `exchange_client.py`) that acts as a bridge
 
 ### 1. The Interface Contract (Complete Method List)
 
-Your new Client class **MUST** implement these 13 async methods with these exact return formats:
+Your new Client class **MUST** implement these 15 async methods with these exact return formats:
 
 #### Core Trading Methods
 
@@ -127,91 +127,112 @@ Your new Client class **MUST** implement these 13 async methods with these exact
 {'code': 200, 'msg': 'success'}
 ```
 
-#### Market Data Methods
+#### Market Data & Analysis Methods
 
 ##### H. `get_klines(symbol, interval, limit)`
-**Used for:** Technical indicators (RSI, MACD, EMA), StrategyManager analysis.
+**Used for:** Technical indicators (RSI, MACD, EMA, ATR), Smart TP, and Trend Scoring.
 **Parameters:**
 - `interval`: "1h", "4h", "1d" etc.
 - `limit`: Number of candles (e.g., 100)
 **Must Return:** List of OHLCV arrays.
 ```python
 [
-    [
-        1704067200000,    # Open time (timestamp ms)
-        '135.00',         # Open
-        '136.50',         # High
-        '134.00',         # Low
-        '135.50',         # Close
-        '10000.5',        # Volume
-        1704070799999,    # Close time
-        '1350000.00',     # Quote volume
-        500,              # Number of trades
-        '5000.25',        # Taker buy volume
-        '675000.00',      # Taker buy quote volume
-        '0'               # Ignore
-    ],
+    [1704067200000, '135.00', '136.50', '134.00', '135.50', '10000.5', ...],
     ...
 ]
 ```
 
 ##### I. `get_exchange_info(symbol)`
-**Used for:** Getting precision, lot size, min notional for order validation.
-**Must Return:**
+**Used for:** Getting precision (`tickSize`, `stepSize`), lot size, min notional for order validation.
+**Must Return:** (Structure must contain `filters` with `PRICE_FILTER`, `LOT_SIZE`, and `MIN_NOTIONAL`)
 ```python
 {
-    'symbol': 'SOLUSDT',
-    'pricePrecision': 2,      # Decimal places for price (e.g. 135.25)
-    'quantityPrecision': 2,   # Decimal places for quantity (e.g. 1.05 SOL)
-    'minQty': '0.01',         # Minimum order quantity
-    'minNotional': '5.0'      # Minimum order value in USDT
+    'symbols': [{
+        'symbol': 'SOLUSDT',
+        'filters': [
+            {'filterType': 'PRICE_FILTER', 'tickSize': '0.01'},
+            {'filterType': 'LOT_SIZE', 'stepSize': '0.01'},
+            {'filterType': 'MIN_NOTIONAL', 'notional': '5.0'}
+        ]
+    }]
 }
 ```
 
-#### Account Setup Methods
-
-##### J. `set_leverage(symbol, leverage)`
-**Used for:** Initial setup, setting leverage (e.g., 5x).
+##### J. `get_funding_rate(symbol)`
+**Used for:** `StrategyManager` funding cost analysis and alerts.
 **Must Return:**
 ```python
-{'leverage': 5, 'symbol': 'SOLUSDT'}
+{
+    'lastFundingRate': '0.0001',
+    'nextFundingTime': 1704067200000
+}
 ```
 
-##### K. `set_margin_type(symbol, margin_type)`
+##### K. `get_depth(symbol, limit)`
+**Used for:** `StrategyManager` liquidity and spread monitoring.
+**Must Return:**
+```python
+{
+    'bids': [['135.00', '10.0'], ...],
+    'asks': [['135.10', '15.0'], ...]
+}
+```
+
+#### Account Setup & Health
+
+##### L. `set_leverage(symbol, leverage)`
+**Used for:** Initial setup.
+**Must Return:** `{'leverage': 5, 'symbol': 'SOLUSDT'}`
+
+##### M. `set_margin_type(symbol, margin_type)`
 **Parameters:** `margin_type` = "ISOLATED" or "CROSSED"
-**Must Return:**
-```python
-{'code': 200, 'msg': 'success'}
-```
+**Must Return:** `{'code': 200, 'msg': 'success'}`
 
-##### L. `test_connection()`
+##### N. `test_connection()`
 **Used for:** Startup health check.
-**Must Return:**
-```python
-True  # or False if connection failed
-```
+**Must Return:** `True`
 
 #### WebSocket Methods
 
-##### M. `subscribe_user_data(callback)`
-**CRITICAL for real-time operation.** See WebSocket section below.
-**Used for:** Receiving order fill events, position updates.
+##### O. `subscribe_user_data(callback)`
+**CRITICAL for real-time operation.**
 **Callback receives:**
 ```python
 {
     'e': 'ORDER_TRADE_UPDATE',
     'o': {
-        'i': 12345,           # Order ID
-        's': 'SOLUSDT',       # Symbol
-        'S': 'BUY',           # Side
-        'X': 'FILLED',        # Status
-        'p': '135.00',        # Price
-        'q': '1.0',           # Quantity
-        'ap': '135.00',       # Average fill price
-        'rp': '0.50'          # Realized profit
+        'i': 12345, 's': 'SOLUSDT', 'S': 'BUY', 'X': 'FILLED',
+        'p': '135.00', 'q': '1.0', 'ap': '135.00', 'rp': '0.50'
     }
 }
 ```
+
+---
+
+## Phase 2: Advanced Features Alignment
+
+When migrating, ensure your new client supports these logic patterns found in the latest `grid_bot.py`:
+
+### 1. Smart Take-Profit (Total Position Logic)
+The bot now calculates TP based on the **Total Position Average Entry** from the exchange, not just the individual grid level.
+*   **Requirement:** `get_position_risk` must return accurate `entryPrice` for the entire position.
+*   **Feature:** Uses `get_klines` to calculate RSI/MACD for dynamic TP percentages (Smart TP).
+
+### 2. Intelligent Drawdown Management
+A 3-level protection system:
+- **15% Drawdown:** Pause new BUY orders (Bot keeps TP orders active).
+- **20% Drawdown:** Partial Cut (Closes 30% of position via MARKET order).
+- **25% Drawdown:** Full Cut (Closes all positions and pauses bot).
+*   **Requirement:** `place_order` must handle `order_type="MARKET"`.
+
+### 3. BTC Correlation (Leading Indicator)
+The bot monitors `BTCUSDT` to detect market-wide reversals.
+*   **Requirement:** `get_ticker_price` and `get_klines` must support fetching data for BTC even if trading SOL.
+
+### 4. Real-time Price Spike Detection
+Uses WebSocket Mark Price stream to detect sudden moves (>3% in 5 min).
+*   **Requirement:** Support subscribing to `@markPrice` stream.
+
 
 ### 2. Implementation Template (Pseudo-code)
 
