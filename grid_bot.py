@@ -128,6 +128,9 @@ class GridLevel:
     intended_price: Decimal = Decimal("0")
     actual_fill_price: Decimal = Decimal("0")
     slippage_percent: Decimal = Decimal("0")
+    # TP tracking for ML analysis
+    tp_placed_at: datetime | None = None
+    tp_target_price: Decimal = Decimal("0")
 
     def __repr__(self) -> str:
         if self.state == GridLevelState.POSITION_HELD:
@@ -155,6 +158,9 @@ class GridLevel:
         self.intended_price = Decimal("0")
         self.actual_fill_price = Decimal("0")
         self.slippage_percent = Decimal("0")
+        # TP tracking for ML analysis
+        self.tp_placed_at = None
+        self.tp_target_price = Decimal("0")
 
     def add_partial_fill(self, price: Decimal, quantity: Decimal) -> None:
         """
@@ -827,7 +833,12 @@ class GridBot:
                 entry_price = level_entry
                 logger.info(f"📊 No total position, using level entry: ${entry_price:.4f}")
 
-            # Get TP percentage
+            # Get TP percentage and capture indicator values for ML logging
+            rsi = 0.0
+            macd_hist = 0.0
+            trend = ""
+            atr_percent = 0.0
+
             if config.risk.USE_SMART_TP:
                 # First try to use cached analysis from StrategyManager
                 cached_analysis = self.strategy_manager.last_analysis
@@ -835,6 +846,11 @@ class GridBot:
                 if cached_analysis and cached_analysis.rsi > 0:
                     tp_percent = await get_smart_tp(market_analysis=cached_analysis)
                     logger.info(f"🧠 Smart TP (cached): {tp_percent}%")
+                    # Capture indicator values for ML logging
+                    rsi = cached_analysis.rsi
+                    macd_hist = cached_analysis.macd_histogram
+                    trend = cached_analysis.trend_direction
+                    atr_percent = float(cached_analysis.atr_value / cached_analysis.current_price * 100) if cached_analysis.current_price > 0 else 0.0
                 else:
                     # Fallback: Fetch candle data for indicator calculation
                     candles = await self.client.get_klines(
@@ -882,6 +898,9 @@ class GridBot:
             filled_level.client_order_id = client_order_id
             # Keep order_id pointing to TP for backward compatibility with get_level_by_order_id
             filled_level.order_id = order_id
+            # Track TP placement time and target for ML outcome analysis
+            filled_level.tp_placed_at = datetime.now()
+            filled_level.tp_target_price = tp_price
 
             logger.info(
                 f"🎯 SMART TP PLACED: SELL @ ${tp_price:.4f} (+{tp_percent}%) | "
@@ -896,15 +915,29 @@ class GridBot:
                 f"Qty: {quantity}\n"
                 f"(TP based on total position avg)"
             )
-            
-            # Log trade event for analysis
+
+            # Get context data for ML logging
+            btc_trend_score = 0
+            if self.strategy_manager.btc_trend_score:
+                btc_trend_score = self.strategy_manager.btc_trend_score.total
+            funding_rate = float(self.strategy_manager.last_funding_rate * 100)
+            drawdown_percent = self.state.get_drawdown_percent()
+
+            # Log trade event with full indicator values for ML analysis
             trade_event_logger.log_smart_tp(
                 entry_price=entry_price,
                 tp_price=tp_price,
                 tp_percent=tp_percent,
-                rsi=0.0,  # Will be enhanced with actual values
-                macd_hist=0.0,
-                trend="",
+                rsi=rsi,
+                macd_hist=macd_hist,
+                trend=trend,
+                grid_level=filled_level.index,
+                position_quantity=quantity,
+                atr_percent=atr_percent,
+                btc_trend_score=btc_trend_score,
+                funding_rate=funding_rate,
+                drawdown_percent=drawdown_percent,
+                order_id=str(order_id),
             )
             
         except AsterAPIError as e:
@@ -1677,6 +1710,22 @@ class GridBot:
                         f"PnL: {pnl:+.4f} | Total Realized: {self.state.realized_pnl:+.4f} | "
                         f"Daily: {self.state.daily_realized_pnl:+.4f}{slippage_info}"
                     )
+
+                    # Log TP outcome for ML analysis
+                    time_to_fill = 0.0
+                    if level.tp_placed_at:
+                        time_to_fill = (datetime.now() - level.tp_placed_at).total_seconds()
+                    trade_event_logger.log_tp_filled(
+                        entry_price=level.entry_price,
+                        tp_target_price=level.tp_target_price if level.tp_target_price > 0 else fill_price,
+                        actual_fill_price=fill_price,
+                        quantity=level.position_quantity,
+                        realized_pnl=pnl,
+                        time_to_fill_seconds=time_to_fill,
+                        grid_level=level.index,
+                        slippage_percent=float(slippage),
+                        order_id=str(order_id),
+                    )
                 else:
                     pnl = Decimal("0")
                     logger.info(f"Order FILLED: {side} @ {price} | Level {level.index}{slippage_info}")
@@ -1892,52 +1941,55 @@ class GridBot:
                 elif "-4168" in str(e):
                     logger.info("Multi-Asset Mode detected - margin type is managed by exchange")
             
-            # Get initial balance (check both USDT and USDF for Multi-Asset Mode)
+            # Get current price first
+            ticker = await self.client.get_ticker_price()
+            current_price = Decimal(ticker.get("price", "0"))
+
+            if current_price <= 0:
+                logger.error("Failed to get current price")
+                return False
+
+            logger.info(f"Current price: {current_price}")
+
+            # Cancel all existing orders FIRST before querying balance
+            # This releases any margin locked up in pending orders
+            # Gives accurate picture of available funds for new grid
+            logger.info("Cancelling existing orders before placing new grid...")
+            await self.cancel_all_orders()
+            await asyncio.sleep(2)  # Wait for orders to be cancelled and margin released
+
+            # Get initial balance AFTER cancelling orders (check both USDT and USDF for Multi-Asset Mode)
+            # This ensures we see the actual available balance after margin is released
+            logger.info("Querying actual balance after order cancellation...")
             balances = await self.client.get_account_balance()
             usdt_balance = Decimal("0")
             usdf_balance = Decimal("0")
-            
+
             for balance in balances:
                 asset = balance.get("asset", "")
                 if asset == "USDT":
                     usdt_balance = Decimal(balance.get("availableBalance", "0"))
                 elif asset == "USDF":
                     usdf_balance = Decimal(balance.get("availableBalance", "0"))
-                    
+
                 # Set primary balance based on config
                 if asset == config.trading.MARGIN_ASSET:
                     self.state.initial_balance = Decimal(balance.get("balance", "0"))
                     self.state.current_balance = Decimal(balance.get("availableBalance", "0"))
-            
+
             logger.info(f"Initial balance: {self.state.initial_balance} {config.trading.MARGIN_ASSET}")
-            
+
             # USDF Recommendation Warning (for Airdrop optimization)
             if usdt_balance > Decimal("10") and usdf_balance < Decimal("10"):
                 logger.critical(
                     "🚨 AIRDROP ALERT: You have USDT but no USDF! "
                     "Swap USDT to USDF on AsterDEX for 20x Airdrop Multiplier!"
                 )
-            
-            # Get current price and calculate grid
-            ticker = await self.client.get_ticker_price()
-            current_price = Decimal(ticker.get("price", "0"))
-            
-            if current_price <= 0:
-                logger.error("Failed to get current price")
-                return False
-            
-            logger.info(f"Current price: {current_price}")
 
             # Initialize session tracking for Phase 3 risk management
             self.state.session_high_price = current_price
             self.state.daily_start_time = datetime.now()
             self.state.daily_realized_pnl = Decimal("0")
-
-            # Cancel all existing orders before placing new grid
-            # This prevents duplicate orders on bot restart/redeploy
-            logger.info("Cancelling existing orders before placing new grid...")
-            await self.cancel_all_orders()
-            await asyncio.sleep(1)  # Wait for orders to be cancelled
 
             # Smart Startup: Check if we should switch grid side immediately
             # This runs analysis and switches if no position is blocking

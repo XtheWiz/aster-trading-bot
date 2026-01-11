@@ -124,16 +124,93 @@ class TradeEventLogger:
         rsi: float,
         macd_hist: float,
         trend: str,
+        grid_level: int = 0,
+        position_quantity: Decimal = Decimal("0"),
+        atr_percent: float = 0.0,
+        btc_trend_score: int = 0,
+        funding_rate: float = 0.0,
+        drawdown_percent: float = 0.0,
+        order_id: Optional[str] = None,
     ):
-        """Log SMART_TP event with indicator values."""
+        """Log SMART_TP event with full indicator values and context for ML analysis."""
+        tp_id = f"tp_{int(datetime.utcnow().timestamp() * 1000)}"
+
         self.log_event("SMART_TP", {
+            "tp_id": tp_id,
+            "order_id": order_id,
+            "grid_level": grid_level,
             "entry_price": entry_price,
             "tp_price": tp_price,
             "tp_percent": tp_percent,
+            "position_quantity": position_quantity,
+            "expected_pnl": float((tp_price - entry_price) * position_quantity),
             "indicators": {
                 "rsi": rsi,
                 "macd_hist": macd_hist,
                 "trend": trend,
+            },
+            "context": {
+                "atr_percent": atr_percent,
+                "btc_trend_score": btc_trend_score,
+                "funding_rate": funding_rate,
+                "drawdown_percent": drawdown_percent,
+            }
+        })
+
+        return tp_id
+
+    def log_tp_filled(
+        self,
+        entry_price: Decimal,
+        tp_target_price: Decimal,
+        actual_fill_price: Decimal,
+        quantity: Decimal,
+        realized_pnl: Decimal,
+        time_to_fill_seconds: float,
+        grid_level: int = 0,
+        slippage_percent: float = 0.0,
+        order_id: Optional[str] = None,
+    ):
+        """Log TP_FILLED event for outcome tracking and ML analysis."""
+        self.log_event("TP_FILLED", {
+            "order_id": order_id,
+            "grid_level": grid_level,
+            "entry_price": entry_price,
+            "tp_target_price": tp_target_price,
+            "actual_fill_price": actual_fill_price,
+            "quantity": quantity,
+            "realized_pnl": realized_pnl,
+            "time_to_fill_seconds": time_to_fill_seconds,
+            "slippage_percent": slippage_percent,
+            "hit_target": float(actual_fill_price) >= float(tp_target_price),
+        })
+
+    def log_buy_filled(
+        self,
+        entry_price: Decimal,
+        quantity: Decimal,
+        grid_level: int,
+        rsi: float = 0.0,
+        macd_hist: float = 0.0,
+        trend: str = "",
+        atr_percent: float = 0.0,
+        btc_trend_score: int = 0,
+        order_id: Optional[str] = None,
+    ):
+        """Log BUY_FILLED event with market context for ML analysis."""
+        self.log_event("BUY_FILLED", {
+            "order_id": order_id,
+            "grid_level": grid_level,
+            "entry_price": entry_price,
+            "quantity": quantity,
+            "indicators": {
+                "rsi": rsi,
+                "macd_hist": macd_hist,
+                "trend": trend,
+            },
+            "context": {
+                "atr_percent": atr_percent,
+                "btc_trend_score": btc_trend_score,
             }
         })
     
@@ -227,6 +304,41 @@ class TradeEventLogger:
                 "realized_pnl": realized_pnl,
                 "final_balance": final_balance,
                 "runtime_seconds": runtime_seconds,
+            }
+        })
+
+    def log_snapshot(
+        self,
+        current_price: Decimal,
+        balance: Decimal,
+        unrealized_pnl: Decimal,
+        realized_pnl: Decimal,
+        position_count: int,
+        open_orders: int,
+        drawdown_percent: float,
+        grid_side: str,
+        rsi: float = 0.0,
+        macd_hist: float = 0.0,
+        atr_percent: float = 0.0,
+        btc_trend_score: int = 0,
+        funding_rate: float = 0.0,
+    ):
+        """Log periodic SNAPSHOT for time-series analysis."""
+        self.log_event("SNAPSHOT", {
+            "price": current_price,
+            "balance": balance,
+            "unrealized_pnl": unrealized_pnl,
+            "realized_pnl": realized_pnl,
+            "position_count": position_count,
+            "open_orders": open_orders,
+            "drawdown_percent": drawdown_percent,
+            "grid_side": grid_side,
+            "indicators": {
+                "rsi": rsi,
+                "macd_hist": macd_hist,
+                "atr_percent": atr_percent,
+                "btc_trend_score": btc_trend_score,
+                "funding_rate": funding_rate,
             }
         })
 
