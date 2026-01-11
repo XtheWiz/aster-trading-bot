@@ -143,8 +143,8 @@ class GridConfig:
     AUTO_REGRID_ENABLED: bool = True
     
     # Re-grid threshold: if price moves more than this % from grid center, re-grid
-    # 5% threshold = less frequent re-gridding, waits for clearer trend
-    REGRID_THRESHOLD_PERCENT: Decimal = Decimal("5.0")
+    # 3% threshold = balanced, re-grids when price exits grid boundary
+    REGRID_THRESHOLD_PERCENT: Decimal = Decimal("3.0")
     
     # How often to check for re-grid (in minutes)
     REGRID_CHECK_INTERVAL_MINUTES: int = 30
