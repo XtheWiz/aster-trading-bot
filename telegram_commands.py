@@ -22,6 +22,8 @@ from typing import Any, Callable, Coroutine, Optional
 import aiohttp
 from dotenv import load_dotenv
 
+from config import config
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -259,7 +261,7 @@ _Tip: Commands only work in the configured chat._
         message = f"""
 🤖 *Bot Status*
 
-📊 *Symbol:* `{self.bot.symbol}`
+📊 *Symbol:* `{config.trading.SYMBOL}`
 🔄 *State:* `{self.bot._state.value if hasattr(self.bot, '_state') else 'RUNNING'}`
 ⏱️ *Runtime:* `{runtime_str}`
 🔢 *Total Trades:* `{state.total_trades}`
@@ -306,7 +308,7 @@ _Tip: Commands only work in the configured chat._
             return
         
         try:
-            positions = await self.bot.client.get_positions(self.bot.symbol)
+            positions = await self.bot.client.get_position_risk(config.trading.SYMBOL)
             
             # Filter for non-zero positions
             active_positions = [
@@ -369,7 +371,7 @@ _Tip: Commands only work in the configured chat._
             return
         
         try:
-            orders = await self.bot.client.get_open_orders(self.bot.symbol)
+            orders = await self.bot.client.get_open_orders(config.trading.SYMBOL)
             
             if not orders:
                 await self._send_message("✅ No open orders")
@@ -540,7 +542,8 @@ _Tip: Commands only work in the configured chat._
                 side = trade.get('side', 'N/A')
                 price = Decimal(str(trade.get('price', 0)))
                 qty = Decimal(str(trade.get('quantity', 0)))
-                pnl = trade.get('pnl', 0) or 0
+                pnl_raw = trade.get('pnl', 0) or 0
+                pnl = Decimal(str(pnl_raw)) if pnl_raw else Decimal(0)
                 timestamp = trade.get('timestamp', '')
                 
                 side_emoji = "🟢" if side == "BUY" else "🔴"
