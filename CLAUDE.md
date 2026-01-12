@@ -129,10 +129,18 @@ Score = EMA + MACD + RSI + Volume (-4 to +4)
 
 ≥ +2  → LONG bias
 ≤ -2  → SHORT bias
-else  → STAY current side
+else  → Default to LONG
 
-Requires 2 confirmations before switching (anti-whipsaw)
+Startup: Grid side set dynamically from analysis (not config)
+Runtime: Requires 2 confirmations before switching (anti-whipsaw)
 ```
+
+### Dynamic Initialization
+On bot startup:
+1. **Initial Capital**: Fetched from exchange (after cancelling orders)
+2. **Grid Side**: Determined by real-time analysis, not config value
+3. **Position Check**: Existing positions force matching side
+4. **Fallback**: Config values used only if analysis fails
 
 ## Risk Management (12 Layers)
 
@@ -333,7 +341,15 @@ git push origin main
 - Logs stored in `/app/logs/` on Railway (volume mounted)
 - SQLite DB: `grid_bot_trades.db`
 
-## Recent Updates (2026-01-08)
+## Recent Updates (2026-01-12)
+
+| Feature | Description |
+|---------|-------------|
+| **Dynamic Initialization** | Capital & grid side from real data, not config |
+| **Analysis-based Side** | Grid side set by trend analysis at startup |
+| Scaled Position | $25/grid for $550 balance |
+
+## Updates (2026-01-08)
 
 | Feature | Description |
 |---------|-------------|

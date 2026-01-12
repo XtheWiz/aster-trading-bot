@@ -1447,16 +1447,16 @@ class GridBot:
 
     async def _smart_startup_side_check(self) -> None:
         """
-        Smart startup: Check if we should switch grid side immediately.
+        Smart startup: Determine optimal grid side from market analysis.
 
         Called during initialization BEFORE placing grid orders.
-        Skips the 2-confirmation requirement if:
-        1. Analysis recommends a different side
-        2. No open position is blocking the switch
+        Sets grid side dynamically based on:
+        1. Real-time market analysis (trend score)
+        2. Existing position constraints
 
-        This prevents waiting 15+ minutes for side switch after restart.
+        Config GRID_SIDE is used only as fallback when analysis is unavailable.
         """
-        logger.info("🔍 Smart Startup: Checking optimal grid side...")
+        logger.info("🔍 Smart Startup: Determining optimal grid side from analysis...")
 
         try:
             # Run market analysis
@@ -1464,66 +1464,71 @@ class GridBot:
             trend_score = self.strategy_manager.current_trend_score
 
             if not trend_score:
-                logger.info("Smart Startup: No trend score available, keeping current side")
+                logger.warning("Smart Startup: No trend score available, using config fallback")
+                logger.info(f"Smart Startup: Grid side = {config.grid.GRID_SIDE} (from config)")
                 return
 
-            current_side = config.grid.GRID_SIDE
-            recommended_side = trend_score.recommended_side
+            # Determine optimal side from analysis
+            config_side = config.grid.GRID_SIDE  # Fallback only
+            analysis_side = trend_score.recommended_side
 
             logger.info(
-                f"Smart Startup: Current={current_side} | Recommended={recommended_side} | "
-                f"Score={trend_score.total:+d} (EMA:{trend_score.ema_score:+d} MACD:{trend_score.macd_score:+d} "
+                f"Smart Startup: Analysis Score={trend_score.total:+d} "
+                f"(EMA:{trend_score.ema_score:+d} MACD:{trend_score.macd_score:+d} "
                 f"RSI:{trend_score.rsi_score:+d} Vol:{trend_score.volume_score:+d})"
             )
 
-            # Check if switch is needed
-            if recommended_side == "STAY" or recommended_side == current_side:
-                logger.info(f"Smart Startup: ✅ Current side ({current_side}) is optimal")
-                return
+            # If analysis is unclear (STAY), default to LONG (generally safer)
+            if analysis_side == "STAY":
+                optimal_side = "LONG"
+                logger.info(f"Smart Startup: Analysis unclear, defaulting to {optimal_side}")
+            else:
+                optimal_side = analysis_side
+                logger.info(f"Smart Startup: Analysis recommends {optimal_side}")
 
-            # Check for existing positions that would block switch
+            # Check for existing positions that might force a different side
             positions = await self.client.get_position_risk(config.trading.SYMBOL)
-            has_blocking_position = False
+            position_amt = Decimal("0")
 
             for pos in positions:
                 if pos.get("symbol") == config.trading.SYMBOL:
                     position_amt = Decimal(pos.get("positionAmt", "0"))
-
-                    if position_amt != 0:
-                        # Check if position blocks this switch direction
-                        if current_side == "LONG" and recommended_side == "SHORT" and position_amt > 0:
-                            has_blocking_position = True
-                            logger.warning(
-                                f"Smart Startup: ⛔ LONG position ({position_amt}) blocks switch to SHORT"
-                            )
-                        elif current_side == "SHORT" and recommended_side == "LONG" and position_amt < 0:
-                            has_blocking_position = True
-                            logger.warning(
-                                f"Smart Startup: ⛔ SHORT position ({position_amt}) blocks switch to LONG"
-                            )
                     break
 
-            if has_blocking_position:
-                logger.info(f"Smart Startup: Keeping {current_side} due to open position")
-                return
+            # If we have an existing position, we must match its side
+            if position_amt > 0:
+                # Existing LONG position - must stay LONG
+                if optimal_side == "SHORT":
+                    logger.warning(
+                        f"Smart Startup: ⛔ Existing LONG position ({position_amt}) "
+                        f"forces LONG instead of recommended SHORT"
+                    )
+                optimal_side = "LONG"
+            elif position_amt < 0:
+                # Existing SHORT position - must stay SHORT
+                if optimal_side == "LONG":
+                    logger.warning(
+                        f"Smart Startup: ⛔ Existing SHORT position ({position_amt}) "
+                        f"forces SHORT instead of recommended LONG"
+                    )
+                optimal_side = "SHORT"
 
-            # No blocking position - switch immediately!
-            logger.warning(f"🔄 Smart Startup: SWITCHING {current_side} → {recommended_side}")
-            config.grid.GRID_SIDE = recommended_side
+            # Set the grid side
+            config.grid.GRID_SIDE = optimal_side
 
             await self.telegram.send_message(
-                f"🚀 Smart Startup Switch\n\n"
-                f"Switched: {current_side} → {recommended_side}\n"
+                f"🚀 Dynamic Grid Initialization\n\n"
+                f"Grid Side: {optimal_side}\n"
                 f"Trend Score: {trend_score.total:+d}\n"
-                f"Reason: Analysis recommends {recommended_side}, no position blocking\n\n"
-                f"Skipped 2-confirmation wait on startup."
+                f"Position: {position_amt if position_amt != 0 else 'None'}\n\n"
+                f"Side determined by real-time analysis, not config."
             )
 
-            logger.info(f"Smart Startup: ✅ Grid side updated to {recommended_side}")
+            logger.info(f"Smart Startup: ✅ Grid side set to {optimal_side}")
 
         except Exception as e:
             logger.error(f"Smart Startup check failed: {e}")
-            logger.info("Continuing with current grid side")
+            logger.info(f"Falling back to config grid side: {config.grid.GRID_SIDE}")
 
     async def switch_grid_side(self, new_side: str) -> None:
         """
@@ -1884,7 +1889,6 @@ class GridBot:
         logger.info(f"Leverage: {config.trading.LEVERAGE}x")
         logger.info(f"Grid Count: {config.grid.GRID_COUNT}")
         logger.info(f"Grid Range: ±{config.grid.GRID_RANGE_PERCENT}%")
-        logger.info(f"Capital: {config.INITIAL_CAPITAL_USDT} USDT")
         logger.info(f"Dry Run: {config.DRY_RUN}")
         logger.info(f"Harvest Mode: {config.harvest.HARVEST_MODE}")
         logger.info("--- Phase 3: Risk Management ---")

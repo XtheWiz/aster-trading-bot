@@ -125,15 +125,13 @@ class GridConfig:
     # BOTH = traditional grid (BUY below price, SELL above price)
     # LONG = only BUY orders (for bullish market)
     # SHORT = only SELL orders (for bearish market)
-    # Currently: LONG-only for bullish trend (Strong Buy signal)
-    GRID_SIDE: Literal["BOTH", "LONG", "SHORT"] = "SHORT"
+    # Jan 2026: LONG - Extreme Fear (25) + Elliott Wave (iii) impulse starting
+    GRID_SIDE: Literal["BOTH", "LONG", "SHORT"] = "LONG"
     
-    # Quantity per grid level - Conservative for low-risk trading
-    # 25 USDF per grid with 3x = ~0.6 SOL per grid (small position)
-    # Reduced from 25 to 18 for better position size management
-    # At 5x leverage: $18 × 5 = $90 notional per level
-    # Max 5 positions = $450 total (within 80% limit of ~$380 balance)
-    QUANTITY_PER_GRID_USDT: Decimal = Decimal("18.0")
+    # Quantity per grid level - Moderate for balanced risk/reward
+    # $25 per grid with 5x leverage = $125 notional per level
+    # Max 5 positions = $625 notional ($125 margin, 23% of $550 balance)
+    QUANTITY_PER_GRID_USDT: Decimal = Decimal("25.0")
     
     # Maximum number of open orders allowed
     MAX_OPEN_ORDERS: int = 20
@@ -360,7 +358,7 @@ class BotConfig:
     DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() == "true"
     
     # Initial capital for the bot
-    INITIAL_CAPITAL_USDT: Decimal = Decimal("310.0")
+    INITIAL_CAPITAL_USDT: Decimal = Decimal("550.0")
     
     def validate(self) -> list[str]:
         """
