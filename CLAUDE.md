@@ -411,6 +411,7 @@ git push origin main
 | **SuperTrend Indicator** | Manual implementation using `ta` library ATR |
 | **StochRSI Indicator** | Manual implementation for faster overbought/oversold |
 | No pandas-ta dependency | Removed numba dependency, works on Python 3.14 |
+| **Bug Fix** | Added missing `indicator_analyzer` init in GridBot (was causing TP not placed) |
 
 ### New Indicators in `indicator_analyzer.py`
 
@@ -470,3 +471,4 @@ NORMAL → PAUSED → PARTIAL_CUT → FULL_CUT → WAITING_REENTRY → NORMAL
 3. ~~Position size not tracked accurately~~ (Fixed 2026-01-08)
 4. ~~TP calculated from level entry instead of total position~~ (Fixed 2026-01-08)
 5. ~~Side switch causes realized loss~~ (Fixed 2026-01-08)
+6. ~~TP not placed after BUY fill - `indicator_analyzer` not initialized~~ (Fixed 2026-01-15)
