@@ -36,12 +36,12 @@ Automated grid trading bot for Aster DEX futures market. Uses arithmetic grid st
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `grid_bot.py` | ~2,200 | Main bot, order management, rebalancing |
-| `strategy_manager.py` | ~1,800 | Risk analysis, drawdown management, alerts |
+| `grid_bot.py` | ~2,400 | Main bot, order management, trailing TP |
+| `strategy_manager.py` | ~1,900 | Risk analysis, point-based confirmation |
 | `aster_client.py` | ~1,040 | API client (REST + WebSocket) |
 | `cli.py` | ~800 | Command-line interface |
-| `indicator_analyzer.py` | ~340 | Technical indicators, Smart TP |
-| `config.py` | ~420 | All configurations |
+| `indicator_analyzer.py` | ~700 | Technical indicators, SuperTrend, StochRSI |
+| `config.py` | ~450 | All configurations |
 | `telegram_notifier.py` | - | Telegram notifications |
 | `telegram_commands.py` | - | Interactive Telegram commands |
 | `trade_logger.py` | - | SQLite trade history |
@@ -103,6 +103,17 @@ REENTRY_POSITION_SIZE_RATIO = 50 # Start with 50% size
 AUTO_SWITCH_SIDE_ENABLED = True
 AUTO_REGRID_ENABLED = True
 REGRID_ON_TP_ENABLED = True
+
+# Trailing TP (SuperTrend-based)
+USE_TRAILING_TP = True
+SUPERTREND_LENGTH = 10
+SUPERTREND_MULTIPLIER = 3.0
+FALLBACK_TP_PERCENT = 1.5
+
+# Point-Based Confirmation (Fast Switch)
+USE_POINT_CONFIRMATION = True
+CONFIRMATION_CHECK_INTERVAL = 300  # 5 minutes
+SWITCH_THRESHOLD_POINTS = 4
 ```
 
 ## Grid Strategy
@@ -115,7 +126,33 @@ EMPTY → BUY_PLACED → POSITION_HELD → TP_PLACED → (TP fills) → EMPTY
                   Store entry price   Wait for profit
 ```
 
-### Smart Take-Profit (Dynamic TP%)
+### Trailing Take-Profit (SuperTrend-based)
+
+Replaces fixed % TP with dynamic trailing stop based on SuperTrend indicator.
+
+```python
+# Config (in RiskConfig)
+USE_TRAILING_TP = True           # Enable SuperTrend trailing
+SUPERTREND_LENGTH = 10           # ATR period
+SUPERTREND_MULTIPLIER = 3.0      # ATR multiplier
+FALLBACK_TP_PERCENT = 1.5%       # Used until position is profitable
+TRAILING_TP_UPDATE_INTERVAL = 300  # Update every 5 minutes
+```
+
+**How it works:**
+| Position | SuperTrend Stop | Action |
+|----------|-----------------|--------|
+| LONG profitable | long_stop > entry | Use SuperTrend as trailing TP |
+| LONG not profitable | long_stop < entry | Use fixed 1.5% TP |
+| SHORT profitable | short_stop < entry | Use SuperTrend as trailing TP |
+| SHORT not profitable | short_stop > entry | Use fixed 1.5% TP |
+
+**Benefits:**
+- Captures more profit in trending moves
+- Adapts to volatility (ATR-based)
+- Protects gains with trailing stop
+
+### Legacy Smart TP (Fallback)
 | Condition | TP% | Reason |
 |-----------|-----|--------|
 | RSI > 65 (near overbought) | 1.0% | Take profit quickly |
@@ -132,8 +169,32 @@ Score = EMA + MACD + RSI + Volume (-4 to +4)
 else  → Default to LONG
 
 Startup: Grid side set dynamically from analysis (not config)
-Runtime: Requires 2 confirmations before switching (anti-whipsaw)
 ```
+
+### Point-Based Trend Confirmation (Fast Switch)
+
+Replaces old 2-check system (30 min) with point accumulation (can switch in 5-10 min).
+
+```python
+# Config (in GridConfig)
+USE_POINT_CONFIRMATION = True    # Enable point system
+CONFIRMATION_CHECK_INTERVAL = 300  # Check every 5 minutes
+SWITCH_THRESHOLD_POINTS = 4      # Points needed to switch
+```
+
+**Point Sources:**
+| Signal | Points | Condition |
+|--------|--------|-----------|
+| Strong trend | +2 | Trend score >= 3 |
+| Moderate trend | +1 | Trend score == 2 |
+| StochRSI oversold | +1 | K < 20 (for LONG) |
+| StochRSI overbought | +1 | K > 80 (for SHORT) |
+| High volume | +1 | Volume > 1.3x average |
+| Unclear signal | -1 | Decay on neutral |
+
+**Example:**
+- Strong LONG signal (score=3) + oversold (StochRSI=15) + high volume = 4 points → Immediate switch
+- Moderate signals accumulate over 2-3 checks before switching
 
 ### Dynamic Initialization
 On bot startup:
@@ -341,7 +402,36 @@ git push origin main
 - Logs stored in `/app/logs/` on Railway (volume mounted)
 - SQLite DB: `grid_bot_trades.db`
 
-## Recent Updates (2026-01-12)
+## Recent Updates (2026-01-15)
+
+| Feature | Description |
+|---------|-------------|
+| **Trailing TP (SuperTrend)** | Dynamic trailing stop replaces fixed % TP |
+| **Point-Based Confirmation** | Faster trend switching (5-10 min vs 30 min) |
+| **SuperTrend Indicator** | Manual implementation using `ta` library ATR |
+| **StochRSI Indicator** | Manual implementation for faster overbought/oversold |
+| No pandas-ta dependency | Removed numba dependency, works on Python 3.14 |
+
+### New Indicators in `indicator_analyzer.py`
+
+```python
+# SuperTrend - ATR-based trailing stop
+SuperTrendResult:
+    trend_line: float      # Current SuperTrend value
+    direction: int         # 1 = bullish, -1 = bearish
+    long_stop: float       # Trailing stop for LONG
+    short_stop: float      # Trailing stop for SHORT
+    atr_value: float       # Current ATR
+
+# StochRSI - Faster momentum detection
+StochRSIResult:
+    k_line: float          # Fast line (0-100)
+    d_line: float          # Signal line (0-100)
+    is_oversold: bool      # K < 20
+    is_overbought: bool    # K > 80
+```
+
+## Updates (2026-01-12)
 
 | Feature | Description |
 |---------|-------------|

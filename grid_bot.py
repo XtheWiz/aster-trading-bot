@@ -351,6 +351,7 @@ class GridBot:
         self.telegram = TelegramNotifier()
         self.telegram_commands = TelegramCommandHandler(bot_reference=self)
         self.strategy_manager = StrategyManager(self.client, bot_reference=self)
+        self.indicator_analyzer = IndicatorAnalyzer()  # For trailing TP calculations
         self._session_id: int = 0
         self._last_hourly_summary = datetime.now()
     
