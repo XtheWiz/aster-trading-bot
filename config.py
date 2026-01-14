@@ -167,6 +167,37 @@ class GridConfig:
     # What to do when trend is unclear (score 0 or ±1)
     # "STAY" = keep current side, "PAUSE" = pause trading
     UNCLEAR_TREND_ACTION: Literal["STAY", "PAUSE"] = "STAY"
+
+    # ==========================================================================
+    # Point-Based Trend Confirmation (Faster than 2-check system)
+    # ==========================================================================
+
+    # Enable point-based confirmation instead of 2-check system
+    # Points accumulate based on multiple signals, faster for strong signals
+    USE_POINT_CONFIRMATION: bool = True
+
+    # Check interval for point accumulation (seconds)
+    # More frequent checks = faster response to strong signals
+    CONFIRMATION_CHECK_INTERVAL: int = 300  # 5 minutes (vs 15 min for 2-check)
+
+    # Points required to trigger a side switch
+    SWITCH_THRESHOLD_POINTS: int = 4
+
+    # Points awarded per signal type
+    STRONG_SIGNAL_POINTS: int = 2   # For trend score >=3 or <=-3
+    MODERATE_SIGNAL_POINTS: int = 1  # For trend score ±2
+
+    # StochRSI bonus thresholds
+    # K < 20 (oversold) = bonus for LONG recommendation
+    # K > 80 (overbought) = bonus for SHORT recommendation
+    STOCHRSI_BONUS_LOW: float = 20.0
+    STOCHRSI_BONUS_HIGH: float = 80.0
+
+    # Volume bonus threshold (volume ratio > this = +1 point)
+    VOLUME_BONUS_THRESHOLD: float = 1.3
+
+    # Point decay rate on unclear signals (-1 per unclear check)
+    POINT_DECAY_RATE: int = 1
     
     # ==========================================================================
     # Dynamic Re-Grid on TP: Re-analyze and re-place after Take Profit fills
@@ -227,13 +258,35 @@ class RiskConfig:
     
     # Auto Take Profit - automatically place TP order after BUY fill
     AUTO_TP_ENABLED: bool = True
-    
+
     # Smart TP - use indicators (RSI, MACD) to determine optimal TP%
     # If False, uses DEFAULT_TP_PERCENT
     USE_SMART_TP: bool = True
-    
+
     # Default TP percentage when Smart TP is disabled or fails
     DEFAULT_TP_PERCENT: Decimal = Decimal("1.5")
+
+    # ==========================================================================
+    # Trailing TP (SuperTrend-based) - Replaces fixed % TP
+    # ==========================================================================
+
+    # Enable SuperTrend-based trailing TP instead of fixed %
+    # When enabled, TP trails with SuperTrend stop level
+    USE_TRAILING_TP: bool = True
+
+    # SuperTrend parameters
+    SUPERTREND_LENGTH: int = 10         # ATR period
+    SUPERTREND_MULTIPLIER: float = 3.0  # ATR multiplier
+
+    # How often to update trailing TP (seconds)
+    TRAILING_TP_UPDATE_INTERVAL: int = 300  # 5 minutes
+
+    # Fallback TP% when SuperTrend stop is not yet profitable
+    FALLBACK_TP_PERCENT: Decimal = Decimal("1.5")
+
+    # Minimum profit % before activating trailing mode
+    # Until price moves this much, use fixed TP
+    MIN_PROFIT_FOR_TRAILING: Decimal = Decimal("0.5")
     
     # Minimum balance to maintain (bot stops if balance falls below)
     MIN_BALANCE_USDT: Decimal = Decimal("50.0")

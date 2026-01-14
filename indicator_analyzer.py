@@ -6,19 +6,24 @@ Technical analysis indicators for smart trading decisions.
 This module can use pre-calculated indicators from StrategyManager
 to avoid duplicate calculations and API calls.
 
-Uses 'ta' library as fallback for calculating RSI, MACD, and other indicators
+Uses 'ta' library for calculating RSI, MACD, ATR, and other indicators
 to determine optimal Take-Profit levels.
+
+Includes manual implementations of:
+- SuperTrend: Trailing stop-based TP (ATR-adaptive)
+- StochRSI: Faster overbought/oversold detection
 """
 
 import logging
 from decimal import Decimal
 from dataclasses import dataclass
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, Literal, TYPE_CHECKING
 
 import pandas as pd
-import ta
+import numpy as np
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator
+from ta.volatility import AverageTrueRange
 
 if TYPE_CHECKING:
     from strategy_manager import MarketAnalysis
@@ -41,6 +46,74 @@ class MarketSignal:
     recommendation: str
 
 
+@dataclass
+class SuperTrendResult:
+    """
+    SuperTrend indicator result for trailing TP.
+
+    SuperTrend is an ATR-based trend-following indicator that provides:
+    - Trend direction (bullish/bearish)
+    - Dynamic trailing stop levels that adapt to volatility
+    """
+    trend_line: float          # Current SuperTrend line value
+    direction: int             # 1 = bullish, -1 = bearish
+    long_stop: float           # Trailing stop for LONG positions
+    short_stop: float          # Trailing stop for SHORT positions
+    atr_value: float           # Current ATR value (for reference)
+
+    @property
+    def is_bullish(self) -> bool:
+        return self.direction == 1
+
+    @property
+    def is_bearish(self) -> bool:
+        return self.direction == -1
+
+
+@dataclass
+class StochRSIResult:
+    """
+    Stochastic RSI result for faster momentum detection.
+
+    StochRSI applies Stochastic formula to RSI values, creating
+    a faster oscillator that reaches extremes more often.
+    """
+    k_line: float              # Fast line (0-100)
+    d_line: float              # Signal line (0-100, smoothed K)
+
+    @property
+    def is_oversold(self) -> bool:
+        """K < 20 indicates oversold condition."""
+        return self.k_line < 20
+
+    @property
+    def is_overbought(self) -> bool:
+        """K > 80 indicates overbought condition."""
+        return self.k_line > 80
+
+    @property
+    def bullish_crossover(self) -> bool:
+        """K crossing above D in oversold zone = buy signal."""
+        return self.k_line > self.d_line and self.k_line < 30
+
+    @property
+    def bearish_crossover(self) -> bool:
+        """K crossing below D in overbought zone = sell signal."""
+        return self.k_line < self.d_line and self.k_line > 70
+
+
+@dataclass
+class TrailingTPResult:
+    """
+    Combined result for SuperTrend-based trailing TP decision.
+    """
+    use_trailing: bool          # Whether to use trailing TP
+    trailing_stop: Decimal      # The trailing stop price
+    fixed_tp: Decimal           # Fallback fixed TP price
+    supertrend: Optional[SuperTrendResult]
+    reason: str                 # Explanation for the decision
+
+
 class IndicatorAnalyzer:
     """
     Analyzes market indicators to provide smart TP recommendations.
@@ -58,6 +131,343 @@ class IndicatorAnalyzer:
         self.rsi_oversold = 30
         self.rsi_high = 65
         self.rsi_low = 40
+
+        # SuperTrend parameters (configurable via config.py)
+        self.supertrend_length = 10
+        self.supertrend_multiplier = 3.0
+
+        # StochRSI parameters
+        self.stochrsi_length = 14
+        self.stochrsi_rsi_length = 14
+        self.stochrsi_k = 3
+        self.stochrsi_d = 3
+
+    def calculate_supertrend(
+        self,
+        candles: list[dict],
+        length: int = None,
+        multiplier: float = None
+    ) -> Optional[SuperTrendResult]:
+        """
+        Calculate SuperTrend indicator from candle data.
+
+        SuperTrend uses ATR to create dynamic support/resistance levels
+        that trail the price during a trend.
+
+        Manual implementation using ta library for ATR calculation.
+
+        Args:
+            candles: List of candle dicts with OHLCV data
+            length: ATR period (default: 10)
+            multiplier: ATR multiplier (default: 3.0)
+
+        Returns:
+            SuperTrendResult with trend direction and stop levels
+        """
+        try:
+            length = length or self.supertrend_length
+            multiplier = multiplier or self.supertrend_multiplier
+
+            if len(candles) < length + 10:
+                logger.warning(f"Not enough candles for SuperTrend: {len(candles)}")
+                return None
+
+            # Convert to DataFrame
+            df = self._candles_to_dataframe(candles)
+            if df is None:
+                return None
+
+            # Calculate ATR using ta library
+            atr_indicator = AverageTrueRange(
+                high=df['high'],
+                low=df['low'],
+                close=df['close'],
+                window=length
+            )
+            df['atr'] = atr_indicator.average_true_range()
+
+            # Calculate HL2 (midpoint of high and low)
+            df['hl2'] = (df['high'] + df['low']) / 2
+
+            # Calculate basic upper and lower bands
+            df['basic_upper'] = df['hl2'] + (multiplier * df['atr'])
+            df['basic_lower'] = df['hl2'] - (multiplier * df['atr'])
+
+            # Initialize SuperTrend columns
+            df['final_upper'] = df['basic_upper']
+            df['final_lower'] = df['basic_lower']
+            df['supertrend'] = np.nan
+            df['direction'] = 1  # 1 = bullish, -1 = bearish
+
+            # Calculate SuperTrend with proper logic
+            for i in range(length, len(df)):
+                # Final upper band: lower of current basic_upper and previous final_upper
+                # (only if previous close was above previous final_upper)
+                if df['close'].iloc[i-1] > df['final_upper'].iloc[i-1]:
+                    df.loc[df.index[i], 'final_upper'] = df['basic_upper'].iloc[i]
+                else:
+                    df.loc[df.index[i], 'final_upper'] = min(
+                        df['basic_upper'].iloc[i],
+                        df['final_upper'].iloc[i-1]
+                    )
+
+                # Final lower band: higher of current basic_lower and previous final_lower
+                # (only if previous close was below previous final_lower)
+                if df['close'].iloc[i-1] < df['final_lower'].iloc[i-1]:
+                    df.loc[df.index[i], 'final_lower'] = df['basic_lower'].iloc[i]
+                else:
+                    df.loc[df.index[i], 'final_lower'] = max(
+                        df['basic_lower'].iloc[i],
+                        df['final_lower'].iloc[i-1]
+                    )
+
+                # Determine direction
+                if i == length:
+                    # First calculation - use simple logic
+                    if df['close'].iloc[i] > df['final_upper'].iloc[i]:
+                        df.loc[df.index[i], 'direction'] = 1
+                    else:
+                        df.loc[df.index[i], 'direction'] = -1
+                else:
+                    prev_dir = df['direction'].iloc[i-1]
+                    prev_st = df['supertrend'].iloc[i-1]
+
+                    if prev_dir == 1:
+                        # Was bullish
+                        if df['close'].iloc[i] < df['final_lower'].iloc[i]:
+                            df.loc[df.index[i], 'direction'] = -1  # Flip to bearish
+                        else:
+                            df.loc[df.index[i], 'direction'] = 1  # Stay bullish
+                    else:
+                        # Was bearish
+                        if df['close'].iloc[i] > df['final_upper'].iloc[i]:
+                            df.loc[df.index[i], 'direction'] = 1  # Flip to bullish
+                        else:
+                            df.loc[df.index[i], 'direction'] = -1  # Stay bearish
+
+                # Set SuperTrend value based on direction
+                if df['direction'].iloc[i] == 1:
+                    df.loc[df.index[i], 'supertrend'] = df['final_lower'].iloc[i]
+                else:
+                    df.loc[df.index[i], 'supertrend'] = df['final_upper'].iloc[i]
+
+            # Get latest values
+            latest = df.iloc[-1]
+
+            result = SuperTrendResult(
+                trend_line=float(latest['supertrend']) if pd.notna(latest['supertrend']) else 0.0,
+                direction=int(latest['direction']),
+                long_stop=float(latest['final_lower']) if pd.notna(latest['final_lower']) else 0.0,
+                short_stop=float(latest['final_upper']) if pd.notna(latest['final_upper']) else float('inf'),
+                atr_value=float(latest['atr']) if pd.notna(latest['atr']) else 0.0
+            )
+
+            logger.debug(
+                f"SuperTrend: direction={result.direction}, "
+                f"long_stop={result.long_stop:.4f}, short_stop={result.short_stop:.4f}"
+            )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error calculating SuperTrend: {e}")
+            return None
+
+    def calculate_stochrsi(
+        self,
+        candles: list[dict],
+        length: int = None,
+        rsi_length: int = None,
+        k: int = None,
+        d: int = None
+    ) -> Optional[StochRSIResult]:
+        """
+        Calculate Stochastic RSI indicator.
+
+        StochRSI is more sensitive than regular RSI, reaching
+        overbought/oversold levels more frequently.
+
+        Manual implementation using ta library for RSI calculation.
+
+        Formula:
+        1. Calculate RSI
+        2. StochRSI = (RSI - min(RSI, length)) / (max(RSI, length) - min(RSI, length))
+        3. K = SMA(StochRSI, k)
+        4. D = SMA(K, d)
+
+        Args:
+            candles: List of candle dicts with OHLCV data
+            length: Stochastic period (default: 14)
+            rsi_length: RSI period (default: 14)
+            k: K smoothing period (default: 3)
+            d: D smoothing period (default: 3)
+
+        Returns:
+            StochRSIResult with K and D line values (0-100 scale)
+        """
+        try:
+            length = length or self.stochrsi_length
+            rsi_length = rsi_length or self.stochrsi_rsi_length
+            k_period = k or self.stochrsi_k
+            d_period = d or self.stochrsi_d
+
+            min_candles = max(length, rsi_length) + 20
+            if len(candles) < min_candles:
+                logger.warning(f"Not enough candles for StochRSI: {len(candles)}")
+                return None
+
+            # Convert to DataFrame
+            df = self._candles_to_dataframe(candles)
+            if df is None:
+                return None
+
+            # Step 1: Calculate RSI
+            rsi_indicator = RSIIndicator(close=df['close'], window=rsi_length)
+            df['rsi'] = rsi_indicator.rsi()
+
+            # Step 2: Calculate Stochastic RSI
+            # StochRSI = (RSI - min(RSI)) / (max(RSI) - min(RSI))
+            df['rsi_min'] = df['rsi'].rolling(window=length).min()
+            df['rsi_max'] = df['rsi'].rolling(window=length).max()
+
+            # Avoid division by zero
+            df['rsi_range'] = df['rsi_max'] - df['rsi_min']
+            df['stochrsi'] = np.where(
+                df['rsi_range'] > 0,
+                (df['rsi'] - df['rsi_min']) / df['rsi_range'],
+                0.5  # Default to middle if no range
+            )
+
+            # Step 3: Calculate K line (smoothed StochRSI)
+            df['k_line'] = df['stochrsi'].rolling(window=k_period).mean()
+
+            # Step 4: Calculate D line (smoothed K)
+            df['d_line'] = df['k_line'].rolling(window=d_period).mean()
+
+            # Get latest values (convert to 0-100 scale)
+            latest = df.iloc[-1]
+
+            k_value = float(latest['k_line']) * 100 if pd.notna(latest['k_line']) else 50.0
+            d_value = float(latest['d_line']) * 100 if pd.notna(latest['d_line']) else 50.0
+
+            result = StochRSIResult(
+                k_line=k_value,
+                d_line=d_value
+            )
+
+            logger.debug(f"StochRSI: K={result.k_line:.1f}, D={result.d_line:.1f}")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error calculating StochRSI: {e}")
+            return None
+
+    def get_trailing_tp(
+        self,
+        candles: list[dict],
+        entry_price: Decimal,
+        position_side: Literal["LONG", "SHORT"],
+        fallback_tp_percent: Decimal = Decimal("1.5")
+    ) -> TrailingTPResult:
+        """
+        Get trailing TP recommendation based on SuperTrend.
+
+        Logic:
+        - LONG: Use SuperTrend long_stop if it's above entry price (profitable)
+        - SHORT: Use SuperTrend short_stop if it's below entry price (profitable)
+        - Fallback to fixed TP% if SuperTrend stop is not yet profitable
+
+        Args:
+            candles: Candle data for indicator calculation
+            entry_price: Position entry price
+            position_side: "LONG" or "SHORT"
+            fallback_tp_percent: Fallback TP% if trailing not applicable
+
+        Returns:
+            TrailingTPResult with trailing stop or fixed TP
+        """
+        # Calculate fixed TP as fallback
+        if position_side == "LONG":
+            fixed_tp = entry_price * (1 + fallback_tp_percent / 100)
+        else:
+            fixed_tp = entry_price * (1 - fallback_tp_percent / 100)
+
+        # Try to calculate SuperTrend
+        supertrend = self.calculate_supertrend(candles)
+
+        if supertrend is None:
+            return TrailingTPResult(
+                use_trailing=False,
+                trailing_stop=Decimal("0"),
+                fixed_tp=fixed_tp,
+                supertrend=None,
+                reason="SuperTrend calculation failed, using fixed TP"
+            )
+
+        # Determine if SuperTrend stop is profitable
+        if position_side == "LONG":
+            st_stop = Decimal(str(supertrend.long_stop))
+            is_profitable = st_stop > entry_price
+
+            if is_profitable:
+                return TrailingTPResult(
+                    use_trailing=True,
+                    trailing_stop=st_stop,
+                    fixed_tp=fixed_tp,
+                    supertrend=supertrend,
+                    reason=f"SuperTrend trailing stop above entry ({st_stop:.4f} > {entry_price:.4f})"
+                )
+            else:
+                return TrailingTPResult(
+                    use_trailing=False,
+                    trailing_stop=st_stop,
+                    fixed_tp=fixed_tp,
+                    supertrend=supertrend,
+                    reason=f"SuperTrend stop below entry, using fixed TP until profit"
+                )
+
+        else:  # SHORT
+            st_stop = Decimal(str(supertrend.short_stop))
+            is_profitable = st_stop < entry_price
+
+            if is_profitable:
+                return TrailingTPResult(
+                    use_trailing=True,
+                    trailing_stop=st_stop,
+                    fixed_tp=fixed_tp,
+                    supertrend=supertrend,
+                    reason=f"SuperTrend trailing stop below entry ({st_stop:.4f} < {entry_price:.4f})"
+                )
+            else:
+                return TrailingTPResult(
+                    use_trailing=False,
+                    trailing_stop=st_stop,
+                    fixed_tp=fixed_tp,
+                    supertrend=supertrend,
+                    reason=f"SuperTrend stop above entry, using fixed TP until profit"
+                )
+
+    def _candles_to_dataframe(self, candles: list[dict]) -> Optional[pd.DataFrame]:
+        """Convert candle list to pandas DataFrame with proper column names."""
+        try:
+            # Aster API returns candles as arrays:
+            # [timestamp, open, high, low, close, volume, ...]
+            df = pd.DataFrame(candles, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_volume', 'trades', 'taker_buy_volume',
+                'taker_buy_quote_volume', 'ignore'
+            ])
+
+            # Ensure numeric types for OHLCV
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            return df
+
+        except Exception as e:
+            logger.error(f"Error converting candles to DataFrame: {e}")
+            return None
 
     def from_market_analysis(self, analysis: "MarketAnalysis") -> Optional[MarketSignal]:
         """

@@ -28,6 +28,7 @@ import websockets
 from aster_client import AsterClient
 from config import config
 from telegram_notifier import TelegramNotifier
+from indicator_analyzer import IndicatorAnalyzer
 
 logger = logging.getLogger("StrategyManager")
 
@@ -110,6 +111,124 @@ class TrendScore:
         return f"TrendScore(EMA={self.ema_score:+d}, MACD={self.macd_score:+d}, RSI={self.rsi_score:+d}, {vol_str}, Total={self.total:+d})"
 
 
+@dataclass
+class FastTrendConfirmation:
+    """
+    Point-based trend confirmation for faster side switching.
+
+    Instead of waiting for 2 consecutive checks (30+ min), this system
+    accumulates points based on multiple signal strengths. Strong signals
+    can trigger a switch in as little as 5-10 minutes.
+
+    Point Sources:
+    - Trend Score >= 3: +2 points
+    - Trend Score == 2: +1 point
+    - StochRSI < 20 (for LONG) or > 80 (for SHORT): +1 point
+    - Volume > 1.3x average: +1 point
+
+    Threshold: 4 points to trigger switch
+    Decay: -1 point per check when signal is unclear
+    """
+    accumulated_points: int = 0
+    pending_direction: str | None = None  # "LONG" or "SHORT"
+    last_check_time: datetime | None = None
+    points_history: list[int] = None  # Track point changes for debugging
+
+    def __post_init__(self):
+        if self.points_history is None:
+            self.points_history = []
+
+    def reset(self):
+        """Reset confirmation state."""
+        self.accumulated_points = 0
+        self.pending_direction = None
+        self.points_history = []
+
+    def add_check(
+        self,
+        trend_score: int,
+        recommended_side: str,
+        stochrsi_k: float | None,
+        volume_ratio: float,
+        current_side: str
+    ) -> str | None:
+        """
+        Process a confirmation check and return new side if switch should happen.
+
+        Args:
+            trend_score: Current trend score (-4 to +4)
+            recommended_side: "LONG", "SHORT", "STAY", or "PAUSE"
+            stochrsi_k: StochRSI K value (0-100) or None if not calculated
+            volume_ratio: Current volume / average volume
+            current_side: Current grid side
+
+        Returns:
+            New side to switch to, or None if no switch needed
+        """
+        points = 0
+        direction = None
+
+        # If signal is unclear, decay points
+        if recommended_side in ("STAY", "PAUSE"):
+            decay = config.grid.POINT_DECAY_RATE
+            self.accumulated_points = max(0, self.accumulated_points - decay)
+            self.points_history.append(-decay)
+            return None
+
+        # Already on recommended side
+        if recommended_side == current_side:
+            self.reset()
+            return None
+
+        direction = recommended_side
+
+        # Calculate points from trend score
+        if abs(trend_score) >= 3:
+            points += config.grid.STRONG_SIGNAL_POINTS
+        elif abs(trend_score) >= 2:
+            points += config.grid.MODERATE_SIGNAL_POINTS
+
+        # StochRSI bonus
+        if stochrsi_k is not None:
+            if direction == "LONG" and stochrsi_k < config.grid.STOCHRSI_BONUS_LOW:
+                points += 1
+            elif direction == "SHORT" and stochrsi_k > config.grid.STOCHRSI_BONUS_HIGH:
+                points += 1
+
+        # Volume bonus
+        if volume_ratio > config.grid.VOLUME_BONUS_THRESHOLD:
+            points += 1
+
+        # Accumulate or reset based on direction consistency
+        if direction == self.pending_direction:
+            self.accumulated_points += points
+        else:
+            # Direction changed - start fresh
+            self.pending_direction = direction
+            self.accumulated_points = points
+
+        self.points_history.append(points)
+        self.last_check_time = datetime.now()
+
+        # Check if threshold reached
+        if self.accumulated_points >= config.grid.SWITCH_THRESHOLD_POINTS:
+            if direction != current_side:
+                result = direction
+                self.reset()
+                return result
+
+        return None
+
+    def get_status(self) -> str:
+        """Get human-readable status."""
+        if self.pending_direction is None:
+            return "No pending signal"
+        return (
+            f"Pending: {self.pending_direction} | "
+            f"Points: {self.accumulated_points}/{config.grid.SWITCH_THRESHOLD_POINTS}"
+        )
+
+
 class StrategyManager:
     """
     Quantitative analysis engine for the grid bot.
@@ -148,6 +267,11 @@ class StrategyManager:
         self.pending_switch_side: Literal["LONG", "SHORT"] | None = None
         self.switch_confirmation_count: int = 0
         self.current_trend_score: TrendScore | None = None
+
+        # Fast Trend Confirmation (point-based system)
+        self.fast_trend_confirmation = FastTrendConfirmation()
+        self.indicator_analyzer = IndicatorAnalyzer()
+        self.last_stochrsi_k: float | None = None  # Cached StochRSI value
         
         # Dynamic Re-Grid on TP tracking
         self.grid_placement_score: int = 0  # Score when grid was placed
@@ -1541,20 +1665,119 @@ class StrategyManager:
     async def _check_auto_switch(self, analysis: MarketAnalysis) -> None:
         """
         Check if grid side should be switched based on trend score.
-        
+
+        Supports two modes:
+        1. Legacy 2-Check: Wait for 2 consecutive confirmations (30+ min)
+        2. Point-Based (NEW): Accumulate points, faster for strong signals
+
+        Point-based system uses:
+        - Trend score strength (+1 or +2 points)
+        - StochRSI extreme levels (+1 point)
+        - Volume confirmation (+1 point)
+        - 4 points = switch
+        """
+        if not config.grid.AUTO_SWITCH_SIDE_ENABLED:
+            return
+
+        if self.current_trend_score is None:
+            return
+
+        recommended = self.current_trend_score.recommended_side
+        current_side = config.grid.GRID_SIDE
+        trend_score = self.current_trend_score.total
+        volume_ratio = self.current_trend_score.volume_ratio
+
+        # Use point-based confirmation if enabled
+        if config.grid.USE_POINT_CONFIRMATION:
+            await self._check_auto_switch_points(analysis, recommended, trend_score, volume_ratio)
+        else:
+            await self._check_auto_switch_legacy(analysis, recommended)
+
+    async def _check_auto_switch_points(
+        self,
+        analysis: MarketAnalysis,
+        recommended: str,
+        trend_score: int,
+        volume_ratio: float
+    ) -> None:
+        """
+        Point-based auto-switch confirmation (faster for strong signals).
+
+        Points accumulate based on signal strength:
+        - Trend Score >= 3: +2 points
+        - Trend Score == 2: +1 point
+        - StochRSI extreme: +1 point
+        - High volume: +1 point
+        - 4 points threshold = switch
+        """
+        current_side = config.grid.GRID_SIDE
+
+        # Get StochRSI if available (cached or calculate)
+        stochrsi_k = self.last_stochrsi_k
+
+        # Try to calculate StochRSI if not cached or stale
+        if stochrsi_k is None:
+            try:
+                candles = await self.client.get_klines(
+                    symbol=config.trading.SYMBOL,
+                    interval="1h",
+                    limit=50
+                )
+                if candles:
+                    stochrsi = self.indicator_analyzer.calculate_stochrsi(candles)
+                    if stochrsi:
+                        stochrsi_k = stochrsi.k_line
+                        self.last_stochrsi_k = stochrsi_k
+            except Exception as e:
+                logger.warning(f"Could not calculate StochRSI: {e}")
+
+        # Run point-based check
+        new_side = self.fast_trend_confirmation.add_check(
+            trend_score=trend_score,
+            recommended_side=recommended,
+            stochrsi_k=stochrsi_k,
+            volume_ratio=volume_ratio,
+            current_side=current_side
+        )
+
+        # Log status
+        ftc = self.fast_trend_confirmation
+        if ftc.pending_direction:
+            logger.info(
+                f"Point Confirmation: {ftc.get_status()} | "
+                f"Score={trend_score}, StochRSI={stochrsi_k:.1f if stochrsi_k else 'N/A'}, Vol={volume_ratio:.2f}"
+            )
+
+            # Send Telegram notification on first signal
+            if len(ftc.points_history) == 1:
+                await self.telegram.send_message(
+                    f"🔄 Trend Signal (Point System)\n\n"
+                    f"Current: {current_side}\n"
+                    f"Recommended: {recommended}\n"
+                    f"Score: {self.current_trend_score}\n"
+                    f"StochRSI: {stochrsi_k:.1f if stochrsi_k else 'N/A'}\n"
+                    f"Volume: {volume_ratio:.2f}x\n\n"
+                    f"Points: {ftc.accumulated_points}/{config.grid.SWITCH_THRESHOLD_POINTS}"
+                )
+
+        # Execute switch if threshold reached
+        if new_side:
+            await self._execute_switch(new_side, analysis)
+
+    async def _check_auto_switch_legacy(
+        self,
+        analysis: MarketAnalysis,
+        recommended: str
+    ) -> None:
+        """
+        Legacy 2-check auto-switch confirmation.
+
         Uses confirmation period to prevent whipsaw:
         - If recommended side is same for 2 consecutive checks, switch
         - If signal changes, reset confirmation counter
         """
-        if not config.grid.AUTO_SWITCH_SIDE_ENABLED:
-            return
-        
-        if self.current_trend_score is None:
-            return
-        
-        recommended = self.current_trend_score.recommended_side
         current_side = config.grid.GRID_SIDE
-        
+
         # If recommendation is STAY or PAUSE, don't switch
         if recommended in ("STAY", "PAUSE"):
             if self.pending_switch_side is not None:
@@ -1562,13 +1785,13 @@ class StrategyManager:
                 self.pending_switch_side = None
                 self.switch_confirmation_count = 0
             return
-        
+
         # If already on recommended side, nothing to do
         if recommended == current_side:
             self.pending_switch_side = None
             self.switch_confirmation_count = 0
             return
-        
+
         # Check if this is a new pending switch or continuation
         if self.pending_switch_side == recommended:
             # Same recommendation as before, increment counter
@@ -1577,7 +1800,7 @@ class StrategyManager:
                 f"Switch to {recommended} confirmed: {self.switch_confirmation_count}/"
                 f"{config.grid.SWITCH_CONFIRMATION_CHECKS}"
             )
-            
+
             # Check if we have enough confirmations
             if self.switch_confirmation_count >= config.grid.SWITCH_CONFIRMATION_CHECKS:
                 await self._execute_switch(recommended, analysis)
@@ -1589,7 +1812,7 @@ class StrategyManager:
                 f"New switch signal: {current_side} → {recommended} "
                 f"(score={self.current_trend_score.total}, need {config.grid.SWITCH_CONFIRMATION_CHECKS} confirmations)"
             )
-            
+
             await self.telegram.send_message(
                 f"🔄 Trend Signal Detected\n\n"
                 f"Current: {current_side}\n"

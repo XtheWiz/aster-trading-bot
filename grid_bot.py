@@ -43,7 +43,7 @@ from trade_logger import TradeLogger, create_trade_record, BalanceSnapshot
 from telegram_notifier import TelegramNotifier
 from telegram_commands import TelegramCommandHandler
 from strategy_manager import StrategyManager
-from indicator_analyzer import IndicatorAnalyzer, get_smart_tp
+from indicator_analyzer import IndicatorAnalyzer, get_smart_tp, TrailingTPResult
 from trade_event_logger import trade_event_logger
 
 # Configure logging with structured format
@@ -131,6 +131,12 @@ class GridLevel:
     # TP tracking for ML analysis
     tp_placed_at: datetime | None = None
     tp_target_price: Decimal = Decimal("0")
+    # Trailing TP (SuperTrend-based) fields
+    trailing_tp_active: bool = False       # Whether trailing mode is active
+    supertrend_stop: Decimal = Decimal("0")  # Current SuperTrend stop level
+    highest_price_seen: Decimal = Decimal("0")   # For LONG: track highest price
+    lowest_price_seen: Decimal = Decimal("999999")  # For SHORT: track lowest price
+    last_tp_update: datetime | None = None  # Last time TP was updated
 
     def __repr__(self) -> str:
         if self.state == GridLevelState.POSITION_HELD:
@@ -161,6 +167,12 @@ class GridLevel:
         # TP tracking for ML analysis
         self.tp_placed_at = None
         self.tp_target_price = Decimal("0")
+        # Trailing TP reset
+        self.trailing_tp_active = False
+        self.supertrend_stop = Decimal("0")
+        self.highest_price_seen = Decimal("0")
+        self.lowest_price_seen = Decimal("999999")
+        self.last_tp_update = None
 
     def add_partial_fill(self, price: Decimal, quantity: Decimal) -> None:
         """
@@ -801,11 +813,15 @@ class GridBot:
         """
         Place intelligent Take-Profit order based on market indicators.
 
-        This method:
-        1. Gets TOTAL position avg entry from exchange (to avoid selling at loss)
-        2. Uses cached analysis from StrategyManager if available
-        3. Determines optimal TP% based on market conditions
-        4. Places SELL order at calculated TP price (above total avg entry)
+        This method supports two modes:
+        1. Traditional Smart TP: RSI/MACD-based fixed percentage (1.0%-2.5%)
+        2. Trailing TP (NEW): SuperTrend-based dynamic trailing stop
+
+        When USE_TRAILING_TP is enabled:
+        - Uses SuperTrend indicator to calculate trailing stop
+        - If SuperTrend stop is above entry (LONG), use it as TP
+        - If not yet profitable, use fallback fixed TP%
+        - TP order will be updated periodically as price moves
 
         Args:
             filled_level: The grid level that just got filled (BUY)
@@ -833,26 +849,70 @@ class GridBot:
                 entry_price = level_entry
                 logger.info(f"📊 No total position, using level entry: ${entry_price:.4f}")
 
-            # Get TP percentage and capture indicator values for ML logging
+            # Initialize tracking variables for ML logging
             rsi = 0.0
             macd_hist = 0.0
             trend = ""
             atr_percent = 0.0
+            tp_mode = "fixed"  # "fixed" or "trailing"
 
-            if config.risk.USE_SMART_TP:
-                # First try to use cached analysis from StrategyManager
+            # Determine position side for trailing TP
+            position_side = "LONG" if config.grid.GRID_SIDE == "LONG" else "SHORT"
+
+            # Check if trailing TP is enabled
+            if config.risk.USE_TRAILING_TP:
+                # Fetch candles for SuperTrend calculation
+                candles = await self.client.get_klines(
+                    symbol=config.trading.SYMBOL,
+                    interval="1h",
+                    limit=100  # Need more candles for SuperTrend
+                )
+
+                if candles:
+                    # Use IndicatorAnalyzer to get trailing TP recommendation
+                    trailing_result = self.indicator_analyzer.get_trailing_tp(
+                        candles=candles,
+                        entry_price=entry_price,
+                        position_side=position_side,
+                        fallback_tp_percent=config.risk.FALLBACK_TP_PERCENT
+                    )
+
+                    if trailing_result.use_trailing:
+                        # SuperTrend stop is profitable - use trailing mode
+                        tp_price = self._round_price(trailing_result.trailing_stop)
+                        tp_mode = "trailing"
+                        filled_level.trailing_tp_active = True
+                        filled_level.supertrend_stop = trailing_result.trailing_stop
+                        logger.info(f"📈 Trailing TP (SuperTrend): ${tp_price:.4f} | {trailing_result.reason}")
+                    else:
+                        # SuperTrend not yet profitable - use fixed TP
+                        tp_price = self._round_price(trailing_result.fixed_tp)
+                        filled_level.trailing_tp_active = False
+                        filled_level.supertrend_stop = trailing_result.trailing_stop
+                        logger.info(f"🎯 Fixed TP (waiting for trailing): ${tp_price:.4f} | {trailing_result.reason}")
+
+                    # Capture ATR for logging if available
+                    if trailing_result.supertrend:
+                        atr_percent = float(trailing_result.supertrend.atr_value / float(entry_price) * 100)
+                else:
+                    # No candles - use fallback
+                    tp_percent = config.risk.FALLBACK_TP_PERCENT
+                    tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
+                    tp_price = self._round_price(tp_price)
+                    logger.warning(f"No candle data for trailing TP, using fallback: {tp_percent}%")
+
+            elif config.risk.USE_SMART_TP:
+                # Original Smart TP logic (RSI/MACD-based)
                 cached_analysis = self.strategy_manager.last_analysis
 
                 if cached_analysis and cached_analysis.rsi > 0:
                     tp_percent = await get_smart_tp(market_analysis=cached_analysis)
                     logger.info(f"🧠 Smart TP (cached): {tp_percent}%")
-                    # Capture indicator values for ML logging
                     rsi = cached_analysis.rsi
                     macd_hist = cached_analysis.macd_histogram
                     trend = cached_analysis.trend_direction
                     atr_percent = float(cached_analysis.atr_value / cached_analysis.current_price * 100) if cached_analysis.current_price > 0 else 0.0
                 else:
-                    # Fallback: Fetch candle data for indicator calculation
                     candles = await self.client.get_klines(
                         symbol=config.trading.SYMBOL,
                         interval="1h",
@@ -865,13 +925,14 @@ class GridBot:
                     else:
                         tp_percent = config.risk.DEFAULT_TP_PERCENT
                         logger.warning(f"No candle data, using default TP: {tp_percent}%")
+
+                tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
+                tp_price = self._round_price(tp_price)
             else:
                 tp_percent = config.risk.DEFAULT_TP_PERCENT
+                tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
+                tp_price = self._round_price(tp_price)
                 logger.info(f"Smart TP disabled, using default: {tp_percent}%")
-            
-            # Calculate TP price
-            tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
-            tp_price = self._round_price(tp_price)
 
             # Use actual position quantity, not recalculated
             quantity = filled_level.position_quantity if filled_level.position_quantity > 0 else self.calculate_quantity_for_level(entry_price)
@@ -901,20 +962,37 @@ class GridBot:
             # Track TP placement time and target for ML outcome analysis
             filled_level.tp_placed_at = datetime.now()
             filled_level.tp_target_price = tp_price
+            filled_level.last_tp_update = datetime.now()
 
-            logger.info(
-                f"🎯 SMART TP PLACED: SELL @ ${tp_price:.4f} (+{tp_percent}%) | "
-                f"Avg Entry: ${entry_price:.4f} | Qty: {quantity} | OrderID: {order_id}"
-            )
+            # Calculate TP percentage for logging
+            if 'tp_percent' not in dir() or tp_percent is None:
+                tp_percent = ((tp_price - entry_price) / entry_price) * 100
 
-            # Send Telegram notification
-            await self.telegram.send_message(
-                f"🎯 Smart TP Placed!\n"
-                f"Avg Entry: ${entry_price:.4f}\n"
-                f"TP: ${tp_price:.4f} (+{tp_percent}%)\n"
-                f"Qty: {quantity}\n"
-                f"(TP based on total position avg)"
-            )
+            # Different log messages based on TP mode
+            if tp_mode == "trailing":
+                logger.info(
+                    f"📈 TRAILING TP PLACED: SELL @ ${tp_price:.4f} (+{tp_percent:.2f}%) | "
+                    f"Avg Entry: ${entry_price:.4f} | Qty: {quantity} | OrderID: {order_id}"
+                )
+                await self.telegram.send_message(
+                    f"📈 Trailing TP Placed (SuperTrend)!\n"
+                    f"Avg Entry: ${entry_price:.4f}\n"
+                    f"TP: ${tp_price:.4f} (+{tp_percent:.2f}%)\n"
+                    f"Qty: {quantity}\n"
+                    f"Mode: Trailing (will update as price moves)"
+                )
+            else:
+                logger.info(
+                    f"🎯 SMART TP PLACED: SELL @ ${tp_price:.4f} (+{tp_percent}%) | "
+                    f"Avg Entry: ${entry_price:.4f} | Qty: {quantity} | OrderID: {order_id}"
+                )
+                await self.telegram.send_message(
+                    f"🎯 Smart TP Placed!\n"
+                    f"Avg Entry: ${entry_price:.4f}\n"
+                    f"TP: ${tp_price:.4f} (+{tp_percent}%)\n"
+                    f"Qty: {quantity}\n"
+                    f"(TP based on total position avg)"
+                )
 
             # Get context data for ML logging
             btc_trend_score = 0
@@ -2087,6 +2165,9 @@ class GridBot:
                     await self.emergency_shutdown()
                     return
 
+                # Update trailing TP orders (SuperTrend-based)
+                await self._update_trailing_tp_orders()
+
                 # Log status periodically with Phase 3 risk metrics
                 runtime = datetime.now() - self.state.start_time if self.state.start_time else None
                 logger.info(
@@ -2218,7 +2299,182 @@ class GridBot:
                     
             except Exception as e:
                 logger.error(f"Auto Re-Grid error: {e}")
-    
+
+    async def _update_trailing_tp_orders(self) -> None:
+        """
+        Update trailing TP orders based on current SuperTrend values.
+
+        This method runs periodically (every TRAILING_TP_UPDATE_INTERVAL) and:
+        1. Finds all levels with active trailing TP
+        2. Recalculates SuperTrend
+        3. If new stop is better (higher for LONG), updates the TP order
+        4. If SuperTrend direction flips, triggers immediate exit
+
+        Called from run_monitoring_loop.
+        """
+        if not config.risk.USE_TRAILING_TP:
+            return
+
+        update_interval = config.risk.TRAILING_TP_UPDATE_INTERVAL
+
+        # Find levels with TP orders that need updating
+        levels_to_update = [
+            level for level in self.state.levels
+            if level.state == GridLevelState.TP_PLACED
+            and level.tp_order_id is not None
+        ]
+
+        if not levels_to_update:
+            return
+
+        # Check if enough time has passed since last update
+        now = datetime.now()
+        levels_due_for_update = []
+
+        for level in levels_to_update:
+            if level.last_tp_update is None:
+                levels_due_for_update.append(level)
+            else:
+                seconds_since_update = (now - level.last_tp_update).total_seconds()
+                if seconds_since_update >= update_interval:
+                    levels_due_for_update.append(level)
+
+        if not levels_due_for_update:
+            return
+
+        try:
+            # Fetch candles for SuperTrend calculation
+            candles = await self.client.get_klines(
+                symbol=config.trading.SYMBOL,
+                interval="1h",
+                limit=100
+            )
+
+            if not candles:
+                logger.warning("No candle data for trailing TP update")
+                return
+
+            # Calculate current SuperTrend
+            supertrend = self.indicator_analyzer.calculate_supertrend(
+                candles=candles,
+                length=config.risk.SUPERTREND_LENGTH,
+                multiplier=config.risk.SUPERTREND_MULTIPLIER
+            )
+
+            if not supertrend:
+                logger.warning("SuperTrend calculation failed for trailing TP update")
+                return
+
+            # Get current price for direction flip check
+            ticker = await self.client.get_ticker_price(config.trading.SYMBOL)
+            current_price = Decimal(ticker["price"])
+
+            position_side = "LONG" if config.grid.GRID_SIDE == "LONG" else "SHORT"
+
+            for level in levels_due_for_update:
+                try:
+                    # Check for SuperTrend direction flip (immediate exit signal)
+                    if position_side == "LONG" and supertrend.is_bearish:
+                        logger.warning(
+                            f"⚠️ SuperTrend flipped BEARISH - Level {level.index} | "
+                            f"Consider closing position"
+                        )
+                        await self.telegram.send_message(
+                            f"⚠️ SuperTrend Flip (Bearish)\n"
+                            f"Level: {level.index}\n"
+                            f"Current Price: ${current_price:.4f}\n"
+                            f"Consider manual exit or wait for TP"
+                        )
+                        level.last_tp_update = now
+                        continue
+
+                    elif position_side == "SHORT" and supertrend.is_bullish:
+                        logger.warning(
+                            f"⚠️ SuperTrend flipped BULLISH - Level {level.index} | "
+                            f"Consider closing position"
+                        )
+                        await self.telegram.send_message(
+                            f"⚠️ SuperTrend Flip (Bullish)\n"
+                            f"Level: {level.index}\n"
+                            f"Current Price: ${current_price:.4f}\n"
+                            f"Consider manual exit or wait for TP"
+                        )
+                        level.last_tp_update = now
+                        continue
+
+                    # Get new SuperTrend stop
+                    if position_side == "LONG":
+                        new_stop = Decimal(str(supertrend.long_stop))
+                        # Only update if new stop is higher (better)
+                        should_update = new_stop > level.supertrend_stop and new_stop > level.entry_price
+                    else:  # SHORT
+                        new_stop = Decimal(str(supertrend.short_stop))
+                        # Only update if new stop is lower (better)
+                        should_update = new_stop < level.supertrend_stop and new_stop < level.entry_price
+
+                    if should_update:
+                        # Cancel old TP order and place new one
+                        old_tp_price = level.tp_target_price
+                        new_tp_price = self._round_price(new_stop)
+
+                        logger.info(
+                            f"📈 Trailing TP Update: Level {level.index} | "
+                            f"${old_tp_price:.4f} → ${new_tp_price:.4f} | "
+                            f"+{((new_tp_price - level.entry_price) / level.entry_price * 100):.2f}%"
+                        )
+
+                        # Cancel old order
+                        if level.tp_order_id:
+                            await self.client.cancel_order(
+                                symbol=config.trading.SYMBOL,
+                                order_id=level.tp_order_id
+                            )
+
+                        # Place new order at updated price
+                        quantity = level.position_quantity
+                        client_order_id = f"tp_{level.index}_{int(now.timestamp())}"
+
+                        response = await self.client.place_order(
+                            symbol=config.trading.SYMBOL,
+                            side="SELL" if position_side == "LONG" else "BUY",
+                            order_type="LIMIT",
+                            quantity=quantity,
+                            price=new_tp_price,
+                            client_order_id=client_order_id,
+                        )
+
+                        # Update level state
+                        level.tp_order_id = response.get("orderId")
+                        level.order_id = level.tp_order_id
+                        level.tp_target_price = new_tp_price
+                        level.supertrend_stop = new_stop
+                        level.trailing_tp_active = True
+                        level.client_order_id = client_order_id
+
+                        await self.telegram.send_message(
+                            f"📈 Trailing TP Updated!\n"
+                            f"Level: {level.index}\n"
+                            f"New TP: ${new_tp_price:.4f}\n"
+                            f"Entry: ${level.entry_price:.4f}\n"
+                            f"Profit: +{((new_tp_price - level.entry_price) / level.entry_price * 100):.2f}%"
+                        )
+
+                    # Update tracking
+                    level.last_tp_update = now
+                    level.supertrend_stop = new_stop
+
+                    # Track highest/lowest prices
+                    if position_side == "LONG":
+                        level.highest_price_seen = max(level.highest_price_seen, current_price)
+                    else:
+                        level.lowest_price_seen = min(level.lowest_price_seen, current_price)
+
+                except Exception as e:
+                    logger.error(f"Error updating trailing TP for level {level.index}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error in trailing TP update: {e}")
+
     async def _daily_report_scheduler(self) -> None:
         """
         Send daily performance report every 24 hours.
