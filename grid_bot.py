@@ -1609,6 +1609,76 @@ class GridBot:
             logger.error(f"Smart Startup check failed: {e}")
             logger.info(f"Falling back to config grid side: {config.grid.GRID_SIDE}")
 
+    async def _send_switch_blocked_alert(
+        self,
+        pos_side: str,
+        new_side: str,
+        position_amt: Decimal,
+        entry_price: Decimal,
+        pos: dict
+    ) -> None:
+        """
+        Send detailed alert when side switch is blocked by existing position.
+
+        Provides actionable information for manual decision:
+        - Current position details
+        - TP order status if exists
+        - Unrealized PnL
+        - Options for user
+        """
+        symbol = config.trading.SYMBOL
+
+        # Get unrealized PnL from position data
+        unrealized_pnl = Decimal(str(pos.get("unrealizedProfit", 0)))
+
+        # Calculate PnL percentage
+        position_value = entry_price * position_amt
+        pnl_percent = (unrealized_pnl / position_value * 100) if position_value > 0 else Decimal(0)
+
+        # Get trend score if available
+        trend_score_str = "N/A"
+        if hasattr(self, 'strategy_manager') and self.strategy_manager:
+            if hasattr(self.strategy_manager, 'current_trend_score') and self.strategy_manager.current_trend_score:
+                trend_score_str = f"{self.strategy_manager.current_trend_score.total:+d}"
+
+        # Get TP order info
+        tp_info = "No TP order found ⚠️"
+        try:
+            open_orders = await self.client.get_open_orders(symbol)
+            tp_side = "SELL" if pos_side == "LONG" else "BUY"
+
+            for order in open_orders:
+                if order.get("side") == tp_side:
+                    tp_price = Decimal(str(order.get("price", 0)))
+                    if entry_price > 0:
+                        tp_percent = ((tp_price - entry_price) / entry_price * 100)
+                        tp_info = f"TP @ ${tp_price:.2f} ({tp_percent:+.2f}%)"
+                    else:
+                        tp_info = f"TP @ ${tp_price:.2f}"
+                    break
+        except Exception as e:
+            logger.warning(f"Failed to get TP order info: {e}")
+
+        # Log the blocked switch
+        logger.warning(
+            f"🚫 BLOCKED SIDE SWITCH: Have {pos_side} position {position_amt} @ ${entry_price:.4f}. "
+            f"Cannot switch to {new_side} - would cause realized loss! Wait for TP to fill first."
+        )
+
+        # Send improved alert with actionable info
+        alert_msg = (
+            f"⚠️ **Side Switch Blocked**\n\n"
+            f"Current: {pos_side} position ({position_amt} {symbol[:3]} @ ${entry_price:.2f})\n"
+            f"Recommended: Switch to {new_side} (score: {trend_score_str})\n\n"
+            f"TP Status: {tp_info}\n"
+            f"Position PnL: ${unrealized_pnl:.2f} ({pnl_percent:+.2f}%)\n\n"
+            f"**Options:**\n"
+            f"• Wait for TP to fill, then switch happens automatically\n"
+            f"• Manually close position on Aster DEX if urgent"
+        )
+
+        await self.telegram.send_message(alert_msg)
+
     async def switch_grid_side(self, new_side: str) -> None:
         """
         Switch grid direction (LONG/SHORT/BOTH).
@@ -1642,28 +1712,24 @@ class GridBot:
 
                     # Block switch if we have LONG position and switching to SHORT (or vice versa)
                     if old_side == "LONG" and new_side == "SHORT" and position_amt > 0:
-                        logger.warning(
-                            f"🚫 BLOCKED SIDE SWITCH: Have LONG position {position_amt} @ ${entry_price:.4f}. "
-                            f"Cannot switch to SHORT - would cause realized loss! Wait for TP to fill first."
-                        )
-                        await self.telegram.send_message(
-                            f"⚠️ Side Switch Blocked!\n\n"
-                            f"Cannot switch LONG → SHORT\n"
-                            f"Active position: {position_amt} @ ${entry_price:.4f}\n\n"
-                            f"Wait for TP to fill before switching."
+                        # Get detailed info for improved alert
+                        await self._send_switch_blocked_alert(
+                            pos_side="LONG",
+                            new_side=new_side,
+                            position_amt=position_amt,
+                            entry_price=entry_price,
+                            pos=pos
                         )
                         return
 
                     if old_side == "SHORT" and new_side == "LONG" and position_amt < 0:
-                        logger.warning(
-                            f"🚫 BLOCKED SIDE SWITCH: Have SHORT position {position_amt} @ ${entry_price:.4f}. "
-                            f"Cannot switch to LONG - would cause realized loss! Wait for TP to fill first."
-                        )
-                        await self.telegram.send_message(
-                            f"⚠️ Side Switch Blocked!\n\n"
-                            f"Cannot switch SHORT → LONG\n"
-                            f"Active position: {abs(position_amt)} @ ${entry_price:.4f}\n\n"
-                            f"Wait for TP to fill before switching."
+                        # Get detailed info for improved alert
+                        await self._send_switch_blocked_alert(
+                            pos_side="SHORT",
+                            new_side=new_side,
+                            position_amt=abs(position_amt),
+                            entry_price=entry_price,
+                            pos=pos
                         )
                         return
                     break
