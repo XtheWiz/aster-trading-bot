@@ -1748,9 +1748,10 @@ class StrategyManager:
         # Log status
         ftc = self.fast_trend_confirmation
         if ftc.pending_direction:
+            stochrsi_str = f"{stochrsi_k:.1f}" if stochrsi_k else "N/A"
             logger.info(
                 f"Point Confirmation: {ftc.get_status()} | "
-                f"Score={trend_score}, StochRSI={stochrsi_k:.1f if stochrsi_k else 'N/A'}, Vol={volume_ratio:.2f}"
+                f"Score={trend_score}, StochRSI={stochrsi_str}, Vol={volume_ratio:.2f}"
             )
 
             # Send Telegram notification on first signal (with cooldown to prevent spam)
@@ -1778,7 +1779,7 @@ class StrategyManager:
                     f"Current: {current_side}\n"
                     f"Recommended: {recommended}\n"
                     f"Score: {self.current_trend_score}\n"
-                    f"StochRSI: {stochrsi_k:.1f if stochrsi_k else 'N/A'}\n"
+                    f"StochRSI: {stochrsi_str}\n"
                     f"Volume: {volume_ratio:.2f}x\n\n"
                     f"Points: {ftc.accumulated_points}/{config.grid.SWITCH_THRESHOLD_POINTS}"
                 )
