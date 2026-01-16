@@ -402,7 +402,36 @@ git push origin main
 - Logs stored in `/app/logs/` on Railway (volume mounted)
 - SQLite DB: `grid_bot_trades.db`
 
-## Recent Updates (2026-01-15)
+## Recent Updates (2026-01-17)
+
+| Feature | Description |
+|---------|-------------|
+| **Bangkok Timezone** | All Telegram notifications now show Bangkok time (UTC+7) with `(BKK)` suffix |
+| **Strategy Guide** | Created `GRID_TRADING_STRATEGY_GUIDE.md` for HyperLiquid team |
+
+### Market Analysis Lessons (2026-01-17)
+
+**Scenario:** SOL spiked $140→$144, StochRSI at 94.5 (overbought), BTC bearish (-2)
+
+**Decision:** Keep LONG grid (don't chase)
+
+**Reasoning:**
+1. January uptrend intact (only 3% pullback from $148 high)
+2. Overbought = wait for pullback, not immediate SHORT
+3. Grid will buy dips at $141-142 (better entries)
+4. BTC divergence is warning, not exit signal
+
+**Key Takeaways:**
+- StochRSI > 80 = caution, not reversal signal
+- Low volume rallies (0.5x) lack conviction
+- Pullbacks in uptrends are entries, not exits
+- Always check BTC before altcoin decisions
+
+### Files Changed
+- `telegram_notifier.py` - Added `bangkok_now()` helper, `BANGKOK_TZ` constant
+- `telegram_commands.py` - Convert `/history` timestamps to Bangkok time
+
+## Updates (2026-01-15)
 
 | Feature | Description |
 |---------|-------------|
