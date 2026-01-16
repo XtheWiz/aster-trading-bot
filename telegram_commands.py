@@ -15,7 +15,7 @@ Commands:
 import asyncio
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Any, Callable, Coroutine, Optional
 
@@ -27,6 +27,9 @@ from config import config
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# Bangkok timezone (UTC+7)
+BANGKOK_TZ = timezone(timedelta(hours=7))
 
 
 class TelegramCommandHandler:
@@ -549,11 +552,13 @@ _Tip: Commands only work in the configured chat._
                 side_emoji = "🟢" if side == "BUY" else "🔴"
                 pnl_emoji = "💰" if pnl > 0 else "💸" if pnl < 0 else "➖"
                 
-                # Format timestamp
+                # Format timestamp (convert to Bangkok time)
                 if timestamp:
                     try:
                         dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                        time_str = dt.strftime("%m/%d %H:%M")
+                        # Convert to Bangkok timezone
+                        dt_bangkok = dt.astimezone(BANGKOK_TZ)
+                        time_str = dt_bangkok.strftime("%m/%d %H:%M")
                     except:
                         time_str = timestamp[:10] if len(timestamp) > 10 else timestamp
                 else:

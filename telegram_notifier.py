@@ -15,7 +15,7 @@ Setup:
 import asyncio
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Optional
 from dataclasses import dataclass
@@ -24,6 +24,14 @@ import aiohttp
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Bangkok timezone (UTC+7)
+BANGKOK_TZ = timezone(timedelta(hours=7))
+
+
+def bangkok_now() -> datetime:
+    """Get current time in Bangkok timezone."""
+    return datetime.now(BANGKOK_TZ)
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +209,7 @@ class TelegramNotifier:
 💰 *Balance:* `{balance:.2f} USDT`
 📈 *Leverage:* `{leverage}x`
 🔢 *Grids:* `{grid_count}`
-⏰ *Time:* `{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}`
+⏰ *Time:* `{bangkok_now().strftime("%Y-%m-%d %H:%M:%S")} (BKK)`
 
 _Bot is now running..._
 """
@@ -227,10 +235,10 @@ _Bot is now running..._
 🔄 *Total Trades:* `{total_trades}`
 {pnl_emoji} *Realized PnL:* `{realized_pnl:+.4f} USDT`
 💰 *Final Balance:* `{final_balance:.2f} USDT`
-⏰ *Time:* `{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}`
+⏰ *Time:* `{bangkok_now().strftime("%Y-%m-%d %H:%M:%S")} (BKK)`
 """
         self.queue_message(message.strip())
-    
+
     async def send_order_filled(
         self,
         side: str,
@@ -270,7 +278,7 @@ _Bot is now running..._
 ⚠️ *Reason:* `{reason}`
 📉 *Drawdown:* `{drawdown_pct:.2f}%`
 💰 *Balance:* `{current_balance:.2f} USDT`
-⏰ *Time:* `{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}`
+⏰ *Time:* `{bangkok_now().strftime("%Y-%m-%d %H:%M:%S")} (BKK)`
 
 _All orders canceled. Bot stopped._
 _Manual intervention required!_
@@ -350,10 +358,10 @@ _Manual intervention required!_
 
 ❌ *Type:* `{error_type}`
 📝 *Details:* `{details}`
-⏰ *Time:* `{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}`
+⏰ *Time:* `{bangkok_now().strftime("%Y-%m-%d %H:%M:%S")} (BKK)`
 """
         self.queue_message(message.strip())
-    
+
     # =========================================================================
     # ADVANCED MONITORING (5x Leverage)
     # =========================================================================
@@ -424,7 +432,7 @@ _Manual intervention required!_
 📊 *% of Max:* `{pct_of_max:.1f}%`
 💰 *Current Balance:* `${current_balance:.2f}`
 💵 *Initial Balance:* `${initial_balance:.2f}`
-⏰ *Time:* `{datetime.now().strftime("%H:%M:%S")}`
+⏰ *Time:* `{bangkok_now().strftime("%H:%M:%S")} (BKK)`
 
 _Monitor closely! Bot will stop at {max_drawdown}%_
 """
@@ -449,7 +457,7 @@ _Monitor closely! Bot will stop at {max_drawdown}%_
         roi_emoji = "📈" if roi >= 0 else "📉"
         
         message = f"""
-📅 *Daily Report* - {datetime.now().strftime("%Y-%m-%d")}
+📅 *Daily Report* - {bangkok_now().strftime("%Y-%m-%d")}
 
 🎯 *Symbol:* `{symbol}`
 ⏱️ *Runtime:* `{runtime_hours:.1f} hours`
