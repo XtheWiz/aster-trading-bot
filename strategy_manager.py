@@ -291,6 +291,11 @@ class StrategyManager:
         self.price_history: list[tuple[datetime, Decimal]] = []
         self.last_spike_alert: datetime | None = None
         self.spike_alert_cooldown = 60  # Seconds between alerts
+
+        # Trend signal alert cooldown (prevents repeated alerts during oscillation)
+        self.last_trend_signal_alert: datetime | None = None
+        self.last_trend_signal_direction: str | None = None
+        self.trend_signal_alert_cooldown = 900  # 15 minutes between same-direction alerts
         self._price_monitor_task: asyncio.Task | None = None
 
         # BTC Correlation Analysis
@@ -1748,8 +1753,26 @@ class StrategyManager:
                 f"Score={trend_score}, StochRSI={stochrsi_k:.1f if stochrsi_k else 'N/A'}, Vol={volume_ratio:.2f}"
             )
 
-            # Send Telegram notification on first signal
+            # Send Telegram notification on first signal (with cooldown to prevent spam)
+            should_alert = False
+            now = datetime.now()
+
             if len(ftc.points_history) == 1:
+                # First point for this direction - check cooldown
+                if self.last_trend_signal_alert is None:
+                    should_alert = True
+                elif ftc.pending_direction != self.last_trend_signal_direction:
+                    # Different direction - always alert
+                    should_alert = True
+                else:
+                    # Same direction - check cooldown
+                    seconds_since = (now - self.last_trend_signal_alert).total_seconds()
+                    if seconds_since >= self.trend_signal_alert_cooldown:
+                        should_alert = True
+
+            if should_alert:
+                self.last_trend_signal_alert = now
+                self.last_trend_signal_direction = ftc.pending_direction
                 await self.telegram.send_message(
                     f"🔄 Trend Signal (Point System)\n\n"
                     f"Current: {current_side}\n"

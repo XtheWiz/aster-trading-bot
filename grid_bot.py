@@ -1217,24 +1217,59 @@ class GridBot:
                 if has_tp:
                     continue
 
-                # Calculate TP price using Smart TP
-                if config.risk.USE_SMART_TP and config.risk.AUTO_TP_ENABLED:
+                # Calculate TP price - priority: Trailing TP > Smart TP > Default
+                tp_price = None
+                tp_percent = None
+                tp_mode = "default"
+
+                # Determine position side for Trailing TP
+                position_side = "LONG" if position_amt > 0 else "SHORT"
+
+                # 1. Try Trailing TP (SuperTrend) first
+                if config.risk.USE_TRAILING_TP:
+                    candles = await self.client.get_klines(
+                        symbol=config.trading.SYMBOL,
+                        interval="1h",
+                        limit=100
+                    )
+                    if candles:
+                        trailing_result = self.indicator_analyzer.get_trailing_tp(
+                            candles=candles,
+                            entry_price=entry_price,
+                            position_side=position_side,
+                            fallback_tp_percent=config.risk.FALLBACK_TP_PERCENT
+                        )
+                        if trailing_result.use_trailing:
+                            tp_price = self._round_price(trailing_result.trailing_stop)
+                            tp_mode = "trailing"
+                            logger.info(f"📈 SYNC Trailing TP (SuperTrend): ${tp_price:.4f} | {trailing_result.reason}")
+                        else:
+                            tp_price = self._round_price(trailing_result.fixed_tp)
+                            tp_mode = "fixed"
+                            logger.info(f"🎯 SYNC Fixed TP (waiting for trailing): ${tp_price:.4f} | {trailing_result.reason}")
+
+                # 2. Fallback to Smart TP if Trailing TP not available
+                if tp_price is None and config.risk.USE_SMART_TP and config.risk.AUTO_TP_ENABLED:
                     cached_analysis = self.strategy_manager.last_analysis
                     if cached_analysis and cached_analysis.rsi > 0:
                         tp_percent = await get_smart_tp(market_analysis=cached_analysis)
                     else:
                         tp_percent = config.risk.DEFAULT_TP_PERCENT
-                else:
-                    tp_percent = config.risk.DEFAULT_TP_PERCENT
+                    tp_mode = "smart"
 
-                # LONG: TP above entry (SELL higher), SHORT: TP below entry (BUY lower)
-                if position_amt > 0:
-                    # LONG position - TP is SELL at higher price
-                    tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
-                else:
-                    # SHORT position - TP is BUY at lower price
-                    tp_price = entry_price * (Decimal("1") - tp_percent / Decimal("100"))
-                tp_price = self._round_price(tp_price)
+                # 3. Final fallback to default
+                if tp_price is None and tp_percent is None:
+                    tp_percent = config.risk.DEFAULT_TP_PERCENT
+                    tp_mode = "default"
+
+                # Calculate TP price from percent if not set by Trailing TP
+                if tp_price is None:
+                    # LONG: TP above entry (SELL higher), SHORT: TP below entry (BUY lower)
+                    if position_amt > 0:
+                        tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
+                    else:
+                        tp_price = entry_price * (Decimal("1") - tp_percent / Decimal("100"))
+                    tp_price = self._round_price(tp_price)
 
                 # Place TP order
                 client_order_id = f"sync_tp_{int(datetime.now().timestamp())}"
@@ -1252,18 +1287,25 @@ class GridBot:
                 tp_side = "SELL" if position_amt > 0 else "BUY"
                 tp_sign = "+" if position_amt > 0 else "-"
 
+                # Calculate TP distance for logging
+                if tp_percent is not None:
+                    tp_info = f"{tp_sign}{tp_percent}%"
+                else:
+                    tp_distance = abs((tp_price - entry_price) / entry_price * 100)
+                    tp_info = f"{tp_sign}{tp_distance:.2f}% ({tp_mode})"
+
                 logger.info(
-                    f"🎯 SYNC TP PLACED: {tp_side} @ ${tp_price:.4f} ({tp_sign}{tp_percent}%) | "
+                    f"🎯 SYNC TP PLACED: {tp_side} @ ${tp_price:.4f} ({tp_info}) | "
                     f"Avg Entry: ${entry_price:.4f} | Qty: {position_qty} | OrderID: {order_id}"
                 )
 
                 # Send Telegram notification
-                position_side = "LONG" if position_amt > 0 else "SHORT"
                 await self.telegram.send_message(
                     f"🔄 Synced Existing Position ({position_side})\n\n"
                     f"Avg Entry: ${entry_price:.4f}\n"
-                    f"TP ({tp_side}): ${tp_price:.4f} ({tp_sign}{tp_percent}%)\n"
-                    f"Qty: {position_qty}\n\n"
+                    f"TP ({tp_side}): ${tp_price:.4f} ({tp_info})\n"
+                    f"Qty: {position_qty}\n"
+                    f"Mode: {tp_mode.capitalize()}\n\n"
                     f"TP based on total position avg entry"
                 )
 
