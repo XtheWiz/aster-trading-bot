@@ -1452,11 +1452,11 @@ class StrategyManager:
         symbol = symbol or config.trading.SYMBOL
         logger.info(f"Analyzing market for {symbol}...")
         
-        # 1. Fetch K-lines (Candles) - 1h interval
+        # 1. Fetch K-lines (Candles) - 15m interval for faster signal detection
         try:
             klines = await self.client.get_klines(
                 symbol=symbol,
-                interval="1h",
+                interval="15m",
                 limit=100
             )
             
