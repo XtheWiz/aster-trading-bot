@@ -345,6 +345,9 @@ class GridBot:
         
         # Harvest mode tracking
         self._initial_orders_placed = False
+
+        # Wait for clear signal before placing orders
+        self._waiting_for_clear_signal = False
         
         # Trade logging and notifications
         self.trade_logger = TradeLogger()
@@ -541,6 +544,11 @@ class GridBot:
         In HARVEST_MODE, initial orders may use MARKET type
         for airdrop point optimization.
         """
+        # Check if waiting for clear signal
+        if self._waiting_for_clear_signal:
+            logger.info("⏸️ Waiting for clear signal - skipping order placement")
+            return
+
         orders_placed = 0
         max_positions = config.risk.MAX_POSITIONS
 
@@ -1599,10 +1607,19 @@ class GridBot:
                 f"RSI:{trend_score.rsi_score:+d} Vol:{trend_score.volume_score:+d})"
             )
 
-            # If analysis is unclear (STAY), default to LONG (generally safer)
+            # If analysis is unclear (STAY), wait for clear signal
             if analysis_side == "STAY":
-                optimal_side = "LONG"
-                logger.info(f"Smart Startup: Analysis unclear, defaulting to {optimal_side}")
+                self._waiting_for_clear_signal = True
+                logger.info(f"Smart Startup: Analysis unclear (score={trend_score.total}), waiting for clear signal...")
+                logger.info("Smart Startup: ⏸️ No orders will be placed until trend is clear (score ≥+2 or ≤-2)")
+                await self.telegram.send_message(
+                    f"⏸️ Waiting for Clear Signal\n\n"
+                    f"Trend Score: {trend_score.total:+d} (unclear)\n"
+                    f"EMA:{trend_score.ema_score:+d} MACD:{trend_score.macd_score:+d} "
+                    f"RSI:{trend_score.rsi_score:+d} Vol:{trend_score.volume_score:+d}\n\n"
+                    f"No orders placed. Analyzing every 5 min..."
+                )
+                return  # Exit early, don't set grid side yet
             else:
                 optimal_side = analysis_side
                 logger.info(f"Smart Startup: Analysis recommends {optimal_side}")
@@ -2228,6 +2245,10 @@ class GridBot:
             
             # Start Auto Re-Grid Monitor
             asyncio.create_task(self._auto_regrid_monitor())
+
+            # Start Clear Signal Monitor (if waiting)
+            if self._waiting_for_clear_signal:
+                asyncio.create_task(self._wait_for_clear_signal_monitor())
             
             return True
             
@@ -2319,10 +2340,76 @@ class GridBot:
             
             await asyncio.sleep(60)  # Check every minute
     
+    async def _wait_for_clear_signal_monitor(self) -> None:
+        """
+        Monitor market until trend becomes clear, then start placing orders.
+
+        Logic:
+        1. Run every 5 minutes (CONFIRMATION_CHECK_INTERVAL)
+        2. Re-analyze market
+        3. If signal becomes clear (score ≥+2 or ≤-2), set grid side and place orders
+        """
+        interval_seconds = config.grid.CONFIRMATION_CHECK_INTERVAL  # 5 minutes
+
+        logger.info(f"Clear Signal Monitor started: checking every {interval_seconds // 60} min")
+
+        while self._waiting_for_clear_signal and not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(interval_seconds)
+
+                if self._shutdown_event.is_set():
+                    break
+
+                # Re-analyze market
+                analysis = await self.strategy_manager.analyze_market(config.trading.SYMBOL)
+                trend_score = self.strategy_manager.current_trend_score
+
+                if not trend_score:
+                    logger.warning("Clear Signal Monitor: No trend score, continuing to wait...")
+                    continue
+
+                logger.info(
+                    f"Clear Signal Monitor: Score={trend_score.total:+d} "
+                    f"(EMA:{trend_score.ema_score:+d} MACD:{trend_score.macd_score:+d} "
+                    f"RSI:{trend_score.rsi_score:+d} Vol:{trend_score.volume_score:+d})"
+                )
+
+                # Check if signal is now clear
+                if trend_score.total >= 2:
+                    optimal_side = "LONG"
+                elif trend_score.total <= -2:
+                    optimal_side = "SHORT"
+                else:
+                    logger.info(f"Clear Signal Monitor: Still unclear, waiting...")
+                    continue
+
+                # Signal is clear! Start placing orders
+                logger.info(f"✅ Clear Signal Monitor: Signal clear! Setting grid to {optimal_side}")
+                self._waiting_for_clear_signal = False
+                config.grid.GRID_SIDE = optimal_side
+
+                await self.telegram.send_message(
+                    f"✅ Clear Signal Detected!\n\n"
+                    f"Trend Score: {trend_score.total:+d}\n"
+                    f"Grid Side: {optimal_side}\n\n"
+                    f"Placing orders now..."
+                )
+
+                # Recalculate grid with new side and place orders
+                await self.calculate_grid()
+                await self.place_initial_orders()
+
+                logger.info(f"Clear Signal Monitor: Orders placed, monitor stopping")
+                break
+
+            except Exception as e:
+                logger.error(f"Clear Signal Monitor error: {e}")
+                await asyncio.sleep(60)
+
     async def _auto_regrid_monitor(self) -> None:
         """
         Monitor price drift and automatically reposition grid when needed.
-        
+
         Logic:
         1. Run every REGRID_CHECK_INTERVAL_MINUTES
         2. Calculate grid center from current levels
