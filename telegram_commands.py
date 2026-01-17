@@ -256,11 +256,19 @@ _Tip: Commands only work in the configured chat._
         if not self.bot:
             await self._send_message("❌ Bot reference not available")
             return
-        
+
         state = self.bot.state
         runtime = datetime.now() - state.start_time if state.start_time else None
         runtime_str = str(runtime).split('.')[0] if runtime else "N/A"
-        
+
+        # Fetch actual balance from exchange
+        try:
+            balances = await self.bot.client.get_account_balance()
+            usdf = next((b for b in balances if b["asset"] == "USDF"), None)
+            actual_balance = Decimal(usdf["availableBalance"]) if usdf else state.current_balance
+        except Exception:
+            actual_balance = state.current_balance
+
         message = f"""
 🤖 *Bot Status*
 
@@ -269,7 +277,7 @@ _Tip: Commands only work in the configured chat._
 ⏱️ *Runtime:* `{runtime_str}`
 🔢 *Total Trades:* `{state.total_trades}`
 📋 *Active Orders:* `{state.active_orders_count}`
-💰 *Balance:* `${state.current_balance:.2f}`
+💰 *Balance:* `${actual_balance:.2f}`
 📉 *Drawdown:* `{state.drawdown_percent:.2f}%`
 """
         await self._send_message(message.strip())
@@ -279,28 +287,44 @@ _Tip: Commands only work in the configured chat._
         if not self.bot:
             await self._send_message("❌ Bot reference not available")
             return
-        
+
         try:
             balances = await self.bot.client.get_account_balance()
-            
+
             usdf = next((b for b in balances if b["asset"] == "USDF"), None)
             usdt = next((b for b in balances if b["asset"] == "USDT"), None)
-            
-            usdf_balance = Decimal(usdf["availableBalance"]) if usdf else Decimal(0)
-            usdt_balance = Decimal(usdt["availableBalance"]) if usdt else Decimal(0)
-            
+
+            # Wallet balance (total including margin)
+            usdf_wallet = Decimal(usdf.get("balance", usdf.get("availableBalance", "0"))) if usdf else Decimal(0)
+            usdt_wallet = Decimal(usdt.get("balance", usdt.get("availableBalance", "0"))) if usdt else Decimal(0)
+
+            # Available balance (excluding margin in positions)
+            usdf_available = Decimal(usdf["availableBalance"]) if usdf else Decimal(0)
+            usdt_available = Decimal(usdt["availableBalance"]) if usdt else Decimal(0)
+
+            # Margin in use
+            usdf_margin = usdf_wallet - usdf_available
+            usdt_margin = usdt_wallet - usdt_available
+
             message = f"""
 💰 *Account Balance*
 
-💵 *USDF:* `${usdf_balance:.2f}`
-💲 *USDT:* `${usdt_balance:.2f}`
-📊 *Total:* `${usdf_balance + usdt_balance:.2f}`
+💵 *USDF*
+├ Wallet: `${usdf_wallet:.2f}`
+├ Available: `${usdf_available:.2f}`
+└ In Margin: `${usdf_margin:.2f}`
 
+💲 *USDT*
+├ Wallet: `${usdt_wallet:.2f}`
+├ Available: `${usdt_available:.2f}`
+└ In Margin: `${usdt_margin:.2f}`
+
+📊 *Total Wallet:* `${usdf_wallet + usdt_wallet:.2f}`
 🔒 *Initial:* `${self.bot.state.initial_balance:.2f}`
 📉 *Drawdown:* `{self.bot.state.drawdown_percent:.2f}%`
 """
             await self._send_message(message.strip())
-            
+
         except Exception as e:
             await self._send_message(f"❌ Error fetching balance: {e}")
     
@@ -388,19 +412,13 @@ _Tip: Commands only work in the configured chat._
 
 🟢 *BUY Orders:* {len(buy_orders)}
 """
-            for o in sorted(buy_orders, key=lambda x: Decimal(x["price"]), reverse=True)[:3]:
+            for o in sorted(buy_orders, key=lambda x: Decimal(x["price"]), reverse=True):
                 message += f"  └ `${Decimal(o['price']):.4f}` × `{Decimal(o['origQty']):.2f}`\n"
-            
-            if len(buy_orders) > 3:
-                message += f"  └ _...and {len(buy_orders) - 3} more_\n"
-            
+
             message += f"\n🔴 *SELL Orders:* {len(sell_orders)}\n"
-            for o in sorted(sell_orders, key=lambda x: Decimal(x["price"]))[:3]:
+            for o in sorted(sell_orders, key=lambda x: Decimal(x["price"])):
                 message += f"  └ `${Decimal(o['price']):.4f}` × `{Decimal(o['origQty']):.2f}`\n"
-            
-            if len(sell_orders) > 3:
-                message += f"  └ _...and {len(sell_orders) - 3} more_\n"
-            
+
             await self._send_message(message.strip())
             
         except Exception as e:
@@ -411,12 +429,21 @@ _Tip: Commands only work in the configured chat._
         if not self.bot:
             await self._send_message("❌ Bot reference not available")
             return
-        
+
         state = self.bot.state
         total = state.realized_pnl + state.unrealized_pnl
-        
+
+        # Fetch actual balance from exchange
+        try:
+            balances = await self.bot.client.get_account_balance()
+            usdf = next((b for b in balances if b["asset"] == "USDF"), None)
+            actual_balance = Decimal(usdf["availableBalance"]) if usdf else state.current_balance
+        except Exception:
+            actual_balance = state.current_balance
+
         pnl_emoji = "🟢" if total >= 0 else "🔴"
-        
+        roi = ((actual_balance - state.initial_balance) / state.initial_balance * 100) if state.initial_balance > 0 else Decimal(0)
+
         message = f"""
 💹 *Profit & Loss*
 
@@ -425,8 +452,8 @@ _Tip: Commands only work in the configured chat._
 {pnl_emoji} *Total:* `{total:+.4f} USDT`
 
 📊 *Initial:* `${state.initial_balance:.2f}`
-💰 *Current:* `${state.current_balance:.2f}`
-📈 *ROI:* `{((state.current_balance - state.initial_balance) / state.initial_balance * 100):+.2f}%`
+💰 *Current:* `${actual_balance:.2f}`
+📈 *ROI:* `{roi:+.2f}%`
 """
         await self._send_message(message.strip())
     
@@ -465,21 +492,29 @@ _Tip: Commands only work in the configured chat._
         if not self.bot:
             await self._send_message("❌ Bot reference not available")
             return
-        
+
         try:
             state = self.bot.state
             runtime = datetime.now() - state.start_time if state.start_time else None
-            
+
+            # Fetch actual balance from exchange
+            try:
+                balances = await self.bot.client.get_account_balance()
+                usdf = next((b for b in balances if b["asset"] == "USDF"), None)
+                actual_balance = Decimal(usdf["availableBalance"]) if usdf else state.current_balance
+            except Exception:
+                actual_balance = state.current_balance
+
             # Calculate stats
             total_trades = state.total_trades
             total_pnl = state.realized_pnl + state.unrealized_pnl
-            roi = (state.current_balance - state.initial_balance) / state.initial_balance * 100 if state.initial_balance > 0 else Decimal(0)
-            
+            roi = (actual_balance - state.initial_balance) / state.initial_balance * 100 if state.initial_balance > 0 else Decimal(0)
+
             # Get trades from database if available
             win_count = 0
             loss_count = 0
             avg_profit = Decimal(0)
-            
+
             if hasattr(self.bot, 'trade_logger') and self.bot.trade_logger:
                 try:
                     trades = await self.bot.trade_logger.get_recent_trades(100)
@@ -491,13 +526,13 @@ _Tip: Commands only work in the configured chat._
                             avg_profit = Decimal(str(sum(profits) / len(profits)))
                 except Exception as e:
                     logger.debug(f"Could not get trade stats: {e}")
-            
+
             win_rate = (win_count / (win_count + loss_count) * 100) if (win_count + loss_count) > 0 else 0
             runtime_str = str(runtime).split('.')[0] if runtime else "N/A"
-            
+
             pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
             roi_emoji = "📈" if roi >= 0 else "📉"
-            
+
             message = f"""
 📊 *Trading Statistics*
 
@@ -515,11 +550,11 @@ _Tip: Commands only work in the configured chat._
 💰 *Avg Profit:* `{avg_profit:+.4f} USDT`
 
 📊 *Current*
-💵 *Balance:* `${state.current_balance:.2f}`
+💵 *Balance:* `${actual_balance:.2f}`
 📉 *Drawdown:* `{state.drawdown_percent:.2f}%`
 """
             await self._send_message(message.strip())
-            
+
         except Exception as e:
             await self._send_message(f"❌ Error fetching stats: {e}")
     
