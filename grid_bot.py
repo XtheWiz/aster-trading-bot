@@ -639,6 +639,24 @@ class GridBot:
         
         self._initial_orders_placed = True
         logger.info(f"Total orders placed: {orders_placed}")
+
+        # Send Telegram notification for placed orders
+        if orders_placed > 0:
+            # Find price range of placed orders
+            placed_levels = [
+                level for level in self.state.levels
+                if level.order_id is not None and level.state in (GridLevelState.BUY_PLACED, GridLevelState.SELL_PLACED)
+            ]
+            if placed_levels:
+                prices = [level.price for level in placed_levels]
+                price_range = (min(prices), max(prices))
+                side = "BUY" if config.grid.GRID_SIDE == "LONG" else "SELL"
+                await self.telegram.send_orders_placed(
+                    orders_count=orders_placed,
+                    side=side,
+                    price_range=price_range,
+                    grid_side=config.grid.GRID_SIDE,
+                )
     
     async def cancel_all_orders(self) -> None:
         """Cancel all open orders for the trading symbol."""
@@ -2218,9 +2236,21 @@ class GridBot:
 
             if placed > 0:
                 logger.info(f"Placed {placed} new orders")
-                await self.telegram.send_message(
-                    f"📊 Placed `{placed}` new grid orders"
-                )
+                # Find price range of placed orders
+                placed_levels = [
+                    level for level in self.state.levels
+                    if level.order_id is not None and level.state in (GridLevelState.BUY_PLACED, GridLevelState.SELL_PLACED)
+                ]
+                if placed_levels:
+                    prices = [level.price for level in placed_levels]
+                    price_range = (min(prices), max(prices))
+                    side = "BUY" if config.grid.GRID_SIDE == "LONG" else "SELL"
+                    await self.telegram.send_orders_placed(
+                        orders_count=placed,
+                        side=side,
+                        price_range=price_range,
+                        grid_side=config.grid.GRID_SIDE,
+                    )
 
         except Exception as e:
             logger.error(f"Error ensuring max orders: {e}")

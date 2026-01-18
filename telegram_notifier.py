@@ -261,7 +261,30 @@ _Bot is now running..._
 🔢 *Grid Level:* `{grid_level}`
 """
         self.queue_message(message.strip())
-    
+
+    async def send_orders_placed(
+        self,
+        orders_count: int,
+        side: str,
+        price_range: tuple[Decimal, Decimal],
+        grid_side: str,
+    ) -> None:
+        """Send notification when grid orders are placed."""
+        if not self.config.NOTIFY_ORDERS:
+            return
+
+        emoji = "🟢" if side == "BUY" else "🔴"
+
+        message = f"""
+{emoji} *Grid Orders Placed*
+
+📊 *Orders:* `{orders_count}` × `{side}`
+💵 *Range:* `${price_range[0]:.2f}` - `${price_range[1]:.2f}`
+🎯 *Grid Side:* `{grid_side}`
+⏰ *Time:* `{bangkok_now().strftime("%H:%M:%S")} (BKK)`
+"""
+        self.queue_message(message.strip())
+
     async def send_circuit_breaker(
         self,
         reason: str,
