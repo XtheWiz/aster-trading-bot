@@ -287,6 +287,10 @@ class RiskConfig:
     # Minimum profit % before activating trailing mode
     # Until price moves this much, use fixed TP
     MIN_PROFIT_FOR_TRAILING: Decimal = Decimal("0.5")
+
+    # SuperTrend flip alert cooldown (seconds)
+    # Prevents spam when SuperTrend flips repeatedly in choppy markets
+    SUPERTREND_FLIP_ALERT_COOLDOWN: int = 3600  # 1 hour
     
     # Minimum balance to maintain (bot stops if balance falls below)
     MIN_BALANCE_USDT: Decimal = Decimal("50.0")

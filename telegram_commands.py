@@ -75,6 +75,7 @@ class TelegramCommandHandler:
             "grid": self._cmd_grid,
             "stats": self._cmd_stats,
             "history": self._cmd_history,
+            "close": self._cmd_close,
             "help": self._cmd_help,
         }
     
@@ -246,6 +247,7 @@ class TelegramCommandHandler:
 🔹 /grid - Grid levels
 🔹 /stats - Trading statistics
 🔹 /history - Recent trades
+🔹 /close - Close all positions
 
 _Tip: Commands only work in the configured chat._
 """
@@ -606,6 +608,36 @@ _Tip: Commands only work in the configured chat._
             
         except Exception as e:
             await self._send_message(f"❌ Error fetching history: {e}")
+
+    async def _cmd_close(self) -> None:
+        """Close all open positions with market orders."""
+        if not self.bot:
+            await self._send_message("❌ Bot reference not available")
+            return
+
+        try:
+            # Call the bot's close_all_positions method
+            result = await self.bot.close_all_positions()
+
+            if result["success"]:
+                if result["closed_count"] == 0:
+                    await self._send_message("✅ No positions to close")
+                else:
+                    message = f"""
+✅ *Positions Closed*
+
+📊 Closed: `{result['closed_count']}` position(s)
+💵 Quantity: `{result['total_quantity']:.4f}`
+💰 Realized PnL: `{result['realized_pnl']:+.4f}`
+
+Grid levels have been reset.
+"""
+                    await self._send_message(message.strip())
+            else:
+                await self._send_message(f"❌ Error closing positions: {result['error']}")
+
+        except Exception as e:
+            await self._send_message(f"❌ Error: {e}")
 
 
 # Test the command handler

@@ -306,6 +306,7 @@ Graduated protection against position drawdowns:
 | `/grid` | Grid configuration |
 | `/stats` | Trading statistics |
 | `/history` | Recent trade history |
+| `/close` | Close all positions (market order) |
 | `/help` | All available commands |
 
 ## Alert Types
@@ -382,6 +383,21 @@ DRY_RUN=false
 LOG_LEVEL=INFO
 ```
 
+## IMPORTANT: Claude Instructions
+
+### Before Git Operations (add, commit, push)
+
+**ALWAYS ask the user about the `DRY_RUN` flag before performing git add, commit, or push:**
+
+> "Before I commit and push, should `DRY_RUN` in `.env` be set to `true` or `false`?"
+
+**Why:** Setting `DRY_RUN=true` prevents the bot from clearing existing orders and positions on Railway deployment. This is critical when the user wants to deploy code changes without disrupting active trades.
+
+| DRY_RUN | Behavior on Deploy |
+|---------|-------------------|
+| `false` | Bot will cancel all orders and place new grid (normal operation) |
+| `true` | Bot runs in simulation mode, existing orders/positions preserved |
+
 ## Railway Deployment
 
 ```bash
@@ -402,7 +418,63 @@ git push origin main
 - Logs stored in `/app/logs/` on Railway (volume mounted)
 - SQLite DB: `grid_bot_trades.db`
 
-## Recent Updates (2026-01-17)
+## Recent Updates (2026-01-19)
+
+| Feature | Description |
+|---------|-------------|
+| **SuperTrend Alert Cooldown** | Reduces alert spam in choppy markets (1 hour cooldown) |
+| **Smart Alerts** | SuperTrend flip alerts now include market context and action suggestions |
+| **Market Regime Detection** | Hourly summary shows market regime (Trending/Ranging/Choppy) with recommendations |
+| **`/close` Command** | Close all positions via Telegram with market orders |
+| **External Close Detection** | Bot detects manual position closes and resets grid levels |
+| **Auto Re-order** | After external close, bot places new orders to reach max limit |
+
+### Smart Alert Example
+```
+⚠️ SuperTrend Flip (Bearish)
+
+📊 Market Context
+├ Price: $142.00
+├ Trend Score: +1 (Choppy (Low Vol))
+├ Volume: 0.3x
+└ uPnL: +0.50
+
+📈 Position
+├ Side: LONG
+└ Count: 1
+
+💡 Choppy market - wait for clarity
+
+Reply /close to close all positions
+```
+
+### Market Regime Categories
+| Regime | Condition | Recommendation |
+|--------|-----------|----------------|
+| Strong Trend | Score ≥ ±3 | Follow trend |
+| Trending | Score ≥ ±2 | Grid optimal |
+| Ranging | Score < ±2, Vol > 0.5x | Grid optimal |
+| Choppy (Low Vol) | Vol < 0.5x | Reduce exposure |
+| High Volatility | ATR > 5% | Widen grid or pause |
+
+### New Config Options
+```python
+# In RiskConfig
+SUPERTREND_FLIP_ALERT_COOLDOWN: int = 3600  # 1 hour (seconds)
+```
+
+### Files Changed
+- `config.py` - Added `SUPERTREND_FLIP_ALERT_COOLDOWN`
+- `grid_bot.py` - Added `close_all_positions()`, `_handle_external_position_close()`, `_ensure_max_orders()`
+- `grid_bot.py` - Enhanced `on_position_update()` for external close detection
+- `grid_bot.py` - Enhanced SuperTrend flip alerts with market context
+- `grid_bot.py` - Enhanced hourly summary with market regime detection
+- `telegram_commands.py` - Added `/close` command
+- `telegram_notifier.py` - Enhanced hourly summary display
+
+---
+
+## Updates (2026-01-17)
 
 | Feature | Description |
 |---------|-------------|

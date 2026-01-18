@@ -238,6 +238,12 @@ class GridState:
 
     # Timing
     start_time: datetime | None = None
+
+    # SuperTrend flip alert cooldown tracking
+    last_supertrend_flip_alert: datetime | None = None
+
+    # Manual position close detection
+    last_known_position_amt: Decimal = Decimal("0")
     
     @property
     def drawdown_percent(self) -> Decimal:
@@ -650,7 +656,113 @@ class GridBot:
             logger.info("All orders canceled")
         except AsterAPIError as e:
             logger.error(f"Failed to cancel all orders: {e}")
-    
+
+    async def close_all_positions(self) -> dict:
+        """
+        Close all open positions with market orders.
+        Called by Telegram /close command.
+
+        Returns:
+            dict with keys:
+            - success: bool
+            - closed_count: int
+            - total_quantity: Decimal
+            - realized_pnl: Decimal
+            - error: str (if failed)
+        """
+        result = {
+            "success": False,
+            "closed_count": 0,
+            "total_quantity": Decimal("0"),
+            "realized_pnl": Decimal("0"),
+            "error": None
+        }
+
+        try:
+            # First cancel all pending orders
+            await self.cancel_all_orders()
+
+            # Get actual positions from exchange
+            positions = await self.client.get_position_risk(config.trading.SYMBOL)
+
+            closed_count = 0
+            total_qty = Decimal("0")
+            total_pnl = Decimal("0")
+
+            for pos in positions:
+                position_amt = Decimal(pos.get("positionAmt", "0"))
+                if position_amt == 0:
+                    continue
+
+                entry_price = Decimal(pos.get("entryPrice", "0"))
+
+                # Determine close order side (opposite of position)
+                close_side = "SELL" if position_amt > 0 else "BUY"
+                close_qty = abs(position_amt)
+
+                logger.info(
+                    f"Closing position: {close_side} {close_qty} @ MARKET | "
+                    f"Entry: ${entry_price:.4f}"
+                )
+
+                # Place market order to close
+                order_result = await self.client.place_order(
+                    symbol=config.trading.SYMBOL,
+                    side=close_side,
+                    order_type="MARKET",
+                    quantity=close_qty,
+                    reduce_only=True
+                )
+
+                if order_result:
+                    # Get fill price from order result
+                    fill_price = Decimal(order_result.get("avgPrice", "0"))
+                    if fill_price == 0:
+                        # Estimate from current market price
+                        ticker = await self.client.get_ticker_price(config.trading.SYMBOL)
+                        fill_price = Decimal(ticker["price"])
+
+                    # Calculate PnL
+                    if position_amt > 0:  # LONG position
+                        pnl = (fill_price - entry_price) * close_qty
+                    else:  # SHORT position
+                        pnl = (entry_price - fill_price) * close_qty
+
+                    total_pnl += pnl
+                    total_qty += close_qty
+                    closed_count += 1
+
+                    logger.info(
+                        f"Position closed: {close_qty} @ ${fill_price:.4f} | "
+                        f"PnL: {pnl:+.4f}"
+                    )
+
+            # Reset all grid levels that were holding positions
+            for level in self.state.levels:
+                if level.state in (GridLevelState.POSITION_HELD, GridLevelState.TP_PLACED):
+                    level.reset()
+
+            # Update state tracking
+            self.state.realized_pnl += total_pnl
+            self.state.daily_realized_pnl += total_pnl
+            self.state.last_known_position_amt = Decimal("0")
+
+            result["success"] = True
+            result["closed_count"] = closed_count
+            result["total_quantity"] = total_qty
+            result["realized_pnl"] = total_pnl
+
+            logger.info(
+                f"All positions closed: {closed_count} positions | "
+                f"Qty: {total_qty:.4f} | PnL: {total_pnl:+.4f}"
+            )
+
+        except Exception as e:
+            logger.error(f"Error closing positions: {e}")
+            result["error"] = str(e)
+
+        return result
+
     async def rebalance_on_fill(
         self,
         filled_level: GridLevel,
@@ -1978,21 +2090,140 @@ class GridBot:
                     logger.info(f"Partial fill too small ({notional:.2f} < {self.min_notional}), skipping")
     
     def on_position_update(self, position_data: dict) -> None:
-        """Handle position update from WebSocket."""
+        """
+        Handle position update from WebSocket.
+
+        Detects manual position closes (when position goes from non-zero to zero)
+        and resets grid levels accordingly.
+        """
         symbol = position_data.get("s")
         if symbol != config.trading.SYMBOL:
             return
-        
+
         position_amt = Decimal(position_data.get("pa", "0"))
         entry_price = Decimal(position_data.get("ep", "0"))
         unrealized_pnl = Decimal(position_data.get("up", "0"))
-        
+
         self.state.unrealized_pnl = unrealized_pnl
-        
+
+        # Detect manual position close (position went from non-zero to zero)
+        last_known = self.state.last_known_position_amt
+        if last_known != 0 and position_amt == 0:
+            logger.warning(
+                f"⚠️ Position closed externally | "
+                f"Previous: {last_known} → Current: 0"
+            )
+            # Schedule grid reset (can't await in callback)
+            asyncio.create_task(self._handle_external_position_close())
+
+        # Update last known position amount
+        self.state.last_known_position_amt = position_amt
+
         logger.debug(
             f"Position: {position_amt} @ {entry_price:.4f} | "
             f"uPnL: {unrealized_pnl:.4f}"
         )
+
+    async def _handle_external_position_close(self) -> None:
+        """
+        Handle external position close (manual close on exchange).
+
+        Resets grid levels that were holding positions and optionally
+        re-places buy orders to reach max orders limit.
+        """
+        try:
+            # Count levels that need to be reset
+            levels_to_reset = [
+                level for level in self.state.levels
+                if level.state in (GridLevelState.POSITION_HELD, GridLevelState.TP_PLACED)
+            ]
+
+            if not levels_to_reset:
+                logger.info("No grid levels to reset after external close")
+                return
+
+            logger.info(f"Resetting {len(levels_to_reset)} grid levels after external close")
+
+            # Reset grid levels
+            for level in levels_to_reset:
+                level.reset()
+
+            # Notify via Telegram
+            await self.telegram.send_message(
+                f"🔄 *External Position Close Detected*\n\n"
+                f"Positions closed: `{len(levels_to_reset)}`\n"
+                f"Grid levels reset to EMPTY\n\n"
+                f"Bot will place new orders on next cycle."
+            )
+
+            # Trigger a re-check to place new orders
+            # This ensures bot reaches max order limit
+            await asyncio.sleep(2)  # Brief delay for exchange to update
+            await self._ensure_max_orders()
+
+        except Exception as e:
+            logger.error(f"Error handling external position close: {e}")
+
+    async def _ensure_max_orders(self) -> None:
+        """
+        Ensure bot has placed orders up to max limit.
+
+        Called after external position close to re-fill empty grid levels.
+        """
+        try:
+            # Count current active orders
+            active_orders = sum(1 for level in self.state.levels if level.order_id is not None)
+            max_orders = config.grid.MAX_OPEN_ORDERS
+
+            if active_orders >= max_orders:
+                logger.debug(f"Already at max orders: {active_orders}/{max_orders}")
+                return
+
+            # Get current price
+            ticker = await self.client.get_ticker_price(config.trading.SYMBOL)
+            current_price = Decimal(ticker["price"])
+
+            # Find empty levels that should have orders
+            empty_levels = [
+                level for level in self.state.levels
+                if level.state == GridLevelState.EMPTY and level.order_id is None
+            ]
+
+            # Sort by distance to current price (closest first)
+            empty_levels.sort(key=lambda l: abs(l.price - current_price))
+
+            orders_to_place = min(len(empty_levels), max_orders - active_orders)
+
+            if orders_to_place <= 0:
+                return
+
+            logger.info(f"Placing {orders_to_place} new orders after external close")
+
+            placed = 0
+            for level in empty_levels[:orders_to_place]:
+                try:
+                    # Determine side based on grid configuration
+                    if config.grid.GRID_SIDE == "LONG":
+                        # For LONG grid, buy below current price
+                        if level.price < current_price:
+                            await self._place_grid_order(level, "BUY")
+                            placed += 1
+                    else:
+                        # For SHORT grid, sell above current price
+                        if level.price > current_price:
+                            await self._place_grid_order(level, "SELL")
+                            placed += 1
+                except Exception as e:
+                    logger.warning(f"Failed to place order at level {level.index}: {e}")
+
+            if placed > 0:
+                logger.info(f"Placed {placed} new orders")
+                await self.telegram.send_message(
+                    f"📊 Placed `{placed}` new grid orders"
+                )
+
+        except Exception as e:
+            logger.error(f"Error ensuring max orders: {e}")
     
     def on_balance_update(self, balance_data: dict) -> None:
         """Handle balance update from WebSocket."""
@@ -2199,6 +2430,15 @@ class GridBot:
             self.state.daily_start_time = datetime.now()
             self.state.daily_realized_pnl = Decimal("0")
 
+            # Initialize position tracking for external close detection
+            positions = await self.client.get_position_risk(config.trading.SYMBOL)
+            for pos in positions:
+                position_amt = Decimal(pos.get("positionAmt", "0"))
+                if position_amt != 0:
+                    self.state.last_known_position_amt = position_amt
+                    logger.info(f"Existing position detected: {position_amt}")
+                    break
+
             # Smart Startup: Check if we should switch grid side immediately
             # This runs analysis and switches if no position is blocking
             await self._smart_startup_side_check()
@@ -2320,14 +2560,41 @@ class GridBot:
                 market_status = None
                 if self.strategy_manager.last_analysis:
                     analysis = self.strategy_manager.last_analysis
+
+                    # Determine market regime and recommendation
+                    volume_ratio = getattr(analysis, 'volume_ratio', 0.0)
+                    trend_score = analysis.trend_score
+                    atr_percent = getattr(analysis, 'atr_percent', 0.0)
+
+                    # Market regime detection
+                    if atr_percent > 5:
+                        market_regime = "High Volatility"
+                        recommendation = "Widen grid or pause"
+                    elif abs(trend_score) >= 3:
+                        market_regime = "Strong Trend"
+                        recommendation = "Follow trend"
+                    elif abs(trend_score) >= 2:
+                        market_regime = "Trending"
+                        recommendation = "Grid optimal"
+                    elif volume_ratio < 0.5:
+                        market_regime = "Choppy (Low Vol)"
+                        recommendation = "Reduce exposure"
+                    else:
+                        market_regime = "Ranging"
+                        recommendation = "Grid optimal"
+
                     market_status = {
                         "state": analysis.state.value,
                         "trend_score": analysis.trend_score,
                         "rsi": analysis.rsi,
                         "price": float(analysis.current_price),
                         "current_side": config.grid.GRID_SIDE,
+                        "volume_ratio": volume_ratio,
+                        "atr_percent": atr_percent,
+                        "market_regime": market_regime,
+                        "recommendation": recommendation,
                     }
-                
+
                 await self.telegram.send_hourly_summary(
                     trades_count=self.state.total_trades,
                     realized_pnl=self.state.realized_pnl,
@@ -2567,6 +2834,47 @@ class GridBot:
 
             position_side = "LONG" if config.grid.GRID_SIDE == "LONG" else "SHORT"
 
+            # Check cooldown for SuperTrend flip alerts (prevent spam)
+            cooldown_seconds = config.risk.SUPERTREND_FLIP_ALERT_COOLDOWN
+            can_send_flip_alert = (
+                self.state.last_supertrend_flip_alert is None or
+                (now - self.state.last_supertrend_flip_alert).total_seconds() >= cooldown_seconds
+            )
+
+            # Pre-fetch market context for smart alerts (only if alert will be sent)
+            trend_score = None
+            volume_ratio = 0.0
+            market_regime = "Unknown"
+            suggestion = ""
+
+            if can_send_flip_alert:
+                try:
+                    # Get trend analysis for context
+                    analysis = await self.indicator_analyzer.analyze(config.trading.SYMBOL)
+                    if analysis:
+                        trend_score = analysis.trend_score
+                        volume_ratio = analysis.volume_ratio
+
+                        # Determine market regime
+                        if abs(trend_score) >= 2:
+                            market_regime = "Trending"
+                        elif volume_ratio < 0.5:
+                            market_regime = "Choppy (Low Vol)"
+                        else:
+                            market_regime = "Ranging"
+
+                        # Smart suggestion based on conditions
+                        if self.state.unrealized_pnl > 0:
+                            suggestion = "💡 Position profitable - consider closing"
+                        elif volume_ratio < 0.5 and abs(trend_score) < 2:
+                            suggestion = "💡 Choppy market - wait for clarity"
+                        elif abs(trend_score) >= 2:
+                            suggestion = "💡 Strong trend - monitor closely"
+                        else:
+                            suggestion = "💡 Mixed signals - use caution"
+                except Exception as e:
+                    logger.debug(f"Could not fetch market context: {e}")
+
             for level in levels_due_for_update:
                 try:
                     # Check for SuperTrend direction flip (immediate exit signal)
@@ -2575,12 +2883,25 @@ class GridBot:
                             f"⚠️ SuperTrend flipped BEARISH - Level {level.index} | "
                             f"Consider closing position"
                         )
-                        await self.telegram.send_message(
-                            f"⚠️ SuperTrend Flip (Bearish)\n"
-                            f"Level: {level.index}\n"
-                            f"Current Price: ${current_price:.4f}\n"
-                            f"Consider manual exit or wait for TP"
-                        )
+                        # Only send Telegram alert if cooldown has passed
+                        if can_send_flip_alert:
+                            msg = (
+                                f"⚠️ *SuperTrend Flip (Bearish)*\n\n"
+                                f"📊 *Market Context*\n"
+                                f"├ Price: `${current_price:.2f}`\n"
+                                f"├ Trend Score: `{trend_score:+d}` ({market_regime})\n"
+                                f"├ Volume: `{volume_ratio:.1f}x`\n"
+                                f"└ uPnL: `{self.state.unrealized_pnl:+.2f}`\n\n"
+                                f"📈 *Position*\n"
+                                f"├ Side: `LONG`\n"
+                                f"└ Count: `{self.state.positions_count}`\n\n"
+                                f"{suggestion}\n\n"
+                                f"Reply `/close` to close all positions\n"
+                                f"_(Next alert in {cooldown_seconds // 60} min)_"
+                            )
+                            await self.telegram.send_message(msg)
+                            self.state.last_supertrend_flip_alert = now
+                            can_send_flip_alert = False  # Only one alert per batch
                         level.last_tp_update = now
                         continue
 
@@ -2589,12 +2910,25 @@ class GridBot:
                             f"⚠️ SuperTrend flipped BULLISH - Level {level.index} | "
                             f"Consider closing position"
                         )
-                        await self.telegram.send_message(
-                            f"⚠️ SuperTrend Flip (Bullish)\n"
-                            f"Level: {level.index}\n"
-                            f"Current Price: ${current_price:.4f}\n"
-                            f"Consider manual exit or wait for TP"
-                        )
+                        # Only send Telegram alert if cooldown has passed
+                        if can_send_flip_alert:
+                            msg = (
+                                f"⚠️ *SuperTrend Flip (Bullish)*\n\n"
+                                f"📊 *Market Context*\n"
+                                f"├ Price: `${current_price:.2f}`\n"
+                                f"├ Trend Score: `{trend_score:+d}` ({market_regime})\n"
+                                f"├ Volume: `{volume_ratio:.1f}x`\n"
+                                f"└ uPnL: `{self.state.unrealized_pnl:+.2f}`\n\n"
+                                f"📈 *Position*\n"
+                                f"├ Side: `SHORT`\n"
+                                f"└ Count: `{self.state.positions_count}`\n\n"
+                                f"{suggestion}\n\n"
+                                f"Reply `/close` to close all positions\n"
+                                f"_(Next alert in {cooldown_seconds // 60} min)_"
+                            )
+                            await self.telegram.send_message(msg)
+                            self.state.last_supertrend_flip_alert = now
+                            can_send_flip_alert = False  # Only one alert per batch
                         level.last_tp_update = now
                         continue
 

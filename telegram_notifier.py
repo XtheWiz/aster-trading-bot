@@ -310,18 +310,20 @@ _Manual intervention required!_
             current_side = market_status.get("current_side", "LONG")
             rsi = market_status.get("rsi", 0)
             price = market_status.get("price", 0)
-            
-            # State emoji
-            state_emojis = {
-                "RANGING_STABLE": "✅",
-                "RANGING_VOLATILE": "⚠️",
-                "TRENDING_UP": "📈",
-                "TRENDING_DOWN": "📉",
-                "EXTREME_VOLATILITY": "🚨",
-                "UNKNOWN": "❓",
+            volume_ratio = market_status.get("volume_ratio", 0)
+            market_regime = market_status.get("market_regime", "Unknown")
+            recommendation = market_status.get("recommendation", "")
+
+            # Market regime emoji
+            regime_emojis = {
+                "Strong Trend": "🚀",
+                "Trending": "📈",
+                "Ranging": "↔️",
+                "Choppy (Low Vol)": "⚠️",
+                "High Volatility": "🚨",
             }
-            state_emoji = state_emojis.get(state, "📊")
-            
+            regime_emoji = regime_emojis.get(market_regime, "📊")
+
             # Trend score display
             if trend_score > 0:
                 score_emoji = "🟢"
@@ -329,14 +331,17 @@ _Manual intervention required!_
                 score_emoji = "🔴"
             else:
                 score_emoji = "⚪"
-            
+
             market_section = f"""
-🌍 *Market Status:*
-├ {state_emoji} State: `{state}`
-├ {score_emoji} Trend Score: `{trend_score:+d}`
+🌍 *Market Status*
+├ {regime_emoji} Regime: `{market_regime}`
+├ {score_emoji} Trend: `{trend_score:+d}`
 ├ 📊 RSI: `{rsi:.1f}`
+├ 📈 Volume: `{volume_ratio:.1f}x`
 ├ 💵 Price: `${price:.2f}`
-└ 🎯 Grid Side: `{current_side}`
+└ 🎯 Grid: `{current_side}`
+
+💡 *{recommendation}*
 """
         
         message = f"""
