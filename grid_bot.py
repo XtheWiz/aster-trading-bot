@@ -2693,8 +2693,18 @@ class GridBot:
                 )
 
                 # Recalculate grid with new side and place orders
-                await self.calculate_grid()
-                await self.place_initial_orders()
+                ticker = await self.client.get_ticker_price(config.trading.SYMBOL)
+                current_price = Decimal(str(ticker.get("price", 0)))
+
+                # Calculate dynamic grid range
+                grid_range = await self.get_dynamic_grid_range(current_price)
+
+                # Recalculate grid levels
+                self.state.entry_price = current_price
+                self.state.levels = self.calculate_grid_levels(current_price, grid_range)
+
+                # Place orders
+                await self.place_grid_orders()
 
                 logger.info(f"Clear Signal Monitor: Orders placed, monitor stopping")
                 break
