@@ -2882,7 +2882,7 @@ class GridBot:
             )
 
             # Pre-fetch market context for smart alerts (only if alert will be sent)
-            trend_score = None
+            trend_score = 0  # Default to 0 (neutral) instead of None
             volume_ratio = 0.0
             market_regime = "Unknown"
             suggestion = ""
@@ -2891,7 +2891,7 @@ class GridBot:
                 try:
                     # Get trend analysis for context
                     analysis = await self.indicator_analyzer.analyze(config.trading.SYMBOL)
-                    if analysis:
+                    if analysis and analysis.trend_score is not None:
                         trend_score = analysis.trend_score
                         volume_ratio = analysis.volume_ratio
 
