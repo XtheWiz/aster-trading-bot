@@ -971,11 +971,17 @@ class GridBot:
             positions = await self.client.get_position_risk(config.trading.SYMBOL)
             total_entry_price = Decimal("0")
 
+            actual_position_side = None
             for pos in positions:
                 if pos.get("symbol") == config.trading.SYMBOL:
                     pos_amt = Decimal(pos.get("positionAmt", "0"))
                     if pos_amt > 0:  # LONG position
                         total_entry_price = Decimal(pos.get("entryPrice", "0"))
+                        actual_position_side = "LONG"
+                        break
+                    elif pos_amt < 0:  # SHORT position
+                        total_entry_price = Decimal(pos.get("entryPrice", "0"))
+                        actual_position_side = "SHORT"
                         break
 
             # Use total position entry if available, otherwise use level entry
@@ -995,8 +1001,8 @@ class GridBot:
             atr_percent = 0.0
             tp_mode = "fixed"  # "fixed" or "trailing"
 
-            # Determine position side for trailing TP
-            position_side = "LONG" if config.grid.GRID_SIDE == "LONG" else "SHORT"
+            # Determine position side for trailing TP - use ACTUAL position side, not config
+            position_side = actual_position_side if actual_position_side else ("LONG" if config.grid.GRID_SIDE == "LONG" else "SHORT")
 
             # Check if trailing TP is enabled
             if config.risk.USE_TRAILING_TP:
@@ -1036,7 +1042,10 @@ class GridBot:
                 else:
                     # No candles - use fallback
                     tp_percent = config.risk.FALLBACK_TP_PERCENT
-                    tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
+                    if position_side == "LONG":
+                        tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
+                    else:  # SHORT
+                        tp_price = entry_price * (Decimal("1") - tp_percent / Decimal("100"))
                     tp_price = self._round_price(tp_price)
                     logger.warning(f"No candle data for trailing TP, using fallback: {tp_percent}%")
 
@@ -1065,11 +1074,17 @@ class GridBot:
                         tp_percent = config.risk.DEFAULT_TP_PERCENT
                         logger.warning(f"No candle data, using default TP: {tp_percent}%")
 
-                tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
+                if position_side == "LONG":
+                    tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
+                else:  # SHORT
+                    tp_price = entry_price * (Decimal("1") - tp_percent / Decimal("100"))
                 tp_price = self._round_price(tp_price)
             else:
                 tp_percent = config.risk.DEFAULT_TP_PERCENT
-                tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
+                if position_side == "LONG":
+                    tp_price = entry_price * (Decimal("1") + tp_percent / Decimal("100"))
+                else:  # SHORT
+                    tp_price = entry_price * (Decimal("1") - tp_percent / Decimal("100"))
                 tp_price = self._round_price(tp_price)
                 logger.info(f"Smart TP disabled, using default: {tp_percent}%")
 
@@ -1078,23 +1093,26 @@ class GridBot:
             
             # Generate client order ID
             client_order_id = f"tp_{filled_level.index}_{int(datetime.now().timestamp())}"
-            
-            # Place SELL order at TP price
+
+            # Determine TP order side: LONG position closes with SELL, SHORT position closes with BUY
+            tp_order_side = "SELL" if position_side == "LONG" else "BUY"
+
+            # Place TP order
             response = await self.client.place_order(
                 symbol=config.trading.SYMBOL,
-                side="SELL",
+                side=tp_order_side,
                 order_type="LIMIT",
                 quantity=quantity,
                 price=tp_price,
                 client_order_id=client_order_id,
             )
-            
+
             order_id = response.get("orderId")
 
-            # Store TP order info separately from BUY order
+            # Store TP order info separately from entry order
             filled_level.tp_order_id = order_id
             filled_level.state = GridLevelState.TP_PLACED
-            filled_level.side = OrderSide.SELL
+            filled_level.side = OrderSide.SELL if position_side == "LONG" else OrderSide.BUY
             filled_level.client_order_id = client_order_id
             # Keep order_id pointing to TP for backward compatibility with get_level_by_order_id
             filled_level.order_id = order_id
@@ -1103,32 +1121,37 @@ class GridBot:
             filled_level.tp_target_price = tp_price
             filled_level.last_tp_update = datetime.now()
 
-            # Calculate TP percentage for logging
+            # Calculate TP percentage for logging (always show as positive profit %)
             if 'tp_percent' not in dir() or tp_percent is None:
-                tp_percent = ((tp_price - entry_price) / entry_price) * 100
+                if position_side == "LONG":
+                    tp_percent = ((tp_price - entry_price) / entry_price) * 100
+                else:  # SHORT - profit when price goes down
+                    tp_percent = ((entry_price - tp_price) / entry_price) * 100
 
             # Different log messages based on TP mode
             if tp_mode == "trailing":
                 logger.info(
-                    f"📈 TRAILING TP PLACED: SELL @ ${tp_price:.4f} (+{tp_percent:.2f}%) | "
+                    f"📈 TRAILING TP PLACED: {tp_order_side} @ ${tp_price:.4f} (+{tp_percent:.2f}%) | "
                     f"Avg Entry: ${entry_price:.4f} | Qty: {quantity} | OrderID: {order_id}"
                 )
                 await self.telegram.send_message(
                     f"📈 Trailing TP Placed (SuperTrend)!\n"
+                    f"Position: {position_side}\n"
                     f"Avg Entry: ${entry_price:.4f}\n"
-                    f"TP: ${tp_price:.4f} (+{tp_percent:.2f}%)\n"
+                    f"TP ({tp_order_side}): ${tp_price:.4f} (+{tp_percent:.2f}%)\n"
                     f"Qty: {quantity}\n"
                     f"Mode: Trailing (will update as price moves)"
                 )
             else:
                 logger.info(
-                    f"🎯 SMART TP PLACED: SELL @ ${tp_price:.4f} (+{tp_percent}%) | "
+                    f"🎯 SMART TP PLACED: {tp_order_side} @ ${tp_price:.4f} (+{tp_percent:.2f}%) | "
                     f"Avg Entry: ${entry_price:.4f} | Qty: {quantity} | OrderID: {order_id}"
                 )
                 await self.telegram.send_message(
                     f"🎯 Smart TP Placed!\n"
+                    f"Position: {position_side}\n"
                     f"Avg Entry: ${entry_price:.4f}\n"
-                    f"TP: ${tp_price:.4f} (+{tp_percent}%)\n"
+                    f"TP ({tp_order_side}): ${tp_price:.4f} (+{tp_percent:.2f}%)\n"
                     f"Qty: {quantity}\n"
                     f"(TP based on total position avg)"
                 )
@@ -1321,15 +1344,12 @@ class GridBot:
                 if position_amt == 0 or entry_price == 0:
                     continue
 
-                # LONG mode: only handle positive positions
+                # Log when syncing position that doesn't match grid mode
+                # (Still place TP to protect the position)
                 if config.grid.GRID_SIDE == "LONG" and position_amt < 0:
-                    logger.warning(f"Found SHORT position in LONG mode, skipping sync")
-                    continue
-
-                # SHORT mode: only handle negative positions
-                if config.grid.GRID_SIDE == "SHORT" and position_amt > 0:
-                    logger.warning(f"Found LONG position in SHORT mode, skipping sync")
-                    continue
+                    logger.info(f"📋 Syncing SHORT position in LONG mode (placing protective TP)")
+                elif config.grid.GRID_SIDE == "SHORT" and position_amt > 0:
+                    logger.info(f"📋 Syncing LONG position in SHORT mode (placing protective TP)")
 
                 position_qty = abs(position_amt)
 
@@ -2872,7 +2892,18 @@ class GridBot:
             ticker = await self.client.get_ticker_price(config.trading.SYMBOL)
             current_price = Decimal(ticker["price"])
 
-            position_side = "LONG" if config.grid.GRID_SIDE == "LONG" else "SHORT"
+            # Determine actual position side from exchange (not config)
+            positions = await self.client.get_position_risk(config.trading.SYMBOL)
+            position_side = "LONG" if config.grid.GRID_SIDE == "LONG" else "SHORT"  # fallback
+            for pos in positions:
+                if pos.get("symbol") == config.trading.SYMBOL:
+                    pos_amt = Decimal(pos.get("positionAmt", "0"))
+                    if pos_amt > 0:
+                        position_side = "LONG"
+                        break
+                    elif pos_amt < 0:
+                        position_side = "SHORT"
+                        break
 
             # Check cooldown for SuperTrend flip alerts (prevent spam)
             cooldown_seconds = config.risk.SUPERTREND_FLIP_ALERT_COOLDOWN
@@ -2987,10 +3018,16 @@ class GridBot:
                         old_tp_price = level.tp_target_price
                         new_tp_price = self._round_price(new_stop)
 
+                        # Calculate profit percentage (always positive for display)
+                        if position_side == "LONG":
+                            tp_profit_pct = ((new_tp_price - level.entry_price) / level.entry_price * 100)
+                        else:  # SHORT - profit when price drops
+                            tp_profit_pct = ((level.entry_price - new_tp_price) / level.entry_price * 100)
+
                         logger.info(
                             f"📈 Trailing TP Update: Level {level.index} | "
                             f"${old_tp_price:.4f} → ${new_tp_price:.4f} | "
-                            f"+{((new_tp_price - level.entry_price) / level.entry_price * 100):.2f}%"
+                            f"+{tp_profit_pct:.2f}%"
                         )
 
                         # Cancel old order
@@ -3021,12 +3058,14 @@ class GridBot:
                         level.trailing_tp_active = True
                         level.client_order_id = client_order_id
 
+                        tp_side = "SELL" if position_side == "LONG" else "BUY"
                         await self.telegram.send_message(
                             f"📈 Trailing TP Updated!\n"
+                            f"Position: {position_side}\n"
                             f"Level: {level.index}\n"
-                            f"New TP: ${new_tp_price:.4f}\n"
+                            f"New TP ({tp_side}): ${new_tp_price:.4f}\n"
                             f"Entry: ${level.entry_price:.4f}\n"
-                            f"Profit: +{((new_tp_price - level.entry_price) / level.entry_price * 100):.2f}%"
+                            f"Profit: +{tp_profit_pct:.2f}%"
                         )
 
                     # Update tracking
