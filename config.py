@@ -55,9 +55,9 @@ class TradingConfig:
     # Trading symbol - SOLUSDT for long-term run (Post-Dec 15 Strategy)
     SYMBOL: str = "SOLUSDT"
     
-    # Leverage multiplier - 5x MODERATE (balanced risk/reward)
-    # Moderate risk: Liq distance ~20%, good for trending markets
-    LEVERAGE: int = 5
+    # Leverage multiplier - 10x for micro grid rebuild
+    # Higher risk but smaller position sizes ($5/grid)
+    LEVERAGE: int = 10
     
     # Margin type: ISOLATED or CROSSED
     # For Multi-Asset Mode (using USDF as collateral), CROSSED is required
@@ -85,8 +85,8 @@ class GridConfig:
         lower = 85,500, upper = 94,500, step = 1,000
         levels = [85500, 86500, 87500, ..., 94500]
     """
-    # 12 grids for more frequent, smaller profits
-    GRID_COUNT: int = 12
+    # 6 grids for micro rebuild strategy
+    GRID_COUNT: int = 6
     
     # Price boundaries - will be calculated dynamically based on current price
     # if not specified (using GRID_RANGE_PERCENT)
@@ -128,10 +128,10 @@ class GridConfig:
     # Jan 2026: LONG - Extreme Fear (25) + Elliott Wave (iii) impulse starting
     GRID_SIDE: Literal["BOTH", "LONG", "SHORT"] = "LONG"
     
-    # Quantity per grid level - Balanced for ~$550 balance
-    # $50 per grid with 5x leverage = $250 notional per level
-    # Max 5 positions = $1250 notional ($250 margin, 45% of $550 balance)
-    QUANTITY_PER_GRID_USDT: Decimal = Decimal("50.0")
+    # Quantity per grid level - Micro rebuild from ~$60 balance
+    # $5 per grid with 10x leverage = $50 notional per level
+    # Max 3 positions = $150 notional ($15 margin, 25% of $60 balance)
+    QUANTITY_PER_GRID_USDT: Decimal = Decimal("5.0")
     
     # Maximum number of open orders allowed
     MAX_OPEN_ORDERS: int = 20
@@ -234,16 +234,16 @@ class RiskConfig:
     - Trailing Stop: 8% (locks profit when price reverses)
     """
     # Maximum drawdown before circuit breaker triggers (percentage of initial balance)
-    # 20% drawdown = bot stops to protect remaining 80% of capital
-    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("20.0")
+    # 10% drawdown = tighter for 10x leverage micro grid
+    MAX_DRAWDOWN_PERCENT: Decimal = Decimal("10.0")
 
     # Daily loss limit - pause trading if daily loss exceeds this percentage
     # Resets every 24 hours from session start
     DAILY_LOSS_LIMIT_PERCENT: Decimal = Decimal("10.0")
 
     # Maximum number of grid positions that can be held simultaneously
-    # Prevents over-exposure to a single asset during trends
-    MAX_POSITIONS: int = 5
+    # Limited to 3 for micro rebuild strategy
+    MAX_POSITIONS: int = 3
 
     # Trailing stop percentage - close all positions if price drops this much
     # from the highest price seen during the session
@@ -293,7 +293,7 @@ class RiskConfig:
     SUPERTREND_FLIP_ALERT_COOLDOWN: int = 3600  # 1 hour
     
     # Minimum balance to maintain (bot stops if balance falls below)
-    MIN_BALANCE_USDT: Decimal = Decimal("50.0")
+    MIN_BALANCE_USDT: Decimal = Decimal("30.0")
     
     # Maximum position size as percentage of balance
     MAX_POSITION_PERCENT: Decimal = Decimal("80.0")
@@ -320,10 +320,10 @@ class RiskConfig:
     # ==========================================================================
 
     # Minimum balance guard - stop everything if balance falls below this
-    MIN_BALANCE_GUARD: Decimal = Decimal("100.0")
+    MIN_BALANCE_GUARD: Decimal = Decimal("30.0")
 
     # Daily loss limit in USDT - pause for 24h if exceeded
-    DAILY_LOSS_LIMIT_USDT: Decimal = Decimal("50.0")
+    DAILY_LOSS_LIMIT_USDT: Decimal = Decimal("5.0")
 
     # ==========================================================================
     # Auto Re-entry after Cut Loss
@@ -414,8 +414,8 @@ class BotConfig:
     # Dry run mode - simulate orders without executing
     DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() == "true"
     
-    # Initial capital for the bot
-    INITIAL_CAPITAL_USDT: Decimal = Decimal("550.0")
+    # Initial capital for the bot - micro rebuild from ~$60
+    INITIAL_CAPITAL_USDT: Decimal = Decimal("60.0")
     
     def validate(self) -> list[str]:
         """
@@ -444,9 +444,9 @@ class BotConfig:
         if self.risk.MAX_DRAWDOWN_PERCENT > Decimal("50"):
             errors.append("MAX_DRAWDOWN_PERCENT > 50% is extremely risky - recommend 20% for safety")
         
-        # Capital validation
-        if self.INITIAL_CAPITAL_USDT < Decimal("100"):
-            errors.append("Minimum recommended capital is 100 USDT")
+        # Capital validation - lowered for micro rebuild strategy
+        if self.INITIAL_CAPITAL_USDT < Decimal("30"):
+            errors.append("Minimum recommended capital is 30 USDT")
         
         return errors
 
