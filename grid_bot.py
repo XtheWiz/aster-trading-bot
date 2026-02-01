@@ -894,7 +894,15 @@ class GridBot:
             await self._handle_tp_sell_filled(filled_level)
             return
         elif grid_side == "SHORT" and new_side == OrderSide.BUY:
-            logger.info(f"SHORT mode: Skipping BUY counter-order after SELL fill")
+            # SHORT mode: Instead of regular counter-order, place Smart TP (BUY to close short)
+            if config.risk.AUTO_TP_ENABLED:
+                await self._place_smart_tp(filled_level)
+            else:
+                logger.info(f"SHORT mode: AUTO_TP disabled, skipping BUY TP")
+            return
+        elif grid_side == "SHORT" and filled_level.side == OrderSide.BUY:
+            # SHORT mode: TP BUY filled -> Dynamic Re-Grid decision
+            await self._handle_tp_buy_filled(filled_level)
             return
         
         # Validate target level exists
@@ -1285,7 +1293,106 @@ class GridBot:
 
         except AsterAPIError as e:
             logger.error(f"Failed to re-place BUY: {e}")
-    
+
+    async def _re_place_sell(self, level: GridLevel) -> None:
+        """Re-place a SELL order at the specified grid level (for SHORT mode)."""
+        try:
+            quantity = self.calculate_quantity_for_level(level.price)
+            client_order_id = f"grid_{level.index}_{int(datetime.now().timestamp())}"
+
+            level.side = OrderSide.SELL
+            level.client_order_id = client_order_id
+            level.state = GridLevelState.EMPTY  # SHORT mode starts with SELL
+            level.filled = False
+
+            response = await self.client.place_order(
+                symbol=config.trading.SYMBOL,
+                side="SELL",
+                order_type="LIMIT",
+                quantity=quantity,
+                price=level.price,
+                client_order_id=client_order_id,
+            )
+
+            level.order_id = response.get("orderId")
+
+            logger.info(f"📤 SELL re-placed: ${level.price:.4f} | Level {level.index}")
+
+        except AsterAPIError as e:
+            logger.error(f"Failed to re-place SELL: {e}")
+
+    async def _handle_tp_buy_filled(self, filled_level: GridLevel) -> None:
+        """
+        Handle TP BUY fill with Dynamic Re-Grid logic (SHORT mode).
+
+        Sequence:
+        1. Reset level position tracking
+        2. Ask StrategyManager what to do
+        3. REPLACE → re-place SELL at original level
+        4. REGRID → cancel all and re-grid
+        5. WAIT → do nothing, wait for more confirmation
+        """
+        try:
+            logger.info(
+                f"🎯 TP BUY filled at level {filled_level.index} | "
+                f"PnL already calculated in on_order_update"
+            )
+
+            # Reset level after TP fill (position is closed)
+            filled_level.reset()
+
+            # Get recommendation from strategy manager
+            action = await self.strategy_manager.should_regrid_on_tp()
+
+            if action == "REPLACE":
+                # Re-place SELL at the original level
+                await self._re_place_sell(filled_level)
+
+                await self.telegram.send_message(
+                    f"🔄 TP Filled → SELL Re-placed\n\n"
+                    f"Level: {filled_level.index}\n"
+                    f"Same trend continues ✅"
+                )
+
+            elif action == "REGRID":
+                # Full re-grid
+                logger.warning("🔄 Trend changed - Full Re-Grid triggered")
+
+                await self.telegram.send_message(
+                    f"🔄 Trend Changed → Full Re-Grid\n\n"
+                    f"Canceling all orders and repositioning..."
+                )
+
+                await self.cancel_all_orders()
+
+                ticker = await self.client.get_ticker_price(config.trading.SYMBOL)
+                current_price = Decimal(ticker["price"])
+
+                # Calculate dynamic grid range
+                grid_range = await self.get_dynamic_grid_range(current_price)
+
+                self.state.entry_price = current_price
+                self.state.levels = self.calculate_grid_levels(current_price, grid_range)
+
+                await self.place_grid_orders()
+
+                # Record new grid placement
+                self.strategy_manager.record_grid_placement()
+
+                await self.telegram.send_message(
+                    f"✅ Re-Grid Complete!\n\n"
+                    f"New Center: ${current_price:.2f}\n"
+                    f"Range: ±{grid_range:.2f}%\n"
+                    f"Orders: {len([l for l in self.state.levels if l.order_id])}"
+                )
+
+            elif action == "WAIT":
+                # Wait for confirmation - do nothing
+                logger.info("Waiting for trend confirmation, not placing new SELL")
+
+        except Exception as e:
+            logger.error(f"Error handling TP BUY fill: {e}")
+
     async def _handle_partial_fill(
         self,
         level: GridLevel,
