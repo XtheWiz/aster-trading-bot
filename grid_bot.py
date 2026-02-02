@@ -1248,6 +1248,9 @@ class GridBot:
 
                 await self.place_grid_orders()
 
+                # Re-place TPs for any remaining positions (they were cancelled with grid orders)
+                await self.sync_existing_positions()
+
                 # Record new grid placement
                 self.strategy_manager.record_grid_placement()
 
@@ -1257,7 +1260,7 @@ class GridBot:
                     f"Range: ±{grid_range:.2f}%\n"
                     f"Orders: {len([l for l in self.state.levels if l.order_id])}"
                 )
-                
+
             elif action == "WAIT":
                 # Trend uncertain - re-place order to maintain grid coverage
                 logger.info("Trend uncertain, re-placing BUY to maintain grid coverage")
@@ -1376,6 +1379,9 @@ class GridBot:
                 self.state.levels = self.calculate_grid_levels(current_price, grid_range)
 
                 await self.place_grid_orders()
+
+                # Re-place TPs for any remaining positions (they were cancelled with grid orders)
+                await self.sync_existing_positions()
 
                 # Record new grid placement
                 self.strategy_manager.record_grid_placement()
@@ -2917,6 +2923,9 @@ class GridBot:
 
                     # Place new orders
                     await self.place_grid_orders()
+
+                    # Re-place TPs for any existing positions (they were cancelled with grid orders)
+                    await self.sync_existing_positions()
 
                     logger.info(
                         f"✅ Re-Grid complete: New grid ${self.state.lower_price:.2f} - ${self.state.upper_price:.2f} "
