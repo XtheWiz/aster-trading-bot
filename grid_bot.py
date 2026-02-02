@@ -3118,7 +3118,11 @@ class GridBot:
                     else:  # SHORT
                         new_stop = Decimal(str(supertrend.short_stop))
                         # Only update if new stop is lower (better)
-                        should_update = new_stop < level.supertrend_stop and new_stop < level.entry_price
+                        # Handle initial state (supertrend_stop=0) or check for better stop
+                        should_update = (
+                            level.supertrend_stop == 0 or
+                            (new_stop < level.supertrend_stop and new_stop < level.entry_price)
+                        )
 
                     if should_update:
                         # Cancel old TP order and place new one
