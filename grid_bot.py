@@ -1169,7 +1169,7 @@ class GridBot:
             if self.strategy_manager.btc_trend_score:
                 btc_trend_score = self.strategy_manager.btc_trend_score.total
             funding_rate = float(self.strategy_manager.last_funding_rate * 100)
-            drawdown_percent = self.state.get_drawdown_percent()
+            drawdown_pct = float(self.state.drawdown_percent)
 
             # Log trade event with full indicator values for ML analysis
             trade_event_logger.log_smart_tp(
@@ -1184,7 +1184,7 @@ class GridBot:
                 atr_percent=atr_percent,
                 btc_trend_score=btc_trend_score,
                 funding_rate=funding_rate,
-                drawdown_percent=drawdown_percent,
+                drawdown_percent=drawdown_pct,
                 order_id=str(order_id),
             )
             
