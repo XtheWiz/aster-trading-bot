@@ -1259,9 +1259,10 @@ class GridBot:
                 )
                 
             elif action == "WAIT":
-                # Wait for confirmation - do nothing
-                logger.info("Waiting for trend confirmation, not placing new BUY")
-                
+                # Trend uncertain - re-place order to maintain grid coverage
+                logger.info("Trend uncertain, re-placing BUY to maintain grid coverage")
+                await self._re_place_buy(filled_level)
+
         except Exception as e:
             logger.error(f"Error handling TP SELL fill: {e}")
             # Fallback: re-place BUY to avoid idle grid
@@ -1387,8 +1388,9 @@ class GridBot:
                 )
 
             elif action == "WAIT":
-                # Wait for confirmation - do nothing
-                logger.info("Waiting for trend confirmation, not placing new SELL")
+                # Trend uncertain - re-place order to maintain grid coverage
+                logger.info("Trend uncertain, re-placing SELL to maintain grid coverage")
+                await self._re_place_sell(filled_level)
 
         except Exception as e:
             logger.error(f"Error handling TP BUY fill: {e}")
