@@ -467,7 +467,7 @@ class AsterClient:
         if config.DRY_RUN:
             logger.info("[DRY RUN] get_account_balance - returning mock data")
             return [{
-                "asset": "USDT",
+                "asset": config.trading.MARGIN_ASSET,
                 "balance": str(config.INITIAL_CAPITAL_USDT),
                 "availableBalance": str(config.INITIAL_CAPITAL_USDT),
                 "crossUnPnl": "0",

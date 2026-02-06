@@ -568,8 +568,8 @@ class BotConfig:
     # Dry run mode - simulate orders without executing
     DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() == "true"
     
-    # Initial capital for the bot - micro rebuild from ~$60
-    INITIAL_CAPITAL_USDT: Decimal = Decimal("60.0")
+    # Initial capital for the bot
+    INITIAL_CAPITAL_USDT: Decimal = Decimal("50.0")
     
     def validate(self) -> list[str]:
         """
