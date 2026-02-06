@@ -258,13 +258,13 @@ class TestRealWorldScenarios:
         Scenario: Choppy sideways market
         EMA: 133.5 vs 133 (within 1%) → 0
         MACD: -0.01 → -1
-        RSI: 52 → +1
+        RSI: 56 → +1 (just above neutral zone 45-55)
         Expected: Score 0, STAY
         """
         ts = self.manager._calculate_trend_score(
-            Decimal("133.5"), Decimal("133"), -0.01, 52
+            Decimal("133.5"), Decimal("133"), -0.01, 56
         )
-        
+
         assert ts.total == 0
         assert ts.recommended_side == "STAY"
         print(f"✅ Choppy Sideways: {ts} → {ts.recommended_side}")
@@ -274,13 +274,13 @@ class TestRealWorldScenarios:
         Scenario: Early reversal from downtrend
         EMA: 128 vs 130 (still bearish but catching up) → -1
         MACD: +0.2 (turning positive) → +1
-        RSI: 55 (recovering) → +1
+        RSI: 56 (recovering, just above neutral zone) → +1
         Expected: Score +1, STAY (need more confirmation)
         """
         ts = self.manager._calculate_trend_score(
-            Decimal("128"), Decimal("130"), 0.2, 55
+            Decimal("128"), Decimal("130"), 0.2, 56
         )
-        
+
         assert ts.total == 1
         assert ts.recommended_side == "STAY"
         print(f"✅ Early Reversal: {ts} → {ts.recommended_side}")
@@ -477,16 +477,16 @@ class TestExtremeScenarios:
         """
         Scenario: After crash, market starts recovering
         - Need to detect and switch back to LONG
-        
+
         EMA: 105 vs 100 (recovering, now above) → +1
         MACD: +0.5 (positive again) → +1
-        RSI: 55 (recovering) → +1
+        RSI: 56 (recovering, just above neutral zone) → +1
         Expected: Score +3, switch to LONG for recovery
         """
         ts = self.manager._calculate_trend_score(
-            Decimal("105"), Decimal("100"), 0.5, 55
+            Decimal("105"), Decimal("100"), 0.5, 56
         )
-        
+
         assert ts.total == 3
         assert ts.recommended_side == "LONG"
         print(f"✅ Recovery: {ts} → Ride the recovery with {ts.recommended_side}")

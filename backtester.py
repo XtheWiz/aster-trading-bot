@@ -54,6 +54,10 @@ class BacktestResult:
     total_pnl: Decimal = Decimal("0")
     max_drawdown: Decimal = Decimal("0")
 
+    # Fee and slippage tracking
+    total_fees: Decimal = Decimal("0")
+    total_slippage_cost: Decimal = Decimal("0")
+
     # Trades
     trades: list[BacktestTrade] = field(default_factory=list)
 
@@ -68,6 +72,11 @@ class BacktestResult:
         if self.initial_balance == 0:
             return 0.0
         return float((self.final_balance - self.initial_balance) / self.initial_balance * 100)
+
+    @property
+    def gross_pnl(self) -> Decimal:
+        """PnL before fees and slippage."""
+        return self.total_pnl + self.total_fees + self.total_slippage_cost
 
     def summary(self) -> str:
         """Generate summary report."""
@@ -89,7 +98,13 @@ class BacktestResult:
 💵 Capital:
    Initial:        ${self.initial_balance:.2f}
    Final:          ${self.final_balance:.2f}
-   PnL:            ${self.total_pnl:+.2f} ({self.roi:+.2f}%)
+   Net PnL:        ${self.total_pnl:+.2f} ({self.roi:+.2f}%)
+   Gross PnL:      ${self.gross_pnl:+.2f}
+
+💸 Trading Costs:
+   Total Fees:     ${self.total_fees:.2f}
+   Slippage Cost:  ${self.total_slippage_cost:.2f}
+   Cost % of PnL:  {f"{float(self.total_fees + self.total_slippage_cost) / abs(float(self.gross_pnl)) * 100:.1f}%" if self.gross_pnl != 0 else "N/A"}
 
 📈 Performance:
    Total Trades:   {self.total_trades}
@@ -142,6 +157,16 @@ class Backtester:
         self.peak_balance = initial_balance
         self.max_drawdown = Decimal("0")
 
+        # Fee and slippage tracking
+        self.total_fees = Decimal("0")
+        self.total_slippage_cost = Decimal("0")
+        self.fee_percent = config.risk.BACKTEST_FEE_PERCENT
+        self.slippage_mode = config.risk.BACKTEST_SLIPPAGE_MODE
+
+        # ATR tracking for volatility-based slippage
+        self._atr_buffer: list[Decimal] = []
+        self._current_atr_percent = Decimal("0")
+
     async def fetch_historical_data(self, days: int = 30) -> list[dict]:
         """Fetch historical kline data."""
         logger.info(f"📥 Fetching {days} days of historical data for {self.symbol}...")
@@ -191,30 +216,81 @@ class Backtester:
 
         logger.info(f"   Grid: {lower:.4f} - {upper:.4f} ({self.grid_count} levels)")
 
-    def process_candle(self, candle: dict, timestamp: datetime) -> None:
-        """Process a single candle and execute trades."""
+    def _calculate_fee(self, notional: Decimal) -> Decimal:
+        """Calculate trading fee for a given notional value."""
+        return notional * self.fee_percent / 100
+
+    def _calculate_slippage(self, price: Decimal, side: str) -> Decimal:
+        """
+        Calculate slippage-adjusted fill price.
+
+        BUY orders get worse fills (higher price).
+        SELL orders get worse fills (lower price).
+        """
+        if self.slippage_mode == "volatility":
+            # Scale slippage with current ATR
+            slippage_pct = self._current_atr_percent * config.risk.BACKTEST_SLIPPAGE_ATR_MULTIPLIER
+            slippage_pct = min(slippage_pct, config.risk.BACKTEST_SLIPPAGE_MAX_PERCENT)
+        else:
+            slippage_pct = config.risk.BACKTEST_SLIPPAGE_FIXED_PERCENT
+
+        slippage_factor = slippage_pct / 100
+        if side == "BUY":
+            return price * (1 + slippage_factor)  # Pay more
+        else:
+            return price * (1 - slippage_factor)  # Receive less
+
+    def _update_atr(self, candle: dict) -> None:
+        """Update ATR estimate from candle data for volatility-based slippage."""
         high = Decimal(str(candle[2]))
         low = Decimal(str(candle[3]))
         close = Decimal(str(candle[4]))
+
+        tr = high - low  # Simplified true range (intra-candle)
+        self._atr_buffer.append(tr)
+
+        # Keep 14-period rolling window
+        if len(self._atr_buffer) > 14:
+            self._atr_buffer = self._atr_buffer[-14:]
+
+        if self._atr_buffer and close > 0:
+            avg_tr = sum(self._atr_buffer) / len(self._atr_buffer)
+            self._current_atr_percent = avg_tr / close * 100
+
+    def process_candle(self, candle: dict, timestamp: datetime) -> None:
+        """Process a single candle and execute trades with realistic fills."""
+        high = Decimal(str(candle[2]))
+        low = Decimal(str(candle[3]))
+        close = Decimal(str(candle[4]))
+
+        # Update ATR for volatility-based slippage
+        self._update_atr(candle)
 
         # Check each grid level
         for level in self.levels:
             # Check for BUY fills (price went below level)
             if not level.has_position and low <= level.price:
-                # Simulate BUY fill
-                quantity = self.quantity_per_grid / level.price
-                cost = quantity * level.price
+                # Apply slippage to fill price (BUY fills at slightly worse price)
+                fill_price = self._calculate_slippage(level.price, "BUY")
+                quantity = self.quantity_per_grid / fill_price
+                cost = quantity * fill_price
 
-                if cost <= self.balance:
+                # Apply trading fee
+                fee = self._calculate_fee(cost)
+                total_cost = cost + fee
+
+                if total_cost <= self.balance:
                     level.has_position = True
-                    level.entry_price = level.price
+                    level.entry_price = fill_price  # Track actual fill price
                     level.quantity = quantity
-                    self.balance -= cost
+                    self.balance -= total_cost
+                    self.total_fees += fee
+                    self.total_slippage_cost += abs(fill_price - level.price) * quantity
 
                     self.trades.append(BacktestTrade(
                         timestamp=timestamp,
                         side="BUY",
-                        price=level.price,
+                        price=fill_price,
                         quantity=quantity,
                         grid_level=level.index,
                     ))
@@ -224,15 +300,23 @@ class Backtester:
                 tp_price = level.entry_price * (1 + self.tp_percent / 100)
 
                 if high >= tp_price:
-                    # Simulate SELL fill at TP
-                    revenue = level.quantity * tp_price
-                    pnl = revenue - (level.quantity * level.entry_price)
-                    self.balance += revenue
+                    # Apply slippage to TP fill (SELL fills at slightly worse price)
+                    fill_price = self._calculate_slippage(tp_price, "SELL")
+                    revenue = level.quantity * fill_price
+
+                    # Apply trading fee
+                    fee = self._calculate_fee(revenue)
+                    net_revenue = revenue - fee
+
+                    pnl = net_revenue - (level.quantity * level.entry_price)
+                    self.balance += net_revenue
+                    self.total_fees += fee
+                    self.total_slippage_cost += abs(tp_price - fill_price) * level.quantity
 
                     self.trades.append(BacktestTrade(
                         timestamp=timestamp,
                         side="SELL",
-                        price=tp_price,
+                        price=fill_price,
                         quantity=level.quantity,
                         grid_level=level.index,
                         pnl=pnl,
@@ -283,17 +367,22 @@ class Backtester:
             # Calculate final results
             end_price = Decimal(str(klines[-1][4]))
 
-            # Close any remaining positions at market price
+            # Close any remaining positions at market price (with slippage + fees)
             for level in self.levels:
                 if level.has_position:
-                    revenue = level.quantity * end_price
-                    pnl = revenue - (level.quantity * level.entry_price)
-                    self.balance += revenue
+                    fill_price = self._calculate_slippage(end_price, "SELL")
+                    revenue = level.quantity * fill_price
+                    fee = self._calculate_fee(revenue)
+                    net_revenue = revenue - fee
+                    pnl = net_revenue - (level.quantity * level.entry_price)
+                    self.balance += net_revenue
+                    self.total_fees += fee
+                    self.total_slippage_cost += abs(end_price - fill_price) * level.quantity
 
                     self.trades.append(BacktestTrade(
                         timestamp=datetime.fromtimestamp(klines[-1][0] / 1000),
                         side="SELL",
-                        price=end_price,
+                        price=fill_price,
                         quantity=level.quantity,
                         grid_level=level.index,
                         pnl=pnl,
@@ -319,6 +408,8 @@ class Backtester:
                 losing_trades=len(losing),
                 total_pnl=total_pnl,
                 max_drawdown=self.max_drawdown,
+                total_fees=self.total_fees,
+                total_slippage_cost=self.total_slippage_cost,
                 trades=self.trades,
             )
 
@@ -388,6 +479,8 @@ async def run_optimization(
                     "win_rate": result.win_rate,
                     "trades": result.total_trades,
                     "max_dd": float(result.max_drawdown),
+                    "fees": float(result.total_fees),
+                    "slippage": float(result.total_slippage_cost),
                 })
 
     # Sort by ROI

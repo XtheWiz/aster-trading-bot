@@ -132,7 +132,53 @@ class GridConfig:
     # $5 per grid with 10x leverage = $50 notional per level
     # Max 3 positions = $150 notional ($15 margin, 25% of $60 balance)
     QUANTITY_PER_GRID_USDT: Decimal = Decimal("5.0")
-    
+
+    # ==========================================================================
+    # Volatility-Based Position Sizing
+    # ==========================================================================
+
+    # Scale position size inversely with volatility
+    # High ATR → smaller positions, Low ATR → normal/larger positions
+    VOLATILITY_POSITION_SIZING_ENABLED: bool = True
+
+    # ATR% thresholds for position size scaling
+    # Below LOW: use full size (calm market)
+    # Between LOW and HIGH: linear scale-down
+    # Above HIGH: use minimum size
+    ATR_PERCENT_LOW: Decimal = Decimal("1.5")   # Below this = full size
+    ATR_PERCENT_HIGH: Decimal = Decimal("4.0")  # Above this = minimum size
+
+    # Minimum position size as fraction of QUANTITY_PER_GRID_USDT
+    # 0.5 = at high volatility, use 50% of normal size
+    MIN_POSITION_SIZE_RATIO: Decimal = Decimal("0.5")
+
+    # ==========================================================================
+    # Session-Aware Parameters
+    # ==========================================================================
+
+    # Adjust grid range and position size based on trading session
+    SESSION_AWARE_ENABLED: bool = True
+
+    # Session definitions (UTC hours)
+    # Asian: 00:00-08:00 UTC (low volume, choppy)
+    # EU:    08:00-13:30 UTC (moderate volume)
+    # US:    13:30-21:30 UTC (high volume, strong trends)
+    # Late:  21:30-00:00 UTC (declining volume)
+    ASIAN_SESSION_START_UTC: int = 0
+    ASIAN_SESSION_END_UTC: int = 8
+    US_SESSION_START_UTC: int = 13   # 13:30 rounded to 13
+    US_SESSION_END_UTC: int = 21     # 21:30 rounded to 21
+
+    # Grid range multiplier per session (applied to dynamic grid range)
+    # >1.0 = wider grid, <1.0 = tighter grid
+    ASIAN_SESSION_GRID_MULTIPLIER: Decimal = Decimal("1.3")  # 30% wider
+    US_SESSION_GRID_MULTIPLIER: Decimal = Decimal("1.0")     # Normal
+
+    # Position size multiplier per session
+    # <1.0 = smaller positions during low-quality sessions
+    ASIAN_SESSION_SIZE_MULTIPLIER: Decimal = Decimal("0.7")  # 30% smaller
+    US_SESSION_SIZE_MULTIPLIER: Decimal = Decimal("1.0")     # Normal
+
     # Maximum number of open orders allowed
     MAX_OPEN_ORDERS: int = 20
     
@@ -198,7 +244,93 @@ class GridConfig:
 
     # Point decay rate on unclear signals (-1 per unclear check)
     POINT_DECAY_RATE: int = 1
+
+    # ==========================================================================
+    # Anti-Whipsaw Protection
+    # ==========================================================================
+
+    # Minimum time between side switches (seconds)
+    SIDE_SWITCH_COOLDOWN_SECONDS: int = 1800  # 30 minutes
+
+    # Maximum side switches per 24h period (0 = unlimited)
+    MAX_SWITCHES_PER_DAY: int = 4
+
+    # ==========================================================================
+    # Multi-Timeframe Filter
+    # ==========================================================================
+
+    # Require higher timeframe alignment before allowing side switch
+    USE_MULTI_TIMEFRAME_FILTER: bool = True
+
+    # Higher timeframe interval for trend confirmation
+    HTF_INTERVAL: str = "4h"
+
+    # 4h score must be at least this aligned (or neutral) to allow switch
+    # Block LONG switch if 4h score <= -HTF_MIN_SCORE
+    # Block SHORT switch if 4h score >= +HTF_MIN_SCORE
+    HTF_MIN_SCORE: int = 1
     
+    # ==========================================================================
+    # Choppy Market Auto-Pause
+    # ==========================================================================
+
+    # Pause trading when market is choppy (oscillating, no clear direction)
+    CHOPPY_MARKET_PAUSE_ENABLED: bool = True
+
+    # Consecutive choppy detections before pausing
+    CHOPPY_CONFIRMATION_CHECKS: int = 3
+
+    # abs(trend score) must be below this for "no clear direction"
+    CHOPPY_TREND_THRESHOLD: int = 2
+
+    # Volume ratio below this indicates low conviction
+    CHOPPY_VOLUME_THRESHOLD: float = 0.5
+
+    # How long to stay paused (minutes)
+    CHOPPY_PAUSE_DURATION_MINUTES: int = 30
+
+    # ==========================================================================
+    # BTC Leading Indicator Analysis
+    # ==========================================================================
+
+    # Enable BTC momentum-based leading indicator analysis
+    # Tracks BTC price changes over recent windows to detect moves
+    # before they propagate to altcoins (typically 1-4h lag)
+    BTC_LEADING_INDICATOR_ENABLED: bool = True
+
+    # BTC momentum lookback windows (minutes)
+    # Short window detects fast BTC dumps/pumps
+    # Long window detects sustained BTC trend shifts
+    BTC_MOMENTUM_SHORT_WINDOW: int = 60   # 1 hour
+    BTC_MOMENTUM_LONG_WINDOW: int = 240   # 4 hours
+
+    # BTC momentum thresholds (percentage change)
+    # If BTC drops > this in the short window, it's a leading bearish signal
+    BTC_MOMENTUM_ALERT_PERCENT: Decimal = Decimal("2.0")   # 2% move = warning
+    BTC_MOMENTUM_DANGER_PERCENT: Decimal = Decimal("4.0")   # 4% move = danger
+
+    # Weight BTC signal in switch decisions
+    # When BTC momentum opposes a pending switch, add penalty points
+    BTC_MOMENTUM_SWITCH_PENALTY: int = 2  # Points to subtract from switch accumulation
+
+    # ==========================================================================
+    # Side Switch with Position Closure
+    # ==========================================================================
+
+    # Allow closing existing position to switch sides in genuine reversals
+    FORCE_SWITCH_ENABLED: bool = True
+
+    # Minimum trend score to force-close position and switch
+    # Only triggers when score is very strong AND BTC aligns
+    FORCE_SWITCH_MIN_SCORE: int = 3
+
+    # Maximum unrealized loss % to accept when force-closing
+    # Won't force-close if position has > this % unrealized loss
+    FORCE_SWITCH_MAX_LOSS_PERCENT: Decimal = Decimal("3.0")
+
+    # Require BTC alignment for force switch (recommended)
+    FORCE_SWITCH_REQUIRE_BTC_ALIGNMENT: bool = True
+
     # ==========================================================================
     # Dynamic Re-Grid on TP: Re-analyze and re-place after Take Profit fills
     # ==========================================================================
@@ -340,6 +472,28 @@ class RiskConfig:
 
     # Minimum wait time after cut loss before re-entry (minutes)
     REENTRY_MIN_WAIT_MINUTES: int = 30
+
+    # ==========================================================================
+    # Backtester Realism Settings
+    # ==========================================================================
+
+    # Trading fee per trade (percentage, applied to both BUY and SELL)
+    # Aster DEX typical: 0.02% maker, 0.05% taker
+    BACKTEST_FEE_PERCENT: Decimal = Decimal("0.05")
+
+    # Slippage simulation mode: "fixed" or "volatility"
+    # "fixed" = constant slippage %, "volatility" = scales with ATR
+    BACKTEST_SLIPPAGE_MODE: str = "volatility"
+
+    # Fixed slippage percentage (used when mode = "fixed")
+    BACKTEST_SLIPPAGE_FIXED_PERCENT: Decimal = Decimal("0.05")
+
+    # Volatility-based slippage: ATR multiplier
+    # Slippage = ATR% × this multiplier (e.g., 2% ATR × 0.1 = 0.2% slippage)
+    BACKTEST_SLIPPAGE_ATR_MULTIPLIER: Decimal = Decimal("0.1")
+
+    # Maximum slippage cap (even in high volatility)
+    BACKTEST_SLIPPAGE_MAX_PERCENT: Decimal = Decimal("0.5")
 
 
 @dataclass

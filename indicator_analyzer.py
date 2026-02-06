@@ -254,11 +254,16 @@ class IndicatorAnalyzer:
             # Get latest values
             latest = df.iloc[-1]
 
+            # Return None if critical SuperTrend values are NaN (insufficient data)
+            if pd.isna(latest['supertrend']) or pd.isna(latest['final_lower']) or pd.isna(latest['final_upper']):
+                logger.warning("SuperTrend values contain NaN (insufficient data), returning None")
+                return None
+
             result = SuperTrendResult(
-                trend_line=float(latest['supertrend']) if pd.notna(latest['supertrend']) else 0.0,
+                trend_line=float(latest['supertrend']),
                 direction=int(latest['direction']),
-                long_stop=float(latest['final_lower']) if pd.notna(latest['final_lower']) else 0.0,
-                short_stop=float(latest['final_upper']) if pd.notna(latest['final_upper']) else float('inf'),
+                long_stop=float(latest['final_lower']),
+                short_stop=float(latest['final_upper']),
                 atr_value=float(latest['atr']) if pd.notna(latest['atr']) else 0.0
             )
 
@@ -469,7 +474,7 @@ class IndicatorAnalyzer:
             logger.error(f"Error converting candles to DataFrame: {e}")
             return None
 
-    def from_market_analysis(self, analysis: "MarketAnalysis") -> Optional[MarketSignal]:
+    def from_market_analysis(self, analysis: "MarketAnalysis", position_side: str = "LONG") -> Optional[MarketSignal]:
         """
         Create MarketSignal from pre-calculated MarketAnalysis.
 
@@ -495,12 +500,12 @@ class IndicatorAnalyzer:
             trend = self._determine_trend(rsi, macd, macd_hist, current_price, sma_20, sma_50)
 
             # Calculate recommended TP
-            tp_percent = self._get_tp_recommendation(rsi, macd_hist, trend)
+            tp_percent = self._get_tp_recommendation(rsi, macd_hist, trend, position_side)
 
             # Build recommendation text
             recommendation = self._build_recommendation(rsi, macd_hist, trend, tp_percent)
 
-            logger.info(f"Using cached indicators: RSI={rsi:.1f}, MACD={macd_hist:.4f}")
+            logger.info(f"Using cached indicators: RSI={rsi:.1f}, MACD={macd_hist:.4f}, Side={position_side}")
 
             return MarketSignal(
                 rsi=rsi,
@@ -519,7 +524,7 @@ class IndicatorAnalyzer:
             logger.error(f"Error creating signal from analysis: {e}")
             return None
     
-    def calculate_indicators(self, candles: list[dict]) -> Optional[MarketSignal]:
+    def calculate_indicators(self, candles: list[dict], position_side: str = "LONG") -> Optional[MarketSignal]:
         """
         Calculate technical indicators from candle data.
         
@@ -578,11 +583,11 @@ class IndicatorAnalyzer:
             trend = self._determine_trend(rsi, macd, macd_hist, current_price, sma_20, sma_50)
             
             # Calculate recommended TP
-            tp_percent = self._get_tp_recommendation(rsi, macd_hist, trend)
-            
+            tp_percent = self._get_tp_recommendation(rsi, macd_hist, trend, position_side)
+
             # Build recommendation text
             recommendation = self._build_recommendation(rsi, macd_hist, trend, tp_percent)
-            
+
             return MarketSignal(
                 rsi=rsi,
                 macd=macd,
@@ -645,43 +650,78 @@ class IndicatorAnalyzer:
             return "NEUTRAL"
     
     def _get_tp_recommendation(
-        self, 
-        rsi: float, 
+        self,
+        rsi: float,
         macd_hist: float,
-        trend: str
+        trend: str,
+        position_side: str = "LONG"
     ) -> Decimal:
         """
-        Get recommended TP percentage based on indicators.
-        
-        Logic:
-        - RSI > 65 (near overbought): TP quickly at 1.0%
-        - RSI < 40 (oversold): Hold longer, TP at 2.5%
-        - MACD bullish + trend bullish: TP at 2.0%
-        - Default: 1.5%
+        Get recommended TP percentage based on indicators and position side.
+
+        For LONG positions:
+        - RSI > 65 + MACD bullish: 2.5% (strong trend, let it run)
+        - RSI > 65: 2.0% (trending up, hold)
+        - RSI < 40: 1.0% (oversold bounce is weak, take quick profit)
+        - MACD+ & bullish trend: 2.0% (momentum)
+        - Bearish signals: 1.0% (counter-trend, exit fast)
+
+        For SHORT positions (mirror logic):
+        - RSI < 40 + MACD bearish: 2.5% (strong downtrend)
+        - RSI < 40: 2.0% (trending down, hold)
+        - RSI > 65: 1.0% (overbought bounce, take quick)
+        - MACD- & bearish trend: 2.0% (momentum)
+        - Bullish signals: 1.0% (counter-trend)
         """
-        # Near overbought - take profit quickly
-        if rsi > self.rsi_high:
-            logger.info(f"RSI {rsi:.1f} > {self.rsi_high}: Near overbought, quick TP")
-            return Decimal("1.0")
-        
-        # Oversold - hold for bigger move
-        if rsi < self.rsi_low:
-            logger.info(f"RSI {rsi:.1f} < {self.rsi_low}: Oversold, hold for bigger TP")
-            return Decimal("2.5")
-        
-        # Strong bullish momentum
-        if macd_hist > 0 and trend == "BULLISH":
-            logger.info(f"MACD bullish + trend bullish: Medium TP")
-            return Decimal("2.0")
-        
-        # Bearish momentum - quick TP
-        if macd_hist < 0 or trend == "BEARISH":
-            logger.info(f"Bearish signals detected: Quick TP")
-            return Decimal("1.0")
-        
-        # Default
-        logger.info(f"Neutral market: Default TP")
-        return Decimal("1.5")
+        if position_side == "SHORT":
+            # SHORT position TP logic (mirror of LONG)
+            if rsi < self.rsi_low and macd_hist < 0:
+                logger.info(f"SHORT: RSI {rsi:.1f} < {self.rsi_low} + MACD bearish: Strong downtrend, wide TP")
+                return Decimal("2.5")
+
+            if rsi < self.rsi_low:
+                logger.info(f"SHORT: RSI {rsi:.1f} < {self.rsi_low}: Trending down, hold")
+                return Decimal("2.0")
+
+            if rsi > self.rsi_high:
+                logger.info(f"SHORT: RSI {rsi:.1f} > {self.rsi_high}: Overbought bounce, quick TP")
+                return Decimal("1.0")
+
+            if macd_hist < 0 and trend == "BEARISH":
+                logger.info(f"SHORT: MACD bearish + trend bearish: Medium TP")
+                return Decimal("2.0")
+
+            if macd_hist > 0 or trend == "BULLISH":
+                logger.info(f"SHORT: Bullish signals (counter-trend): Quick TP")
+                return Decimal("1.0")
+
+            logger.info(f"SHORT: Neutral market: Default TP")
+            return Decimal("1.5")
+
+        else:
+            # LONG position TP logic
+            if rsi > self.rsi_high and macd_hist > 0:
+                logger.info(f"LONG: RSI {rsi:.1f} > {self.rsi_high} + MACD bullish: Strong trend, wide TP")
+                return Decimal("2.5")
+
+            if rsi > self.rsi_high:
+                logger.info(f"LONG: RSI {rsi:.1f} > {self.rsi_high}: Trending up, hold")
+                return Decimal("2.0")
+
+            if rsi < self.rsi_low:
+                logger.info(f"LONG: RSI {rsi:.1f} < {self.rsi_low}: Oversold bounce, quick TP")
+                return Decimal("1.0")
+
+            if macd_hist > 0 and trend == "BULLISH":
+                logger.info(f"LONG: MACD bullish + trend bullish: Medium TP")
+                return Decimal("2.0")
+
+            if macd_hist < 0 or trend == "BEARISH":
+                logger.info(f"LONG: Bearish signals (counter-trend): Quick TP")
+                return Decimal("1.0")
+
+            logger.info(f"LONG: Neutral market: Default TP")
+            return Decimal("1.5")
     
     def _build_recommendation(
         self,
@@ -719,7 +759,7 @@ class IndicatorAnalyzer:
 analyzer = IndicatorAnalyzer()
 
 
-async def get_smart_tp(candles: list[dict] = None, market_analysis: "MarketAnalysis" = None) -> Decimal:
+async def get_smart_tp(candles: list[dict] = None, market_analysis: "MarketAnalysis" = None, position_side: str = "LONG") -> Decimal:
     """
     Quick helper to get smart TP recommendation.
 
@@ -728,6 +768,7 @@ async def get_smart_tp(candles: list[dict] = None, market_analysis: "MarketAnaly
     Args:
         candles: Candle data from API (fallback)
         market_analysis: Pre-calculated MarketAnalysis from StrategyManager (preferred)
+        position_side: "LONG" or "SHORT" - affects TP sizing logic
 
     Returns:
         Recommended TP percentage
@@ -736,16 +777,16 @@ async def get_smart_tp(candles: list[dict] = None, market_analysis: "MarketAnaly
 
     # Prefer cached analysis
     if market_analysis is not None:
-        signal = analyzer.from_market_analysis(market_analysis)
+        signal = analyzer.from_market_analysis(market_analysis, position_side=position_side)
         if signal:
-            logger.info(f"Smart TP (cached): {signal.recommendation}")
+            logger.info(f"Smart TP (cached, {position_side}): {signal.recommendation}")
             return signal.tp_percent
 
     # Fallback to calculating from candles
     if candles:
-        signal = analyzer.calculate_indicators(candles)
+        signal = analyzer.calculate_indicators(candles, position_side=position_side)
         if signal:
-            logger.info(f"Smart TP (calculated): {signal.recommendation}")
+            logger.info(f"Smart TP (calculated, {position_side}): {signal.recommendation}")
             return signal.tp_percent
 
     logger.warning("Could not calculate indicators, using default TP")

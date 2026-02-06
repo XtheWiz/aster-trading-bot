@@ -407,9 +407,17 @@ class GridBot:
             dynamic_range = max(dynamic_range, config.grid.MIN_GRID_RANGE_PERCENT)
             dynamic_range = min(dynamic_range, config.grid.MAX_GRID_RANGE_PERCENT)
 
+            # Session-aware grid widening
+            session_grid_mult = self._get_session_grid_multiplier()
+            if session_grid_mult != Decimal("1"):
+                dynamic_range = dynamic_range * session_grid_mult
+                # Re-clamp after session adjustment
+                dynamic_range = min(dynamic_range, config.grid.MAX_GRID_RANGE_PERCENT)
+
             logger.info(
                 f"Dynamic Grid: ATR={atr_percent:.2f}% × {config.grid.ATR_GRID_MULTIPLIER} = "
-                f"{dynamic_range:.2f}% (bounds: {config.grid.MIN_GRID_RANGE_PERCENT}-{config.grid.MAX_GRID_RANGE_PERCENT}%)"
+                f"{dynamic_range:.2f}% (session×{session_grid_mult}, "
+                f"bounds: {config.grid.MIN_GRID_RANGE_PERCENT}-{config.grid.MAX_GRID_RANGE_PERCENT}%)"
             )
 
             return dynamic_range
@@ -505,36 +513,146 @@ class GridBot:
     def calculate_quantity_for_level(self, price: Decimal) -> Decimal:
         """
         Calculate order quantity for a grid level.
-        
-        We use fixed USDT value per grid and convert to base asset quantity.
-        
+
+        Applies volatility-based scaling and session-aware multipliers
+        to the base QUANTITY_PER_GRID_USDT.
+
         Formula:
-            quantity = (usdt_per_grid * leverage) / price
-        
+            effective_usdt = base_usdt * volatility_factor * session_factor
+            quantity = (effective_usdt * leverage) / price
+
         Args:
             price: Order price
-            
+
         Returns:
             Quantity in base asset (rounded to lot size)
         """
         usdt_per_grid = config.grid.QUANTITY_PER_GRID_USDT
+
+        # Volatility-based position sizing
+        vol_factor = self._get_volatility_size_factor()
+        usdt_per_grid = usdt_per_grid * vol_factor
+
+        # Session-aware position sizing
+        session_factor = self._get_session_size_factor()
+        usdt_per_grid = usdt_per_grid * session_factor
+
         leverage = Decimal(config.trading.LEVERAGE)
-        
+
         # Calculate base quantity
         quantity = (usdt_per_grid * leverage) / price
-        
+
         # Round to lot size
         quantity = self._round_quantity(quantity)
-        
+
         # Validate minimum notional
         notional = quantity * price
         if notional < self.min_notional:
             logger.warning(f"Order notional {notional} < min {self.min_notional}")
             quantity = (self.min_notional / price).quantize(Decimal("0.01"), ROUND_UP)
             quantity = self._round_quantity(quantity)
-        
+
         return quantity
-    
+
+    def _get_volatility_size_factor(self) -> Decimal:
+        """
+        Calculate position size scaling factor based on ATR volatility.
+
+        Returns a multiplier between MIN_POSITION_SIZE_RATIO and 1.0.
+        Linear interpolation between ATR_PERCENT_LOW and ATR_PERCENT_HIGH.
+        """
+        if not config.grid.VOLATILITY_POSITION_SIZING_ENABLED:
+            return Decimal("1")
+
+        # Get ATR% from last analysis
+        atr_percent = Decimal("0")
+        if (
+            self.strategy_manager.last_analysis
+            and self.strategy_manager.last_analysis.atr_value > 0
+            and self.strategy_manager.last_analysis.current_price > 0
+        ):
+            atr_percent = (
+                self.strategy_manager.last_analysis.atr_value
+                / self.strategy_manager.last_analysis.current_price * 100
+            )
+
+        if atr_percent <= 0:
+            return Decimal("1")
+
+        low = config.grid.ATR_PERCENT_LOW
+        high = config.grid.ATR_PERCENT_HIGH
+        min_ratio = config.grid.MIN_POSITION_SIZE_RATIO
+
+        if atr_percent <= low:
+            return Decimal("1")
+        elif atr_percent >= high:
+            return min_ratio
+        else:
+            # Linear interpolation: 1.0 at low, min_ratio at high
+            fraction = (atr_percent - low) / (high - low)
+            factor = Decimal("1") - fraction * (Decimal("1") - min_ratio)
+            return factor
+
+    def _get_session_size_factor(self) -> Decimal:
+        """
+        Get position size multiplier based on current trading session.
+
+        Sessions (UTC):
+        - Asian (00-08): Low volume, choppy → smaller positions
+        - EU (08-13): Moderate → normal
+        - US (13-21): High volume, trends → normal
+        - Late (21-00): Declining → smaller positions
+        """
+        if not config.grid.SESSION_AWARE_ENABLED:
+            return Decimal("1")
+
+        from datetime import timezone
+        utc_hour = datetime.now(timezone.utc).hour
+
+        if config.grid.ASIAN_SESSION_START_UTC <= utc_hour < config.grid.ASIAN_SESSION_END_UTC:
+            return config.grid.ASIAN_SESSION_SIZE_MULTIPLIER
+        elif config.grid.US_SESSION_START_UTC <= utc_hour < config.grid.US_SESSION_END_UTC:
+            return config.grid.US_SESSION_SIZE_MULTIPLIER
+        else:
+            # EU and Late sessions: normal size
+            return Decimal("1")
+
+    def _get_current_session_name(self) -> str:
+        """Get human-readable name of current trading session."""
+        if not config.grid.SESSION_AWARE_ENABLED:
+            return "N/A"
+
+        from datetime import timezone
+        utc_hour = datetime.now(timezone.utc).hour
+
+        if config.grid.ASIAN_SESSION_START_UTC <= utc_hour < config.grid.ASIAN_SESSION_END_UTC:
+            return "Asian"
+        elif config.grid.ASIAN_SESSION_END_UTC <= utc_hour < config.grid.US_SESSION_START_UTC:
+            return "EU"
+        elif config.grid.US_SESSION_START_UTC <= utc_hour < config.grid.US_SESSION_END_UTC:
+            return "US"
+        else:
+            return "Late"
+
+    def _get_session_grid_multiplier(self) -> Decimal:
+        """
+        Get grid range multiplier based on current trading session.
+
+        Wider grids during low-quality sessions to avoid whipsaw fills.
+        """
+        if not config.grid.SESSION_AWARE_ENABLED:
+            return Decimal("1")
+
+        from datetime import timezone
+        utc_hour = datetime.now(timezone.utc).hour
+
+        if config.grid.ASIAN_SESSION_START_UTC <= utc_hour < config.grid.ASIAN_SESSION_END_UTC:
+            return config.grid.ASIAN_SESSION_GRID_MULTIPLIER
+        elif config.grid.US_SESSION_START_UTC <= utc_hour < config.grid.US_SESSION_END_UTC:
+            return config.grid.US_SESSION_GRID_MULTIPLIER
+        else:
+            return Decimal("1")
+
     # =========================================================================
     # ORDER MANAGEMENT
     # =========================================================================
@@ -1062,8 +1180,8 @@ class GridBot:
                 cached_analysis = self.strategy_manager.last_analysis
 
                 if cached_analysis and cached_analysis.rsi > 0:
-                    tp_percent = await get_smart_tp(market_analysis=cached_analysis)
-                    logger.info(f"🧠 Smart TP (cached): {tp_percent}%")
+                    tp_percent = await get_smart_tp(market_analysis=cached_analysis, position_side=position_side)
+                    logger.info(f"🧠 Smart TP (cached, {position_side}): {tp_percent}%")
                     rsi = cached_analysis.rsi
                     macd_hist = cached_analysis.macd_histogram
                     trend = cached_analysis.trend_direction
@@ -1076,8 +1194,8 @@ class GridBot:
                     )
 
                     if candles:
-                        tp_percent = await get_smart_tp(candles=candles)
-                        logger.info(f"🧠 Smart TP (calculated): {tp_percent}%")
+                        tp_percent = await get_smart_tp(candles=candles, position_side=position_side)
+                        logger.info(f"🧠 Smart TP (calculated, {position_side}): {tp_percent}%")
                     else:
                         tp_percent = config.risk.DEFAULT_TP_PERCENT
                         logger.warning(f"No candle data, using default TP: {tp_percent}%")
@@ -1306,7 +1424,7 @@ class GridBot:
 
             level.side = OrderSide.SELL
             level.client_order_id = client_order_id
-            level.state = GridLevelState.EMPTY  # SHORT mode starts with SELL
+            level.state = GridLevelState.SELL_PLACED  # SHORT mode starts with SELL
             level.filled = False
 
             response = await self.client.place_order(
@@ -1324,6 +1442,35 @@ class GridBot:
 
         except AsterAPIError as e:
             logger.error(f"Failed to re-place SELL: {e}")
+
+    async def _place_grid_order(self, level: GridLevel, side: str) -> None:
+        """Place a single grid order at the specified level (used by _ensure_max_orders)."""
+        try:
+            quantity = self.calculate_quantity_for_level(level.price)
+            client_order_id = f"grid_{level.index}_{int(datetime.now().timestamp())}"
+
+            level.side = OrderSide.BUY if side == "BUY" else OrderSide.SELL
+            level.client_order_id = client_order_id
+            level.state = GridLevelState.BUY_PLACED if side == "BUY" else GridLevelState.SELL_PLACED
+            level.filled = False
+
+            response = await self.client.place_order(
+                symbol=config.trading.SYMBOL,
+                side=side,
+                order_type="LIMIT",
+                quantity=quantity,
+                price=level.price,
+                client_order_id=client_order_id,
+            )
+
+            level.order_id = response.get("orderId")
+            logger.info(f"📋 {side} placed: ${level.price:.4f} | Level {level.index}")
+
+        except AsterAPIError as e:
+            logger.error(f"Failed to place {side} order at level {level.index}: {e}")
+            # Reset state on failure
+            level.state = GridLevelState.EMPTY
+            level.order_id = None
 
     async def _handle_tp_buy_filled(self, filled_level: GridLevel) -> None:
         """
@@ -1525,7 +1672,7 @@ class GridBot:
                 if tp_price is None and config.risk.USE_SMART_TP and config.risk.AUTO_TP_ENABLED:
                     cached_analysis = self.strategy_manager.last_analysis
                     if cached_analysis and cached_analysis.rsi > 0:
-                        tp_percent = await get_smart_tp(market_analysis=cached_analysis)
+                        tp_percent = await get_smart_tp(market_analysis=cached_analysis, position_side=position_side)
                     else:
                         tp_percent = config.risk.DEFAULT_TP_PERCENT
                     tp_mode = "smart"
@@ -1661,16 +1808,25 @@ class GridBot:
             )
             return True
 
-        # Check 2: Daily Loss Limit
-        daily_loss = self.state.daily_loss_percent
-        if daily_loss >= config.risk.DAILY_LOSS_LIMIT_PERCENT:
+        # Check 2: Daily Loss Limit (including unrealized losses)
+        daily_realized_loss = self.state.daily_loss_percent
+        # Also consider unrealized losses as part of daily impact
+        daily_total_pnl = self.state.daily_realized_pnl + min(Decimal("0"), self.state.unrealized_pnl)
+        daily_total_loss = Decimal("0")
+        if self.state.initial_balance > 0 and daily_total_pnl < 0:
+            daily_total_loss = abs(daily_total_pnl) / self.state.initial_balance * 100
+        effective_daily_loss = max(daily_realized_loss, daily_total_loss)
+        if effective_daily_loss >= config.risk.DAILY_LOSS_LIMIT_PERCENT:
             logger.critical(
-                f"🚨 DAILY LOSS LIMIT: Loss {daily_loss:.2f}% >= "
-                f"LIMIT {config.risk.DAILY_LOSS_LIMIT_PERCENT}%"
+                f"🚨 DAILY LOSS LIMIT: Loss {effective_daily_loss:.2f}% >= "
+                f"LIMIT {config.risk.DAILY_LOSS_LIMIT_PERCENT}% "
+                f"(realized={daily_realized_loss:.2f}%, unrealized={self.state.unrealized_pnl:.2f})"
             )
             await self.telegram.send_message(
                 f"🚨 *DAILY LOSS LIMIT REACHED*\n\n"
-                f"Daily Loss: {daily_loss:.2f}%\n"
+                f"Effective Daily Loss: {effective_daily_loss:.2f}%\n"
+                f"Realized: {daily_realized_loss:.2f}%\n"
+                f"Unrealized PnL: {self.state.unrealized_pnl:.2f}\n"
                 f"Limit: {config.risk.DAILY_LOSS_LIMIT_PERCENT}%\n\n"
                 f"Bot pausing until tomorrow."
             )
@@ -1706,15 +1862,19 @@ class GridBot:
                 # For now, just trigger emergency shutdown
                 return True
 
-        # Check 4: Minimum Balance
-        if self.state.current_balance < config.risk.MIN_BALANCE_USDT:
+        # Check 4: Minimum Balance (using equity = balance + unrealized PnL)
+        current_equity = self.state.current_balance + self.state.unrealized_pnl
+        if current_equity < config.risk.MIN_BALANCE_USDT:
             logger.critical(
-                f"🚨 CIRCUIT BREAKER: Balance {self.state.current_balance} < "
-                f"MIN {config.risk.MIN_BALANCE_USDT}"
+                f"🚨 CIRCUIT BREAKER: Equity {current_equity:.2f} < "
+                f"MIN {config.risk.MIN_BALANCE_USDT} "
+                f"(balance={self.state.current_balance:.2f}, uPnL={self.state.unrealized_pnl:.2f})"
             )
             await self.telegram.send_message(
                 f"🚨 *MINIMUM BALANCE REACHED*\n\n"
+                f"Equity: {current_equity:.2f}\n"
                 f"Balance: {self.state.current_balance:.2f}\n"
+                f"Unrealized PnL: {self.state.unrealized_pnl:.2f}\n"
                 f"Minimum: {config.risk.MIN_BALANCE_USDT}\n\n"
                 f"Bot is stopping."
             )
@@ -1933,6 +2093,71 @@ class GridBot:
             logger.error(f"Smart Startup check failed: {e}")
             logger.info(f"Falling back to config grid side: {config.grid.GRID_SIDE}")
 
+    async def _can_force_switch(
+        self,
+        pos_side: str,
+        new_side: str,
+        position_amt: Decimal,
+        entry_price: Decimal,
+        pos: dict
+    ) -> bool:
+        """
+        Check if conditions allow force-closing position to switch sides.
+
+        Force switch requires:
+        1. Trend score >= FORCE_SWITCH_MIN_SCORE in the new direction
+        2. Unrealized loss <= FORCE_SWITCH_MAX_LOSS_PERCENT
+        3. BTC alignment (optional but recommended)
+
+        Returns True if force switch is allowed.
+        """
+        # Check 1: Strong trend score in new direction
+        sm = getattr(self, 'strategy_manager', None)
+        if not sm or not sm.current_trend_score:
+            logger.info("Force switch: no trend score available, blocking")
+            return False
+
+        score = sm.current_trend_score.total
+        min_score = config.grid.FORCE_SWITCH_MIN_SCORE
+
+        if new_side == "LONG" and score < min_score:
+            logger.info(f"Force switch: score {score} < {min_score} for LONG, blocking")
+            return False
+        if new_side == "SHORT" and score > -min_score:
+            logger.info(f"Force switch: score {score} > {-min_score} for SHORT, blocking")
+            return False
+
+        # Check 2: Unrealized loss is within acceptable range
+        unrealized_pnl = Decimal(str(pos.get("unrealizedProfit", "0")))
+        position_value = entry_price * position_amt
+        if position_value > 0:
+            loss_percent = abs(min(Decimal("0"), unrealized_pnl)) / position_value * 100
+        else:
+            loss_percent = Decimal("0")
+
+        max_loss = config.grid.FORCE_SWITCH_MAX_LOSS_PERCENT
+        if loss_percent > max_loss:
+            logger.info(
+                f"Force switch: unrealized loss {loss_percent:.2f}% > max {max_loss}%, blocking"
+            )
+            return False
+
+        # Check 3: BTC alignment (optional)
+        if config.grid.FORCE_SWITCH_REQUIRE_BTC_ALIGNMENT and sm.btc_trend_score:
+            btc_total = sm.btc_trend_score.total
+            if new_side == "LONG" and btc_total <= -1:
+                logger.info(f"Force switch: BTC bearish ({btc_total}), blocking LONG switch")
+                return False
+            if new_side == "SHORT" and btc_total >= 1:
+                logger.info(f"Force switch: BTC bullish ({btc_total}), blocking SHORT switch")
+                return False
+
+        logger.info(
+            f"Force switch ALLOWED: score={score}, loss={loss_percent:.2f}%, "
+            f"BTC={'aligned' if sm.btc_trend_score else 'N/A'}"
+        )
+        return True
+
     async def _send_switch_blocked_alert(
         self,
         pos_side: str,
@@ -2027,6 +2252,7 @@ class GridBot:
 
         # CRITICAL: Check for existing positions before switching
         # Switching while holding position causes realized losses
+        # UNLESS force-switch conditions are met (strong reversal + BTC alignment)
         try:
             positions = await self.client.get_position_risk(config.trading.SYMBOL)
             for pos in positions:
@@ -2034,28 +2260,60 @@ class GridBot:
                     position_amt = Decimal(pos.get("positionAmt", "0"))
                     entry_price = Decimal(pos.get("entryPrice", "0"))
 
-                    # Block switch if we have LONG position and switching to SHORT (or vice versa)
-                    if old_side == "LONG" and new_side == "SHORT" and position_amt > 0:
-                        # Get detailed info for improved alert
-                        await self._send_switch_blocked_alert(
-                            pos_side="LONG",
-                            new_side=new_side,
-                            position_amt=position_amt,
-                            entry_price=entry_price,
-                            pos=pos
-                        )
-                        return
+                    has_long = old_side == "LONG" and position_amt > 0
+                    has_short = old_side == "SHORT" and position_amt < 0
 
-                    if old_side == "SHORT" and new_side == "LONG" and position_amt < 0:
-                        # Get detailed info for improved alert
-                        await self._send_switch_blocked_alert(
-                            pos_side="SHORT",
-                            new_side=new_side,
-                            position_amt=abs(position_amt),
-                            entry_price=entry_price,
-                            pos=pos
-                        )
-                        return
+                    if (has_long and new_side == "SHORT") or (has_short and new_side == "LONG"):
+                        pos_side = "LONG" if has_long else "SHORT"
+                        abs_amt = abs(position_amt)
+
+                        # Check if force-switch is allowed
+                        if config.grid.FORCE_SWITCH_ENABLED:
+                            can_force = await self._can_force_switch(
+                                pos_side=pos_side,
+                                new_side=new_side,
+                                position_amt=abs_amt,
+                                entry_price=entry_price,
+                                pos=pos
+                            )
+                            if can_force:
+                                # Close position at market, then continue with switch
+                                logger.warning(
+                                    f"🔄 FORCE SWITCH: Closing {pos_side} position to switch to {new_side}"
+                                )
+                                close_result = await self.close_all_positions()
+                                if close_result.get("success"):
+                                    pnl = close_result.get("realized_pnl", Decimal("0"))
+                                    await self.telegram.send_message(
+                                        f"🔄 Force Switch: Closed {pos_side} position\n"
+                                        f"Realized PnL: ${pnl:+.2f}\n"
+                                        f"Reason: Strong reversal confirmed\n"
+                                        f"Now switching to {new_side}..."
+                                    )
+                                    # Fall through to execute the switch below
+                                else:
+                                    logger.error("Force switch: failed to close position")
+                                    return
+                            else:
+                                # Block switch (force conditions not met)
+                                await self._send_switch_blocked_alert(
+                                    pos_side=pos_side,
+                                    new_side=new_side,
+                                    position_amt=abs_amt,
+                                    entry_price=entry_price,
+                                    pos=pos
+                                )
+                                return
+                        else:
+                            # Force switch disabled, always block
+                            await self._send_switch_blocked_alert(
+                                pos_side=pos_side,
+                                new_side=new_side,
+                                position_amt=abs_amt,
+                                entry_price=entry_price,
+                                pos=pos
+                            )
+                            return
                     break
         except Exception as e:
             logger.error(f"Failed to check positions before switch: {e}")
@@ -2748,6 +3006,12 @@ class GridBot:
                         market_regime = "Ranging"
                         recommendation = "Grid optimal"
 
+                    # Session and sizing info
+                    session_name = self._get_current_session_name()
+                    vol_factor = self._get_volatility_size_factor()
+                    session_size_factor = self._get_session_size_factor()
+                    effective_size = config.grid.QUANTITY_PER_GRID_USDT * vol_factor * session_size_factor
+
                     market_status = {
                         "state": analysis.state.value,
                         "trend_score": analysis.trend_score,
@@ -2758,6 +3022,9 @@ class GridBot:
                         "atr_percent": atr_percent,
                         "market_regime": market_regime,
                         "recommendation": recommendation,
+                        "session": session_name,
+                        "effective_size": f"${effective_size:.2f}",
+                        "vol_factor": f"{vol_factor:.2f}",
                     }
 
                 await self.telegram.send_hourly_summary(

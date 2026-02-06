@@ -355,13 +355,25 @@ _Manual intervention required!_
             else:
                 score_emoji = "⚪"
 
+            # Session and sizing info
+            session = market_status.get("session", "")
+            effective_size = market_status.get("effective_size", "")
+            vol_factor = market_status.get("vol_factor", "")
+
+            session_line = ""
+            if session:
+                session_line = f"\n├ 🕐 Session: `{session}`"
+            sizing_line = ""
+            if effective_size:
+                sizing_line = f"\n├ 📐 Size: `{effective_size}/grid` (vol×{vol_factor})"
+
             market_section = f"""
 🌍 *Market Status*
 ├ {regime_emoji} Regime: `{market_regime}`
 ├ {score_emoji} Trend: `{trend_score:+d}`
 ├ 📊 RSI: `{rsi:.1f}`
 ├ 📈 Volume: `{volume_ratio:.1f}x`
-├ 💵 Price: `${price:.2f}`
+├ 💵 Price: `${price:.2f}`{session_line}{sizing_line}
 └ 🎯 Grid: `{current_side}`
 
 💡 *{recommendation}*

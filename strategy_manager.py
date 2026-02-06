@@ -25,6 +25,9 @@ from typing import Literal
 import pandas as pd
 import websockets
 
+from ta.momentum import RSIIndicator
+from ta.trend import MACD, EMAIndicator
+
 from aster_client import AsterClient
 from config import config
 from telegram_notifier import TelegramNotifier
@@ -273,6 +276,21 @@ class StrategyManager:
         self.indicator_analyzer = IndicatorAnalyzer()
         self.last_stochrsi_k: float | None = None  # Cached StochRSI value
         
+        # Multi-Timeframe Filter (4h trend)
+        self.last_htf_trend_score: TrendScore | None = None
+        self.last_htf_analysis_time: datetime | None = None
+
+        # Choppy Market Detection
+        self.choppy_count: int = 0
+        self.choppy_paused: bool = False
+        self.choppy_pause_until: datetime | None = None
+        self.recent_signal_directions: list[str] = []
+
+        # Anti-Whipsaw Protection
+        self.last_switch_time: datetime | None = None
+        self.daily_switch_count: int = 0
+        self.daily_switch_reset_time: datetime = datetime.now()
+
         # Dynamic Re-Grid on TP tracking
         self.grid_placement_score: int = 0  # Score when grid was placed
         self.last_analysis_time: datetime | None = None
@@ -305,6 +323,12 @@ class StrategyManager:
         self.btc_rsi_danger_high = 70  # BTC overbought - danger for LONG
         self.btc_rsi_danger_low = 30   # BTC oversold - danger for SHORT
         self.btc_divergence_alert_sent = False
+
+        # BTC Leading Indicator (momentum tracking)
+        self.btc_price_history: list[tuple[datetime, Decimal]] = []
+        self.btc_momentum_short: Decimal = Decimal("0")  # Short window % change
+        self.btc_momentum_long: Decimal = Decimal("0")    # Long window % change
+        self.btc_momentum_alert_sent: bool = False
 
         # Liquidity Crisis Detection
         self.spread_warning_threshold = Decimal("0.003")  # 0.3% spread = warning
@@ -346,6 +370,20 @@ class StrategyManager:
 
         while self.is_running:
             try:
+                # Check if choppy pause has expired (auto-resume)
+                if (
+                    self.choppy_paused
+                    and self.choppy_pause_until
+                    and datetime.now() >= self.choppy_pause_until
+                ):
+                    self.choppy_paused = False
+                    self.choppy_pause_until = None
+                    self.choppy_count = 0
+                    self.recent_signal_directions = []
+                    if self.bot and self.bot.is_paused:
+                        await self.bot.resume()
+                        logger.info("Choppy market pause expired, bot resumed")
+
                 # Analyze main trading symbol (SOL)
                 analysis = await self.analyze_market()
                 await self.evaluate_safety(analysis)
@@ -608,8 +646,8 @@ class StrategyManager:
         - If BTC is overbought (RSI > 70) → potential reversal
         - If BTC breaks key support/resistance → altcoins follow
 
-        This method compares BTC trend with current grid side and alerts
-        if there's a dangerous divergence.
+        Enhanced with momentum tracking to detect BTC price movements
+        before they propagate to altcoins (typically 1-4h lag).
         """
         try:
             # Analyze BTC market
@@ -626,20 +664,123 @@ class StrategyManager:
             )
             self.btc_trend_score = btc_score
 
+            # Track BTC price history for momentum analysis
+            self._update_btc_momentum(btc_analysis.current_price)
+
             # Get current grid side and SOL trend
             grid_side = config.grid.GRID_SIDE
             sol_score = self.current_trend_score.total if self.current_trend_score else 0
 
             logger.info(
                 f"BTC Correlation Check: BTC={btc_score.total:+d} RSI={btc_analysis.rsi:.1f} | "
-                f"SOL={sol_score:+d} | Grid={grid_side}"
+                f"SOL={sol_score:+d} | Grid={grid_side} | "
+                f"BTC Momentum: {self.btc_momentum_short:+.2f}% (1h) / {self.btc_momentum_long:+.2f}% (4h)"
             )
 
-            # Check for dangerous divergences
+            # Check for dangerous divergences (existing logic)
             await self._evaluate_btc_divergence(btc_analysis, btc_score, grid_side)
+
+            # Check BTC momentum-based leading signals
+            if config.grid.BTC_LEADING_INDICATOR_ENABLED:
+                await self._evaluate_btc_momentum(grid_side)
 
         except Exception as e:
             logger.error(f"Error checking BTC correlation: {e}")
+
+    def _update_btc_momentum(self, current_price: Decimal) -> None:
+        """Track BTC price over time and compute momentum."""
+        now = datetime.now()
+        self.btc_price_history.append((now, current_price))
+
+        # Prune old entries (keep max 6 hours of data)
+        cutoff = now - timedelta(hours=6)
+        self.btc_price_history = [
+            (t, p) for t, p in self.btc_price_history if t >= cutoff
+        ]
+
+        # Calculate short-window momentum
+        short_cutoff = now - timedelta(minutes=config.grid.BTC_MOMENTUM_SHORT_WINDOW)
+        short_prices = [p for t, p in self.btc_price_history if t <= short_cutoff]
+        if short_prices:
+            old_price = short_prices[-1]  # Closest to the window start
+            if old_price > 0:
+                self.btc_momentum_short = (current_price - old_price) / old_price * 100
+        else:
+            self.btc_momentum_short = Decimal("0")
+
+        # Calculate long-window momentum
+        long_cutoff = now - timedelta(minutes=config.grid.BTC_MOMENTUM_LONG_WINDOW)
+        long_prices = [p for t, p in self.btc_price_history if t <= long_cutoff]
+        if long_prices:
+            old_price = long_prices[-1]
+            if old_price > 0:
+                self.btc_momentum_long = (current_price - old_price) / old_price * 100
+        else:
+            self.btc_momentum_long = Decimal("0")
+
+    async def _evaluate_btc_momentum(self, grid_side: str) -> None:
+        """
+        Evaluate BTC momentum as a leading indicator.
+
+        BTC typically moves 1-4 hours before altcoins follow.
+        A sharp BTC drop signals danger for LONG altcoin positions.
+        A sharp BTC pump signals danger for SHORT altcoin positions.
+        """
+        alert_pct = config.grid.BTC_MOMENTUM_ALERT_PERCENT
+        danger_pct = config.grid.BTC_MOMENTUM_DANGER_PERCENT
+
+        # Use whichever momentum window shows a bigger move
+        btc_move = max(abs(self.btc_momentum_short), abs(self.btc_momentum_long))
+        # Determine direction from the short window (more recent signal)
+        btc_direction = "UP" if self.btc_momentum_short > 0 else "DOWN"
+
+        # Check if BTC momentum is dangerous for current grid side
+        danger_detected = False
+        severity = "WARNING"
+
+        if grid_side == "LONG" and btc_direction == "DOWN" and btc_move >= alert_pct:
+            danger_detected = True
+            severity = "CRITICAL" if btc_move >= danger_pct else "WARNING"
+
+        elif grid_side == "SHORT" and btc_direction == "UP" and btc_move >= alert_pct:
+            danger_detected = True
+            severity = "CRITICAL" if btc_move >= danger_pct else "WARNING"
+
+        if danger_detected and not self.btc_momentum_alert_sent:
+            self.btc_momentum_alert_sent = True
+            icon = "🚨" if severity == "CRITICAL" else "⚠️"
+
+            await self.telegram.send_message(
+                f"{icon} BTC Momentum Alert!\n\n"
+                f"BTC moving {btc_direction} aggressively:\n"
+                f"  1h change: {self.btc_momentum_short:+.2f}%\n"
+                f"  4h change: {self.btc_momentum_long:+.2f}%\n\n"
+                f"Your Grid: {grid_side}\n"
+                f"{'🔴 BTC leads altcoins — expect SOL to follow!' if severity == 'CRITICAL' else '⚠️ Monitor closely, BTC may drag SOL.'}"
+            )
+            logger.warning(
+                f"BTC Momentum Alert: {btc_direction} {btc_move:.2f}% vs {grid_side} grid"
+            )
+        elif not danger_detected and self.btc_momentum_alert_sent:
+            self.btc_momentum_alert_sent = False
+            logger.info("BTC momentum alert cleared")
+
+    def get_btc_momentum_signal(self) -> int:
+        """
+        Get BTC momentum as a signal for switch decisions.
+
+        Returns:
+            +1 if BTC momentum supports LONG (bullish)
+            -1 if BTC momentum supports SHORT (bearish)
+            0 if neutral
+        """
+        alert_pct = config.grid.BTC_MOMENTUM_ALERT_PERCENT
+
+        if self.btc_momentum_short >= alert_pct:
+            return 1  # BTC pumping → bullish signal
+        elif self.btc_momentum_short <= -alert_pct:
+            return -1  # BTC dumping → bearish signal
+        return 0
 
     async def _evaluate_btc_divergence(
         self,
@@ -1667,6 +1808,173 @@ class StrategyManager:
             volume_ratio=volume_ratio
         )
     
+    async def _check_choppy_market(self, analysis: MarketAnalysis) -> bool:
+        """
+        Detect choppy market conditions and auto-pause if confirmed.
+
+        Choppiness is detected when:
+        - abs(trend_score) < CHOPPY_TREND_THRESHOLD (no clear direction)
+        - volume_ratio < CHOPPY_VOLUME_THRESHOLD (low conviction)
+        - Signal direction oscillates frequently
+
+        Returns:
+            True if in choppy pause (skip auto-switch), False otherwise
+        """
+        if not config.grid.CHOPPY_MARKET_PAUSE_ENABLED:
+            return False
+
+        # If currently in choppy pause, check if expired
+        if self.choppy_paused and self.choppy_pause_until:
+            if datetime.now() >= self.choppy_pause_until:
+                # Pause expired — re-evaluate
+                self.choppy_paused = False
+                self.choppy_pause_until = None
+                self.choppy_count = 0
+                self.recent_signal_directions = []
+                logger.info("Choppy pause expired, re-evaluating market")
+
+                if self.bot and self.bot.is_paused:
+                    await self.bot.resume()
+                return False
+            else:
+                # Still in pause
+                return True
+
+        # Detect choppiness
+        trend_score = self.current_trend_score.total if self.current_trend_score else 0
+        volume_ratio = self.current_trend_score.volume_ratio if self.current_trend_score else 1.0
+
+        is_choppy_now = (
+            abs(trend_score) < config.grid.CHOPPY_TREND_THRESHOLD
+            and volume_ratio < config.grid.CHOPPY_VOLUME_THRESHOLD
+        )
+
+        # Track signal direction for oscillation detection
+        if trend_score > 0:
+            self.recent_signal_directions.append("LONG")
+        elif trend_score < 0:
+            self.recent_signal_directions.append("SHORT")
+        else:
+            self.recent_signal_directions.append("NEUTRAL")
+
+        # Keep only last 6 checks
+        if len(self.recent_signal_directions) > 6:
+            self.recent_signal_directions = self.recent_signal_directions[-6:]
+
+        # Count direction flips (oscillation indicator)
+        flips = 0
+        for i in range(1, len(self.recent_signal_directions)):
+            prev = self.recent_signal_directions[i - 1]
+            curr = self.recent_signal_directions[i]
+            if prev != curr and prev != "NEUTRAL" and curr != "NEUTRAL":
+                flips += 1
+
+        # Extra choppy signal if oscillating frequently
+        is_oscillating = flips >= 2 and len(self.recent_signal_directions) >= 4
+
+        if is_choppy_now or is_oscillating:
+            self.choppy_count += 1
+            logger.info(
+                f"Choppy market detected: count={self.choppy_count}/{config.grid.CHOPPY_CONFIRMATION_CHECKS} "
+                f"(score={trend_score}, vol={volume_ratio:.2f}, flips={flips})"
+            )
+        else:
+            self.choppy_count = max(0, self.choppy_count - 1)
+
+        # Trigger pause if confirmed
+        if self.choppy_count >= config.grid.CHOPPY_CONFIRMATION_CHECKS:
+            self.choppy_paused = True
+            self.choppy_pause_until = datetime.now() + timedelta(
+                minutes=config.grid.CHOPPY_PAUSE_DURATION_MINUTES
+            )
+
+            logger.warning(
+                f"Choppy market confirmed! Pausing for {config.grid.CHOPPY_PAUSE_DURATION_MINUTES} min"
+            )
+
+            if self.bot and hasattr(self.bot, 'pause'):
+                await self.bot.pause()
+
+            await self.telegram.send_message(
+                f"⏸️ Choppy Market Detected\n\n"
+                f"Trend Score: {trend_score}\n"
+                f"Volume: {volume_ratio:.2f}x\n"
+                f"Direction Flips: {flips}/6\n"
+                f"Consecutive Checks: {self.choppy_count}\n\n"
+                f"Pausing for {config.grid.CHOPPY_PAUSE_DURATION_MINUTES} min.\n"
+                f"Auto-resume at {self.choppy_pause_until.strftime('%H:%M')}"
+            )
+            return True
+
+        return False
+
+    async def _analyze_higher_timeframe(self) -> TrendScore | None:
+        """
+        Analyze higher timeframe (4h) trend to filter side switches.
+
+        Uses cached result for 30 minutes to avoid excessive API calls.
+
+        Returns:
+            TrendScore for 4h timeframe, or None on failure
+        """
+        # Return cached result if fresh enough (30 min)
+        if (
+            self.last_htf_trend_score is not None
+            and self.last_htf_analysis_time is not None
+            and (datetime.now() - self.last_htf_analysis_time).total_seconds() < 1800
+        ):
+            return self.last_htf_trend_score
+
+        try:
+            candles = await self.client.get_klines(
+                symbol=config.trading.SYMBOL,
+                interval=config.grid.HTF_INTERVAL,
+                limit=100
+            )
+
+            if not candles or len(candles) < 50:
+                logger.warning(f"Not enough {config.grid.HTF_INTERVAL} candles for MTF analysis")
+                return self.last_htf_trend_score  # Return stale data rather than None
+
+            # Convert to DataFrame and calculate indicators (same as analyze_market)
+            df = pd.DataFrame(candles, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_volume', 'trades', 'taker_buy_volume',
+                'taker_buy_quote_volume', 'ignore'
+            ])
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            ema_fast = EMAIndicator(close=df['close'], window=self.ma_fast_period).ema_indicator()
+            ema_slow = EMAIndicator(close=df['close'], window=self.ma_slow_period).ema_indicator()
+            rsi = RSIIndicator(close=df['close'], window=14).rsi()
+            macd_indicator = MACD(close=df['close'], window_fast=12, window_slow=26, window_sign=9)
+            macd_hist = macd_indicator.macd_diff()
+
+            latest = df.iloc[-1]
+            ema_f = Decimal(str(ema_fast.iloc[-1])) if pd.notna(ema_fast.iloc[-1]) else Decimal("0")
+            ema_s = Decimal(str(ema_slow.iloc[-1])) if pd.notna(ema_slow.iloc[-1]) else Decimal("0")
+            rsi_val = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
+            macd_h = float(macd_hist.iloc[-1]) if pd.notna(macd_hist.iloc[-1]) else 0.0
+
+            # Calculate volume ratio
+            vol_series = df['volume'].astype(float)
+            avg_vol = vol_series.rolling(window=20).mean().iloc[-1]
+            current_vol = float(latest['volume'])
+            vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1.0
+
+            htf_score = self._calculate_trend_score(ema_f, ema_s, macd_h, rsi_val, vol_ratio)
+
+            self.last_htf_trend_score = htf_score
+            self.last_htf_analysis_time = datetime.now()
+
+            logger.info(f"MTF Analysis ({config.grid.HTF_INTERVAL}): {htf_score}")
+            return htf_score
+
+        except Exception as e:
+            logger.error(f"Error in higher timeframe analysis: {e}")
+            return self.last_htf_trend_score
+
     async def _check_auto_switch(self, analysis: MarketAnalysis) -> None:
         """
         Check if grid side should be switched based on trend score.
@@ -1685,6 +1993,26 @@ class StrategyManager:
             return
 
         if self.current_trend_score is None:
+            return
+
+        # Anti-whipsaw: enforce cooldown between switches
+        if self.last_switch_time:
+            elapsed = (datetime.now() - self.last_switch_time).total_seconds()
+            if elapsed < config.grid.SIDE_SWITCH_COOLDOWN_SECONDS:
+                remaining = config.grid.SIDE_SWITCH_COOLDOWN_SECONDS - elapsed
+                logger.debug(f"Anti-whipsaw: cooldown active, {remaining:.0f}s remaining")
+                return
+            # Cooldown just expired — reset points once for fresh evaluation
+            logger.info("Anti-whipsaw: cooldown expired, allowing switches again")
+            self.last_switch_time = None  # Clear so this only triggers once
+            self.fast_trend_confirmation.reset()
+
+        # Anti-whipsaw: daily switch limit
+        if datetime.now().date() > self.daily_switch_reset_time.date():
+            self.daily_switch_count = 0
+            self.daily_switch_reset_time = datetime.now()
+        if config.grid.MAX_SWITCHES_PER_DAY > 0 and self.daily_switch_count >= config.grid.MAX_SWITCHES_PER_DAY:
+            logger.warning(f"Anti-whipsaw: daily switch limit reached ({self.daily_switch_count}/{config.grid.MAX_SWITCHES_PER_DAY})")
             return
 
         recommended = self.current_trend_score.recommended_side
@@ -1736,6 +2064,17 @@ class StrategyManager:
             except Exception as e:
                 logger.warning(f"Could not calculate StochRSI: {e}")
 
+        # Multi-Timeframe Filter: block switch if 4h trend disagrees
+        if config.grid.USE_MULTI_TIMEFRAME_FILTER and recommended != current_side:
+            htf_score = await self._analyze_higher_timeframe()
+            if htf_score:
+                if recommended == "LONG" and htf_score.total <= -config.grid.HTF_MIN_SCORE:
+                    logger.info(f"MTF Filter: Blocking LONG switch, 4h score={htf_score.total}")
+                    return
+                if recommended == "SHORT" and htf_score.total >= config.grid.HTF_MIN_SCORE:
+                    logger.info(f"MTF Filter: Blocking SHORT switch, 4h score={htf_score.total}")
+                    return
+
         # Run point-based check
         new_side = self.fast_trend_confirmation.add_check(
             trend_score=trend_score,
@@ -1745,13 +2084,29 @@ class StrategyManager:
             current_side=current_side
         )
 
+        # BTC momentum penalty: subtract points when BTC opposes the switch
+        if config.grid.BTC_LEADING_INDICATOR_ENABLED and recommended != current_side:
+            btc_signal = self.get_btc_momentum_signal()
+            ftc = self.fast_trend_confirmation
+            if ftc.pending_direction:
+                # BTC bearish (-1) opposes LONG switch, BTC bullish (+1) opposes SHORT switch
+                if (recommended == "LONG" and btc_signal < 0) or \
+                   (recommended == "SHORT" and btc_signal > 0):
+                    penalty = config.grid.BTC_MOMENTUM_SWITCH_PENALTY
+                    ftc.accumulated_points = max(0, ftc.accumulated_points - penalty)
+                    logger.info(
+                        f"BTC Momentum Penalty: -{penalty} points (BTC signal={btc_signal}, "
+                        f"switch to {recommended}), remaining={ftc.accumulated_points}"
+                    )
+
         # Log status
         ftc = self.fast_trend_confirmation
         if ftc.pending_direction:
             stochrsi_str = f"{stochrsi_k:.1f}" if stochrsi_k else "N/A"
+            btc_mom_str = f"{self.btc_momentum_short:+.1f}%" if config.grid.BTC_LEADING_INDICATOR_ENABLED else "off"
             logger.info(
                 f"Point Confirmation: {ftc.get_status()} | "
-                f"Score={trend_score}, StochRSI={stochrsi_str}, Vol={volume_ratio:.2f}"
+                f"Score={trend_score}, StochRSI={stochrsi_str}, Vol={volume_ratio:.2f}, BTC={btc_mom_str}"
             )
 
             # Send Telegram notification on first signal (with cooldown to prevent spam)
@@ -1816,6 +2171,17 @@ class StrategyManager:
             self.switch_confirmation_count = 0
             return
 
+        # Multi-Timeframe Filter: block switch if 4h trend disagrees
+        if config.grid.USE_MULTI_TIMEFRAME_FILTER:
+            htf_score = await self._analyze_higher_timeframe()
+            if htf_score:
+                if recommended == "LONG" and htf_score.total <= -config.grid.HTF_MIN_SCORE:
+                    logger.info(f"MTF Filter (legacy): Blocking LONG switch, 4h score={htf_score.total}")
+                    return
+                if recommended == "SHORT" and htf_score.total >= config.grid.HTF_MIN_SCORE:
+                    logger.info(f"MTF Filter (legacy): Blocking SHORT switch, 4h score={htf_score.total}")
+                    return
+
         # Check if this is a new pending switch or continuation
         if self.pending_switch_side == recommended:
             # Same recommendation as before, increment counter
@@ -1863,15 +2229,20 @@ class StrategyManager:
         # Execute switch via bot reference
         if self.bot and hasattr(self.bot, 'switch_grid_side'):
             await self.bot.switch_grid_side(new_side)
-            
+
+            # Record switch for anti-whipsaw tracking
+            self.last_switch_time = datetime.now()
+            self.daily_switch_count += 1
+
             await self.telegram.send_message(
                 f"✅ Switch Complete!\n\n"
                 f"Grid now: {new_side}-only\n"
-                f"New orders placed."
+                f"New orders placed.\n"
+                f"Switches today: {self.daily_switch_count}/{config.grid.MAX_SWITCHES_PER_DAY}"
             )
         else:
             logger.error("Cannot switch: bot reference not available")
-        
+
         # Reset tracking
         self.pending_switch_side = None
         self.switch_confirmation_count = 0
@@ -2024,7 +2395,12 @@ class StrategyManager:
         
         # Update previous state
         self.previous_state = current_state
-        
+
+        # Check choppy market BEFORE auto-switch
+        is_choppy = await self._check_choppy_market(analysis)
+        if is_choppy:
+            return  # Skip auto-switch during choppy conditions
+
         # Check for auto-switch based on trend score
         await self._check_auto_switch(analysis)
 
