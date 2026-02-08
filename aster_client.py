@@ -30,6 +30,328 @@ from config import config
 logger = logging.getLogger(__name__)
 
 
+class PaperTradingEngine:
+    """
+    Paper trading engine for DRY_RUN mode.
+
+    Maintains a virtual order book, tracks positions and balance,
+    polls real market prices to detect fills, and emits events in the
+    exact same format as the real WebSocket stream so grid_bot.py
+    needs zero changes.
+    """
+
+    def __init__(self, initial_balance: Decimal, margin_asset: str, symbol: str):
+        self.symbol = symbol
+        self.margin_asset = margin_asset
+
+        # Virtual order book: order_id -> order dict
+        self.open_orders: dict[int, dict] = {}
+
+        # Virtual account state
+        self.balance = Decimal(str(initial_balance))
+        self.position_amt = Decimal("0")  # + long, - short
+        self.entry_price = Decimal("0")
+        self.mark_price = Decimal("0")
+
+        # Callbacks (set by subscribe_user_data)
+        self.on_order_update: Callable | None = None
+        self.on_position_update: Callable | None = None
+        self.on_balance_update: Callable | None = None
+
+        # Reference to the AsterClient for fetching real prices
+        self._client: "AsterClient | None" = None
+        self._running = False
+        self._task: asyncio.Task | None = None
+
+        # Commission rate (taker fee)
+        self._commission_rate = Decimal("0.0005")  # 0.05%
+
+    # ------------------------------------------------------------------
+    # Order book management
+    # ------------------------------------------------------------------
+
+    def add_order(
+        self,
+        order_id: int,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: str,
+        price: str,
+        client_order_id: str = "",
+        reduce_only: bool = False,
+    ) -> None:
+        """Store an order in the paper book."""
+        self.open_orders[order_id] = {
+            "orderId": order_id,
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "origQty": quantity,
+            "price": price,
+            "status": "NEW",
+            "clientOrderId": client_order_id,
+            "reduceOnly": reduce_only,
+            "time": int(time.time() * 1000),
+        }
+        logger.debug(f"[PAPER] Order added: {side} {quantity} @ {price} (id={order_id})")
+
+    def remove_order(self, order_id: int) -> bool:
+        """Remove an order from the paper book. Returns True if found."""
+        if order_id in self.open_orders:
+            del self.open_orders[order_id]
+            logger.debug(f"[PAPER] Order removed: {order_id}")
+            return True
+        return False
+
+    def remove_all_orders(self, symbol: str | None = None) -> int:
+        """Remove all orders (optionally for a symbol). Returns count removed."""
+        if symbol is None:
+            count = len(self.open_orders)
+            self.open_orders.clear()
+        else:
+            to_remove = [
+                oid for oid, o in self.open_orders.items() if o["symbol"] == symbol
+            ]
+            for oid in to_remove:
+                del self.open_orders[oid]
+            count = len(to_remove)
+        logger.info(f"[PAPER] Removed {count} orders")
+        return count
+
+    def get_orders(self, symbol: str | None = None) -> list[dict]:
+        """Return open orders matching the API response format."""
+        orders = list(self.open_orders.values())
+        if symbol:
+            orders = [o for o in orders if o["symbol"] == symbol]
+        return orders
+
+    # ------------------------------------------------------------------
+    # Account queries
+    # ------------------------------------------------------------------
+
+    def get_balance(self) -> list[dict]:
+        """Return balance matching get_account_balance() API format."""
+        unrealized = self._calc_unrealized_pnl()
+        return [{
+            "asset": self.margin_asset,
+            "balance": str(self.balance),
+            "availableBalance": str(self.balance + unrealized),
+            "crossUnPnl": str(unrealized),
+        }]
+
+    def get_position(self, symbol: str | None = None) -> list[dict]:
+        """Return position matching get_position_risk() API format."""
+        sym = symbol or self.symbol
+        unrealized = self._calc_unrealized_pnl()
+        return [{
+            "symbol": sym,
+            "positionAmt": str(self.position_amt),
+            "entryPrice": str(self.entry_price),
+            "markPrice": str(self.mark_price),
+            "unRealizedProfit": str(unrealized),
+            "liquidationPrice": "0",
+            "leverage": str(config.trading.LEVERAGE),
+        }]
+
+    def _calc_unrealized_pnl(self) -> Decimal:
+        if self.position_amt == 0 or self.mark_price == 0:
+            return Decimal("0")
+        return (self.mark_price - self.entry_price) * self.position_amt
+
+    # ------------------------------------------------------------------
+    # Fill detection loop
+    # ------------------------------------------------------------------
+
+    async def start(self, client: "AsterClient", poll_interval: int = 5) -> None:
+        """Start the fill detection loop."""
+        self._client = client
+        self._running = True
+        logger.info(f"[PAPER] Fill detection started (poll every {poll_interval}s)")
+
+        while self._running:
+            try:
+                await self._check_fills()
+            except Exception as e:
+                logger.error(f"[PAPER] Fill check error: {e}")
+            await asyncio.sleep(poll_interval)
+
+    def stop(self) -> None:
+        """Stop the fill detection loop."""
+        self._running = False
+        logger.info("[PAPER] Fill detection stopped")
+
+    async def _check_fills(self) -> None:
+        """Poll real price and check if any paper orders would have filled."""
+        if not self._client or not self.open_orders:
+            return
+
+        try:
+            ticker = await self._client.get_ticker_price(self.symbol)
+            current_price = Decimal(ticker["price"])
+        except Exception as e:
+            logger.debug(f"[PAPER] Price fetch failed: {e}")
+            return
+
+        self.mark_price = current_price
+
+        # Emit position update with current mark price (for unrealized PnL)
+        if self.position_amt != 0 and self.on_position_update:
+            self.on_position_update({
+                "s": self.symbol,
+                "pa": str(self.position_amt),
+                "ep": str(self.entry_price),
+                "up": str(self._calc_unrealized_pnl()),
+            })
+
+        # Check each open order for fill
+        # Copy keys since we modify the dict during iteration
+        filled_ids = []
+        for order_id, order in list(self.open_orders.items()):
+            order_price = Decimal(order["price"])
+            side = order["side"]
+
+            should_fill = False
+            if side == "BUY" and current_price <= order_price:
+                should_fill = True
+            elif side == "SELL" and current_price >= order_price:
+                should_fill = True
+
+            if should_fill:
+                filled_ids.append(order_id)
+
+        # Process fills outside the iteration
+        for order_id in filled_ids:
+            if order_id in self.open_orders:
+                await self._process_fill(order_id, current_price)
+
+    async def _process_fill(self, order_id: int, market_price: Decimal) -> None:
+        """Process a single order fill: update state, emit events."""
+        order = self.open_orders.pop(order_id, None)
+        if order is None:
+            return
+
+        side = order["side"]
+        order_price = Decimal(order["price"])
+        quantity = Decimal(order["origQty"])
+        reduce_only = order.get("reduceOnly", False)
+
+        # Fill at the order's limit price (not market price — limit order guarantee)
+        fill_price = order_price
+        commission = fill_price * quantity * self._commission_rate
+
+        logger.info(
+            f"[PAPER] {side} FILLED: {quantity} @ {fill_price} "
+            f"(market={market_price}, commission={commission:.4f})"
+        )
+
+        # Update position and balance
+        self._update_position(side, fill_price, quantity, commission, reduce_only)
+
+        # Emit ORDER_TRADE_UPDATE (must match real WebSocket format)
+        if self.on_order_update:
+            self.on_order_update({
+                "i": order_id,                        # orderId
+                "X": "FILLED",                        # order status
+                "S": side,                            # BUY/SELL
+                "p": str(order_price),                # order price
+                "l": str(quantity),                    # last executed qty
+                "L": str(fill_price),                 # last executed price
+                "z": str(quantity),                    # cumulative filled qty
+                "q": str(quantity),                    # original qty
+                "o": order["type"],                    # order type
+                "n": str(commission),                  # commission
+                "N": "USDT",                           # commission asset
+                "c": order.get("clientOrderId", ""),   # client order id
+            })
+
+        # Emit ACCOUNT_UPDATE position
+        if self.on_position_update:
+            self.on_position_update({
+                "s": self.symbol,
+                "pa": str(self.position_amt),
+                "ep": str(self.entry_price),
+                "up": str(self._calc_unrealized_pnl()),
+            })
+
+        # Emit ACCOUNT_UPDATE balance
+        if self.on_balance_update:
+            self.on_balance_update({
+                "a": self.margin_asset,
+                "wb": str(self.balance),
+                "cw": str(self.balance),
+            })
+
+    def _update_position(
+        self,
+        side: str,
+        fill_price: Decimal,
+        quantity: Decimal,
+        commission: Decimal,
+        reduce_only: bool,
+    ) -> None:
+        """Update virtual position and balance after a fill."""
+        # Deduct commission from balance
+        self.balance -= commission
+
+        if side == "BUY":
+            if self.position_amt < 0:
+                # Closing/reducing a SHORT position
+                close_qty = min(quantity, abs(self.position_amt))
+                pnl = (self.entry_price - fill_price) * close_qty
+                self.balance += pnl
+                self.position_amt += close_qty
+
+                remaining = quantity - close_qty
+                if remaining > 0 and not reduce_only:
+                    # Opening a new LONG with remainder
+                    self.position_amt = remaining
+                    self.entry_price = fill_price
+                elif self.position_amt == 0:
+                    self.entry_price = Decimal("0")
+            else:
+                # Adding to LONG position (or opening new)
+                if self.position_amt == 0:
+                    self.entry_price = fill_price
+                    self.position_amt = quantity
+                else:
+                    # Weighted average entry
+                    total_cost = (self.entry_price * self.position_amt) + (fill_price * quantity)
+                    self.position_amt += quantity
+                    self.entry_price = total_cost / self.position_amt
+
+        elif side == "SELL":
+            if self.position_amt > 0:
+                # Closing/reducing a LONG position
+                close_qty = min(quantity, self.position_amt)
+                pnl = (fill_price - self.entry_price) * close_qty
+                self.balance += pnl
+                self.position_amt -= close_qty
+
+                remaining = quantity - close_qty
+                if remaining > 0 and not reduce_only:
+                    # Opening a new SHORT with remainder
+                    self.position_amt = -remaining
+                    self.entry_price = fill_price
+                elif self.position_amt == 0:
+                    self.entry_price = Decimal("0")
+            else:
+                # Adding to SHORT position (or opening new)
+                if self.position_amt == 0:
+                    self.entry_price = fill_price
+                    self.position_amt = -quantity
+                else:
+                    # Weighted average entry for shorts
+                    total_cost = (self.entry_price * abs(self.position_amt)) + (fill_price * quantity)
+                    self.position_amt -= quantity
+                    self.entry_price = total_cost / abs(self.position_amt)
+
+        logger.debug(
+            f"[PAPER] Position: {self.position_amt} @ {self.entry_price}, "
+            f"Balance: {self.balance:.4f}"
+        )
+
+
 class AsterAPIError(Exception):
     """
     Custom exception for Aster DEX API errors.
@@ -111,6 +433,16 @@ class AsterClient:
         self._symbol_precision_cache: dict[str, dict] = {}
         self._precision_cache_time: float = 0
         self._precision_cache_ttl: float = 3600  # 1 hour TTL
+
+        # Paper trading engine (initialized lazily on first DRY_RUN use)
+        self.paper_engine: PaperTradingEngine | None = None
+        self._paper_order_counter = 0
+        if config.DRY_RUN:
+            self.paper_engine = PaperTradingEngine(
+                initial_balance=config.INITIAL_CAPITAL_USDT,
+                margin_asset=config.trading.MARGIN_ASSET,
+                symbol=config.trading.SYMBOL,
+            )
     
     async def __aenter__(self) -> "AsterClient":
         """Async context manager entry - creates HTTP session."""
@@ -130,10 +462,13 @@ class AsterClient:
     
     async def close(self) -> None:
         """Close all connections gracefully."""
+        if self.paper_engine:
+            self.paper_engine.stop()
+
         if self._ws_connection:
             await self._ws_connection.close()
             self._ws_connection = None
-        
+
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
@@ -464,15 +799,10 @@ class AsterClient:
         Returns:
             List of asset balances
         """
-        if config.DRY_RUN:
-            logger.info("[DRY RUN] get_account_balance - returning mock data")
-            return [{
-                "asset": config.trading.MARGIN_ASSET,
-                "balance": str(config.INITIAL_CAPITAL_USDT),
-                "availableBalance": str(config.INITIAL_CAPITAL_USDT),
-                "crossUnPnl": "0",
-            }]
-        
+        if config.DRY_RUN and self.paper_engine:
+            logger.debug("[PAPER] get_account_balance")
+            return self.paper_engine.get_balance()
+
         return await self._request("GET", "/fapi/v2/balance", signed=True)
     
     async def get_position_risk(self, symbol: str | None = None) -> list[dict[str, Any]]:
@@ -493,18 +823,10 @@ class AsterClient:
         Returns:
             List of position info
         """
-        if config.DRY_RUN:
-            logger.info("[DRY RUN] get_position_risk - returning mock data")
-            return [{
-                "symbol": symbol or config.trading.SYMBOL,
-                "positionAmt": "0",
-                "entryPrice": "0",
-                "markPrice": "0.9683",
-                "unRealizedProfit": "0",
-                "liquidationPrice": "0",
-                "leverage": str(config.trading.LEVERAGE),
-            }]
-        
+        if config.DRY_RUN and self.paper_engine:
+            logger.debug("[PAPER] get_position_risk")
+            return self.paper_engine.get_position(symbol)
+
         params = {}
         if symbol:
             params["symbol"] = symbol
@@ -520,10 +842,10 @@ class AsterClient:
         Returns:
             List of open orders
         """
-        if config.DRY_RUN:
-            logger.info("[DRY RUN] get_open_orders - returning empty list")
-            return []
-        
+        if config.DRY_RUN and self.paper_engine:
+            logger.debug("[PAPER] get_open_orders")
+            return self.paper_engine.get_orders(symbol)
+
         params = {}
         if symbol:
             params["symbol"] = symbol
@@ -699,19 +1021,36 @@ class AsterClient:
             params["newClientOrderId"] = client_order_id
 
         if config.DRY_RUN:
-            logger.info(f"[DRY RUN] place_order: {side} {order_type} {rounded_qty} @ {rounded_price}")
+            self._paper_order_counter += 1
+            order_id = int(time.time() * 1000) + self._paper_order_counter
+            coid = client_order_id or f"dry_{order_id}"
+            logger.info(f"[PAPER] place_order: {side} {order_type} {rounded_qty} @ {rounded_price}")
+
+            # Store in paper engine for fill simulation
+            if self.paper_engine and order_type == "LIMIT" and rounded_price is not None:
+                self.paper_engine.add_order(
+                    order_id=order_id,
+                    symbol=symbol,
+                    side=side,
+                    order_type=order_type,
+                    quantity=str(rounded_qty),
+                    price=str(rounded_price),
+                    client_order_id=coid,
+                    reduce_only=reduce_only,
+                )
+
             return {
-                "orderId": int(time.time() * 1000),
+                "orderId": order_id,
                 "symbol": symbol,
                 "status": "NEW",
-                "clientOrderId": client_order_id or f"dry_{int(time.time())}",
+                "clientOrderId": coid,
                 "price": str(rounded_price) if rounded_price else "0",
                 "origQty": str(rounded_qty),
                 "executedQty": "0",
                 "side": side,
                 "type": order_type,
             }
-        
+
         return await self._request("POST", "/fapi/v1/order", params, signed=True)
     
     async def cancel_order(
@@ -741,7 +1080,9 @@ class AsterClient:
             params["origClientOrderId"] = client_order_id
         
         if config.DRY_RUN:
-            logger.info(f"[DRY RUN] cancel_order: {order_id or client_order_id}")
+            logger.info(f"[PAPER] cancel_order: {order_id or client_order_id}")
+            if self.paper_engine and order_id:
+                self.paper_engine.remove_order(order_id)
             return {"orderId": order_id, "status": "CANCELED"}
         
         return await self._request("DELETE", "/fapi/v1/order", params, signed=True)
@@ -762,8 +1103,10 @@ class AsterClient:
             Cancellation response
         """
         if config.DRY_RUN:
-            logger.info(f"[DRY RUN] cancel_all_orders: {symbol}")
-            return {"code": 200, "msg": "All orders canceled (dry run)"}
+            logger.info(f"[PAPER] cancel_all_orders: {symbol}")
+            if self.paper_engine:
+                self.paper_engine.remove_all_orders(symbol)
+            return {"code": 200, "msg": "All orders canceled (paper)"}
         
         return await self._request(
             "DELETE", 
@@ -884,11 +1227,23 @@ class AsterClient:
             on_position_update: Callback for position updates
             on_balance_update: Callback for balance updates
         """
+        # Paper trading mode: use fill detection loop instead of real WebSocket
+        if config.DRY_RUN and self.paper_engine:
+            logger.info("[PAPER] Starting paper trading fill detection (no WebSocket)")
+            self.paper_engine.on_order_update = on_order_update
+            self.paper_engine.on_position_update = on_position_update
+            self.paper_engine.on_balance_update = on_balance_update
+            await self.paper_engine.start(
+                client=self,
+                poll_interval=config.PAPER_POLL_INTERVAL,
+            )
+            return
+
         listen_key = await self.create_listen_key()
         ws_url = f"{self.ws_url}/ws/{listen_key}"
-        
+
         logger.info(f"Connecting to user data stream: {ws_url}")
-        
+
         # Keep-alive task
         async def keepalive():
             while True:
@@ -898,40 +1253,40 @@ class AsterClient:
                     logger.debug("Listen key refreshed")
                 except Exception as e:
                     logger.error(f"Failed to refresh listen key: {e}")
-        
+
         keepalive_task = asyncio.create_task(keepalive())
-        
+
         try:
             async with websockets.connect(ws_url) as ws:
                 self._ws_connection = ws
                 logger.info("User data stream connected")
-                
+
                 async for message in ws:
                     try:
                         data = json.loads(message)
                         event_type = data.get("e")
-                        
+
                         if event_type == "ORDER_TRADE_UPDATE" and on_order_update:
                             on_order_update(data.get("o", {}))
-                        
+
                         elif event_type == "ACCOUNT_UPDATE":
                             update_data = data.get("a", {})
-                            
+
                             # Position updates
                             if on_position_update and "P" in update_data:
                                 for position in update_data["P"]:
                                     on_position_update(position)
-                            
+
                             # Balance updates
                             if on_balance_update and "B" in update_data:
                                 for balance in update_data["B"]:
                                     on_balance_update(balance)
-                        
+
                     except json.JSONDecodeError as e:
                         logger.error(f"Failed to parse WebSocket message: {e}")
                     except Exception as e:
                         logger.error(f"Error processing WebSocket message: {e}")
-                        
+
         except ConnectionClosed as e:
             logger.warning(f"WebSocket connection closed: {e}")
         finally:

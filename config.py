@@ -567,9 +567,13 @@ class BotConfig:
     
     # Dry run mode - simulate orders without executing
     DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() == "true"
-    
+
     # Initial capital for the bot
     INITIAL_CAPITAL_USDT: Decimal = Decimal("50.0")
+
+    # Paper trading fill detection interval (seconds)
+    # How often to check if real market price has crossed paper order levels
+    PAPER_POLL_INTERVAL: int = 5
     
     def validate(self) -> list[str]:
         """
