@@ -354,7 +354,7 @@ _Tip: Commands only work in the configured chat._
                 entry = Decimal(pos["entryPrice"])
                 mark = Decimal(pos["markPrice"])
                 liq = Decimal(pos.get("liquidationPrice", "0"))
-                pnl = Decimal(pos["unrealizedProfit"])
+                pnl = Decimal(pos["unRealizedProfit"])
                 
                 side = "LONG" if size > 0 else "SHORT"
                 

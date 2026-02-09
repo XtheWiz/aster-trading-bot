@@ -38,7 +38,7 @@ async def check_orders():
         if pos.get("symbol") == "SOLUSDT":
             amt = float(pos.get("positionAmt", 0))
             entry = float(pos.get("entryPrice", 0))
-            pnl = float(pos.get("unrealizedProfit", 0))
+            pnl = float(pos.get("unRealizedProfit", 0))
             if amt != 0:
                 print("=== Position ===")
                 print(f"Amount: {amt:.4f} SOL")

@@ -2128,7 +2128,7 @@ class GridBot:
             return False
 
         # Check 2: Unrealized loss is within acceptable range
-        unrealized_pnl = Decimal(str(pos.get("unrealizedProfit", "0")))
+        unrealized_pnl = Decimal(str(pos.get("unRealizedProfit", "0")))
         position_value = entry_price * position_amt
         if position_value > 0:
             loss_percent = abs(min(Decimal("0"), unrealized_pnl)) / position_value * 100
@@ -2178,7 +2178,7 @@ class GridBot:
         symbol = config.trading.SYMBOL
 
         # Get unrealized PnL from position data
-        unrealized_pnl = Decimal(str(pos.get("unrealizedProfit", 0)))
+        unrealized_pnl = Decimal(str(pos.get("unRealizedProfit", "0")))
 
         # Calculate PnL percentage
         position_value = entry_price * position_amt
@@ -2317,7 +2317,11 @@ class GridBot:
                     break
         except Exception as e:
             logger.error(f"Failed to check positions before switch: {e}")
-            # Continue with switch if we can't check (fail-open for flexibility)
+            await self.telegram.send_message(
+                f"❌ Side switch blocked: could not verify position status\n"
+                f"Error: {e}"
+            )
+            return
 
         logger.warning(f"🔄 SWITCHING GRID SIDE: {old_side} → {new_side}")
 

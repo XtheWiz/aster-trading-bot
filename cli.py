@@ -418,7 +418,7 @@ async def cmd_close_position(symbol: str = None):
         size = float(position.get("positionAmt", 0))
         entry = float(position.get("entryPrice", 0))
         mark = float(position.get("markPrice", 0))
-        upnl = float(position.get("unrealizedProfit", 0))
+        upnl = float(position.get("unRealizedProfit", 0))
         
         print(f"\n📊 Current Position:")
         print(f"   Side: {'LONG' if size > 0 else 'SHORT'}")
