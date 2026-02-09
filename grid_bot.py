@@ -3017,6 +3017,9 @@ class GridBot:
                     # Multi-timeframe alignment
                     mtf_data = self.strategy_manager.get_mtf_alignment()
 
+                    # TradingView screener recommendations (advisory)
+                    tv_data = self.strategy_manager.get_tv_recommendations()
+
                     market_status = {
                         "state": analysis.state.value,
                         "trend_score": analysis.trend_score,
@@ -3035,6 +3038,7 @@ class GridBot:
                         "effective_size": f"${effective_size:.2f}",
                         "vol_factor": f"{vol_factor:.2f}",
                         "mtf": mtf_data,
+                        "tv": tv_data,
                     }
 
                 await self.telegram.send_hourly_summary(

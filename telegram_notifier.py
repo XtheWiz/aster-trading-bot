@@ -423,6 +423,36 @@ _Manual intervention required!_
 └ {align_emoji} {summary}
 """
 
+            # TradingView screener section
+            tv_section = ""
+            tv = market_status.get("tv")
+            if tv:
+                def _tv_emoji(label):
+                    if "STRONG BUY" in label:
+                        return "🟢"
+                    elif "BUY" in label:
+                        return "🟢"
+                    elif "STRONG SELL" in label:
+                        return "🔴"
+                    elif "SELL" in label:
+                        return "🔴"
+                    return "⚪"
+
+                tv_1h = tv.get("rec_1h_label", "N/A")
+                tv_4h = tv.get("rec_4h_label", "N/A")
+                tv_w = tv.get("rec_w_label", "N/A")
+                tv_rsi = tv.get("rsi")
+                tv_rsi_str = f" RSI `{tv_rsi:.0f}`" if tv_rsi is not None else ""
+
+                tv_section = f"""
+
+📺 *TradingView*
+├ {_tv_emoji(tv_1h)} 1H: `{tv_1h}`
+├ {_tv_emoji(tv_4h)} 4H: `{tv_4h}`
+├ {_tv_emoji(tv_w)} Weekly: `{tv_w}`{tv_rsi_str}
+└ 📊 Rating: `{tv.get("rating_label", "N/A")}`
+"""
+
             market_section = f"""
 🌍 *Market Status*
 ├ {regime_emoji} Regime: `{market_regime}`{confidence_line}
@@ -433,7 +463,7 @@ _Manual intervention required!_
 └ 🎯 Grid: `{current_side}`
 
 💡 *{recommendation}*
-{mtf_section}"""
+{mtf_section}{tv_section}"""
         
         message = f"""
 📊 *Hourly Summary*

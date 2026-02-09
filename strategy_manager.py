@@ -2176,6 +2176,119 @@ class StrategyManager:
 
         return result
 
+    def get_tv_recommendations(self) -> dict | None:
+        """
+        Fetch TradingView screener recommendations for the trading pair.
+
+        Returns dict with 1H/4H/Weekly recommendations and RSI, or None on failure.
+        Caches results for 1 hour to avoid excessive API calls.
+        """
+        # Check cache (1 hour)
+        now = datetime.now()
+        if (
+            hasattr(self, '_tv_cache')
+            and self._tv_cache is not None
+            and hasattr(self, '_tv_cache_time')
+            and (now - self._tv_cache_time).total_seconds() < 3600
+        ):
+            return self._tv_cache
+
+        try:
+            from tvscreener import CryptoScreener, CryptoField
+
+            # Build perpetual symbol name from config
+            symbol_name = config.trading.SYMBOL + ".P"
+
+            cs = CryptoScreener()
+            cs.where(CryptoField.NAME == symbol_name)
+            cs.select(
+                CryptoField.NAME,
+                CryptoField.PRICE,
+                CryptoField.RELATIVE_STRENGTH_INDEX_14,
+                CryptoField.RECOMMEND_ALL_60,    # 1H
+                CryptoField.RECOMMEND_ALL_240,   # 4H
+                CryptoField.RECOMMEND_ALL_1W,    # Weekly
+                CryptoField.TECHNICAL_RATING,
+            )
+            df = cs.get()
+
+            # Filter to Binance row
+            binance_symbol = f"BINANCE:{symbol_name}"
+            row = df[df['Symbol'] == binance_symbol]
+            if row.empty:
+                # Try first row if Binance not found
+                if not df.empty:
+                    row = df.iloc[0]
+                else:
+                    logger.warning(f"TV Screener: No data for {symbol_name}")
+                    return None
+            else:
+                row = row.iloc[0]
+
+            def _label(val):
+                """Convert -1/+1 recommendation to label."""
+                if val is None or pd.isna(val):
+                    return "N/A"
+                if val >= 0.5:
+                    return "STRONG BUY"
+                elif val >= 0.1:
+                    return "BUY"
+                elif val > -0.1:
+                    return "NEUTRAL"
+                elif val > -0.5:
+                    return "SELL"
+                else:
+                    return "STRONG SELL"
+
+            def _safe_float(val, default=None):
+                try:
+                    if val is None or pd.isna(val):
+                        return default
+                    return float(val)
+                except (TypeError, ValueError):
+                    return default
+
+            rec_1h = _safe_float(row.get('Recommend All|60'))
+            rec_4h = _safe_float(row.get('Recommend All|240'))
+            rec_w = _safe_float(row.get('Recommend All|1W'))
+            rsi = _safe_float(row.get('Relative Strength Index (14)'))
+            rating = _safe_float(row.get('Technical Rating'))
+
+            result = {
+                "rec_1h": rec_1h,
+                "rec_1h_label": _label(rec_1h),
+                "rec_4h": rec_4h,
+                "rec_4h_label": _label(rec_4h),
+                "rec_w": rec_w,
+                "rec_w_label": _label(rec_w),
+                "rsi": rsi,
+                "rating": rating,
+                "rating_label": _label(rating),
+            }
+
+            self._tv_cache = result
+            self._tv_cache_time = now
+            logger.info(
+                f"TV Screener: 1H={result['rec_1h_label']}, "
+                f"4H={result['rec_4h_label']}, "
+                f"W={result['rec_w_label']}, RSI={rsi:.1f}" if rsi else
+                f"TV Screener: 1H={result['rec_1h_label']}, "
+                f"4H={result['rec_4h_label']}, "
+                f"W={result['rec_w_label']}"
+            )
+            return result
+
+        except ImportError:
+            logger.warning("tvscreener not installed — TV recommendations unavailable")
+            return None
+        except Exception as e:
+            logger.error(f"TV Screener error: {e}")
+            # Return stale cache if available
+            if hasattr(self, '_tv_cache') and self._tv_cache is not None:
+                logger.info("TV Screener: returning stale cached data")
+                return self._tv_cache
+            return None
+
     async def _check_auto_switch(self, analysis: MarketAnalysis) -> None:
         """
         Check if grid side should be switched based on trend score.
