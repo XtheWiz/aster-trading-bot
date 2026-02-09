@@ -324,7 +324,8 @@ class GridConfig:
     # ==========================================================================
 
     # Allow closing existing position to switch sides in genuine reversals
-    FORCE_SWITCH_ENABLED: bool = True
+    # DISABLED: Grid bots should hold through adverse moves, not cut+switch
+    FORCE_SWITCH_ENABLED: bool = False
 
     # Minimum trend score to force-close position and switch
     # Only triggers when score is very strong AND BTC aligns
