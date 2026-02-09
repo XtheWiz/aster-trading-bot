@@ -367,17 +367,73 @@ _Manual intervention required!_
             if effective_size:
                 sizing_line = f"\n├ 📐 Size: `{effective_size}/grid` (vol×{vol_factor})"
 
+            # Enhanced regime info
+            regime_confidence = market_status.get("regime_confidence", 0)
+            regime_duration = market_status.get("regime_duration", 0)
+            volatility_trend = market_status.get("volatility_trend", "")
+            volume_trend_str = market_status.get("volume_trend", "")
+
+            confidence_line = ""
+            if regime_confidence:
+                confidence_line = f" ({int(regime_confidence * 100)}%)"
+
+            duration_line = ""
+            if regime_duration > 0:
+                hours = int(regime_duration // 60)
+                mins = int(regime_duration % 60)
+                duration_line = f"\n├ ⏱️ In regime: `{hours}h {mins}m`" if hours > 0 else f"\n├ ⏱️ In regime: `{mins}m`"
+
+            trend_lines = ""
+            if volatility_trend and volatility_trend != "stable":
+                trend_lines += f"\n├ 📉 Vol trend: `{volatility_trend}`"
+            if volume_trend_str and volume_trend_str != "stable":
+                trend_lines += f"\n├ 📊 Vol ratio trend: `{volume_trend_str}`"
+
+            # Multi-timeframe section
+            mtf_section = ""
+            mtf = market_status.get("mtf")
+            if mtf and mtf.get("htf_4h") is not None:
+                htf_4h = mtf.get("htf_4h", {})
+                weekly = mtf.get("weekly", {})
+                alignment = mtf.get("alignment", "UNKNOWN")
+                summary = mtf.get("summary", "")
+
+                # Alignment emoji
+                align_emojis = {
+                    "ALIGNED_BULLISH": "🟢",
+                    "ALIGNED_BEARISH": "🔴",
+                    "CONFLICTING": "⚠️",
+                    "MIXED": "🟡",
+                }
+                align_emoji = align_emojis.get(alignment, "📊")
+
+                def _tf_line(label, data):
+                    if not data:
+                        return f"\n├ ⏳ {label}: `loading...`"
+                    s = data.get("score", 0)
+                    bias = data.get("bias", "")
+                    rsi_val = data.get("rsi", 0)
+                    emoji = "🟢" if s > 0 else "🔴" if s < 0 else "⚪"
+                    return f"\n├ {emoji} {label}: `{s:+d}` ({bias}) RSI `{rsi_val:.0f}`"
+
+                mtf_section = f"""
+
+🔭 *Multi-Timeframe*
+├ {score_emoji} 1H: `{trend_score:+d}`{_tf_line("4H", htf_4h)}{_tf_line("Weekly", weekly)}
+└ {align_emoji} {summary}
+"""
+
             market_section = f"""
 🌍 *Market Status*
-├ {regime_emoji} Regime: `{market_regime}`
+├ {regime_emoji} Regime: `{market_regime}`{confidence_line}
 ├ {score_emoji} Trend: `{trend_score:+d}`
 ├ 📊 RSI: `{rsi:.1f}`
 ├ 📈 Volume: `{volume_ratio:.1f}x`
-├ 💵 Price: `${price:.2f}`{session_line}{sizing_line}
+├ 💵 Price: `${price:.2f}`{duration_line}{trend_lines}{session_line}{sizing_line}
 └ 🎯 Grid: `{current_side}`
 
 💡 *{recommendation}*
-"""
+{mtf_section}"""
         
         message = f"""
 📊 *Hourly Summary*
@@ -391,6 +447,46 @@ _Manual intervention required!_
 {market_section}"""
         self.queue_message(message.strip())
     
+    async def send_regime_transition(
+        self,
+        old_regime: str,
+        new_regime: str,
+        duration_minutes: float,
+        trend_score: int,
+        rsi: float,
+        volume_ratio: float,
+        atr_percent: float,
+        recommendation: str,
+    ) -> None:
+        """Send regime transition alert."""
+        hours = int(duration_minutes // 60)
+        mins = int(duration_minutes % 60)
+        duration_str = f"{hours}h {mins}m" if hours > 0 else f"{mins}m"
+
+        regime_emojis = {
+            "Strong Trend": "🚀",
+            "Trending": "📈",
+            "Ranging": "↔️",
+            "Choppy (Low Vol)": "⚠️",
+            "High Volatility": "🚨",
+        }
+        new_emoji = regime_emojis.get(new_regime, "📊")
+
+        message = f"""
+{new_emoji} *Regime Change*
+
+📊 `{old_regime}` → `{new_regime}`
+⏱️ Was in `{old_regime}` for `{duration_str}`
+
+📈 *Indicators:*
+├ Trend: `{trend_score:+d}` | RSI: `{rsi:.1f}`
+├ Volume: `{volume_ratio:.1f}x` | ATR: `{atr_percent:.1f}%`
+└ ⏰ `{bangkok_now().strftime("%H:%M:%S")} (BKK)`
+
+💡 *{recommendation}*
+"""
+        self.queue_message(message.strip())
+
     async def send_error(self, error_type: str, details: str) -> None:
         """Send error notification."""
         message = f"""
@@ -488,14 +584,50 @@ _Monitor closely! Bot will stop at {max_drawdown}%_
         initial_balance: Decimal,
         win_rate: Decimal,
         runtime_hours: float,
+        best_trade: float = 0.0,
+        worst_trade: float = 0.0,
+        session_breakdown: dict | None = None,
+        regime_distribution: dict | None = None,
+        side_switches: int = 0,
     ) -> None:
-        """Send daily performance report."""
+        """Send daily performance report with enhanced analytics."""
         total_pnl = realized_pnl + unrealized_pnl
-        roi = ((current_balance - initial_balance) / initial_balance) * 100
-        
+        roi = ((current_balance - initial_balance) / initial_balance) * 100 if initial_balance > 0 else Decimal("0")
+
         pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
         roi_emoji = "📈" if roi >= 0 else "📉"
-        
+
+        # Session breakdown section
+        session_section = ""
+        if session_breakdown:
+            lines = []
+            for session, data in session_breakdown.items():
+                if data["count"] > 0:
+                    s_pnl = data["pnl"]
+                    s_emoji = "🟢" if s_pnl >= 0 else "🔴"
+                    lines.append(f"├ {s_emoji} {session}: `{data['count']}` trades, `{s_pnl:+.4f}`")
+            if lines:
+                session_section = "\n🕐 *Sessions:*\n" + "\n".join(lines)
+
+        # Regime distribution section
+        regime_section = ""
+        if regime_distribution:
+            lines = []
+            regime_emojis = {
+                "Strong Trend": "🚀", "Trending": "📈", "Ranging": "↔️",
+                "Choppy (Low Vol)": "⚠️", "High Volatility": "🚨",
+            }
+            for regime, pct in regime_distribution.items():
+                emoji = regime_emojis.get(regime, "📊")
+                lines.append(f"├ {emoji} {regime}: `{pct}%`")
+            if lines:
+                regime_section = "\n📊 *Regime Distribution:*\n" + "\n".join(lines)
+
+        # Best/worst trade
+        trade_highlights = ""
+        if best_trade != 0 or worst_trade != 0:
+            trade_highlights = f"\n├ 🏆 Best: `{best_trade:+.4f}` | Worst: `{worst_trade:+.4f}`"
+
         message = f"""
 📅 *Daily Report* - {bangkok_now().strftime("%Y-%m-%d")}
 
@@ -507,14 +639,76 @@ _Monitor closely! Bot will stop at {max_drawdown}%_
 ├ 🎯 Win Rate: `{win_rate:.1f}%`
 ├ 💵 Realized PnL: `{realized_pnl:+.4f}`
 ├ 💭 Unrealized PnL: `{unrealized_pnl:+.4f}`
-└ {pnl_emoji} Total PnL: `{total_pnl:+.4f} USDT`
+├ {pnl_emoji} Total PnL: `{total_pnl:+.4f} USDT`{trade_highlights}
+└ 🔀 Side Switches: `{side_switches}`
 
 💰 *Balance:*
 ├ Initial: `${initial_balance:.2f}`
 ├ Current: `${current_balance:.2f}`
 └ {roi_emoji} ROI: `{roi:+.2f}%`
+{session_section}{regime_section}
+"""
+        self.queue_message(message.strip())
 
-_Keep grinding! 💪_
+    async def send_weekly_report(
+        self,
+        symbol: str,
+        total_trades: int,
+        realized_pnl: Decimal,
+        current_balance: Decimal,
+        initial_balance: Decimal,
+        win_rate: float,
+        best_trade: float = 0.0,
+        worst_trade: float = 0.0,
+        daily_stats: list[dict] | None = None,
+        regime_distribution: dict | None = None,
+    ) -> None:
+        """Send weekly performance report."""
+        roi = ((current_balance - initial_balance) / initial_balance) * 100 if initial_balance > 0 else Decimal("0")
+        pnl_emoji = "🟢" if realized_pnl >= 0 else "🔴"
+        roi_emoji = "📈" if roi >= 0 else "📉"
+
+        # Daily breakdown
+        daily_section = ""
+        if daily_stats:
+            lines = []
+            for day in daily_stats[:7]:
+                d_pnl = day.get("pnl", 0)
+                d_emoji = "🟢" if d_pnl >= 0 else "🔴"
+                lines.append(f"├ {d_emoji} {day['date']}: `{day['trades']}` trades, `{d_pnl:+.4f}`")
+            if lines:
+                daily_section = "\n📅 *Daily Breakdown:*\n" + "\n".join(lines)
+
+        # Regime distribution
+        regime_section = ""
+        if regime_distribution:
+            lines = []
+            regime_emojis = {
+                "Strong Trend": "🚀", "Trending": "📈", "Ranging": "↔️",
+                "Choppy (Low Vol)": "⚠️", "High Volatility": "🚨",
+            }
+            for regime, pct in regime_distribution.items():
+                emoji = regime_emojis.get(regime, "📊")
+                lines.append(f"├ {emoji} {regime}: `{pct}%`")
+            if lines:
+                regime_section = "\n📊 *Regime Distribution:*\n" + "\n".join(lines)
+
+        message = f"""
+📊 *Weekly Report* - Week of {bangkok_now().strftime("%Y-%m-%d")}
+
+🎯 *Symbol:* `{symbol}`
+
+📈 *Performance:*
+├ 🔄 Total Trades: `{total_trades}`
+├ 🎯 Win Rate: `{win_rate:.1f}%`
+├ {pnl_emoji} Realized PnL: `{realized_pnl:+.4f} USDT`
+├ 🏆 Best: `{best_trade:+.4f}` | Worst: `{worst_trade:+.4f}`
+└ {roi_emoji} ROI: `{roi:+.2f}%`
+
+💰 *Balance:*
+├ Start: `${initial_balance:.2f}`
+└ Current: `${current_balance:.2f}`
+{daily_section}{regime_section}
 """
         self.queue_message(message.strip())
 

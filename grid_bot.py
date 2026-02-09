@@ -32,7 +32,7 @@ import logging
 import signal
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from enum import Enum
 from typing import Callable
@@ -45,6 +45,7 @@ from telegram_commands import TelegramCommandHandler
 from strategy_manager import StrategyManager
 from indicator_analyzer import IndicatorAnalyzer, get_smart_tp, TrailingTPResult
 from trade_event_logger import trade_event_logger
+from regime_detector import RegimeDetector
 
 # Configure logging with structured format
 logging.basicConfig(
@@ -361,8 +362,14 @@ class GridBot:
         self.telegram_commands = TelegramCommandHandler(bot_reference=self)
         self.strategy_manager = StrategyManager(self.client, bot_reference=self)
         self.indicator_analyzer = IndicatorAnalyzer()  # For trailing TP calculations
+        self.regime_detector = RegimeDetector()
+        self._current_regime: str | None = None
+        self._regime_entered_at: datetime | None = None
+        self._last_regime_alert: datetime | None = None
         self._session_id: int = 0
         self._last_hourly_summary = datetime.now()
+        self._last_daily_report: datetime | None = None
+        self._last_weekly_report: datetime | None = None
     
     # =========================================================================
     # GRID CALCULATION
@@ -2991,30 +2998,24 @@ class GridBot:
                     # Determine market regime and recommendation
                     volume_ratio = getattr(analysis, 'volume_ratio', 0.0)
                     trend_score = analysis.trend_score
-                    atr_percent = getattr(analysis, 'atr_percent', 0.0)
+                    atr_percent = float(analysis.atr_value / analysis.current_price * 100) if analysis.current_price > 0 else 0.0
 
                     # Market regime detection
-                    if atr_percent > 5:
-                        market_regime = "High Volatility"
-                        recommendation = "Widen grid or pause"
-                    elif abs(trend_score) >= 3:
-                        market_regime = "Strong Trend"
-                        recommendation = "Follow trend"
-                    elif abs(trend_score) >= 2:
-                        market_regime = "Trending"
-                        recommendation = "Grid optimal"
-                    elif volume_ratio < 0.5:
-                        market_regime = "Choppy (Low Vol)"
-                        recommendation = "Reduce exposure"
-                    else:
-                        market_regime = "Ranging"
-                        recommendation = "Grid optimal"
+                    regime_result = self.regime_detector.detect(analysis)
+                    market_regime = regime_result.regime
+                    recommendation = regime_result.recommendation
+
+                    # Check regime transition
+                    await self._check_regime_transition(analysis, regime_result)
 
                     # Session and sizing info
                     session_name = self._get_current_session_name()
                     vol_factor = self._get_volatility_size_factor()
                     session_size_factor = self._get_session_size_factor()
                     effective_size = config.grid.QUANTITY_PER_GRID_USDT * vol_factor * session_size_factor
+
+                    # Multi-timeframe alignment
+                    mtf_data = self.strategy_manager.get_mtf_alignment()
 
                     market_status = {
                         "state": analysis.state.value,
@@ -3026,9 +3027,14 @@ class GridBot:
                         "atr_percent": atr_percent,
                         "market_regime": market_regime,
                         "recommendation": recommendation,
+                        "regime_confidence": regime_result.confidence,
+                        "regime_duration": regime_result.duration_minutes,
+                        "volatility_trend": regime_result.volatility_trend,
+                        "volume_trend": regime_result.volume_trend,
                         "session": session_name,
                         "effective_size": f"${effective_size:.2f}",
                         "vol_factor": f"{vol_factor:.2f}",
+                        "mtf": mtf_data,
                     }
 
                 await self.telegram.send_hourly_summary(
@@ -3040,9 +3046,205 @@ class GridBot:
                     market_status=market_status,
                 )
                 self._last_hourly_summary = datetime.now()
-            
+
+            # Daily/Weekly reports
+            await self._check_scheduled_reports()
+
             await asyncio.sleep(60)  # Check every minute
     
+    async def _check_scheduled_reports(self) -> None:
+        """Check if daily or weekly reports should be sent."""
+        BANGKOK_TZ = timezone(timedelta(hours=7))
+        now_bkk = datetime.now(BANGKOK_TZ)
+
+        # Daily report
+        if config.report.DAILY_REPORT_ENABLED:
+            should_send_daily = False
+            if self._last_daily_report is None:
+                # First run — only send if it's the right hour
+                if now_bkk.hour == config.report.DAILY_REPORT_HOUR_BANGKOK:
+                    should_send_daily = True
+            else:
+                last_bkk = self._last_daily_report.astimezone(BANGKOK_TZ)
+                if now_bkk.date() > last_bkk.date() and now_bkk.hour >= config.report.DAILY_REPORT_HOUR_BANGKOK:
+                    should_send_daily = True
+
+            if should_send_daily:
+                await self._send_daily_report()
+                self._last_daily_report = datetime.now(BANGKOK_TZ)
+
+        # Weekly report
+        if config.report.WEEKLY_REPORT_ENABLED:
+            should_send_weekly = False
+            if self._last_weekly_report is None:
+                if now_bkk.weekday() == config.report.WEEKLY_REPORT_DAY and now_bkk.hour == config.report.DAILY_REPORT_HOUR_BANGKOK:
+                    should_send_weekly = True
+            else:
+                last_bkk = self._last_weekly_report.astimezone(BANGKOK_TZ)
+                days_since = (now_bkk.date() - last_bkk.date()).days
+                if days_since >= 7 and now_bkk.weekday() == config.report.WEEKLY_REPORT_DAY:
+                    should_send_weekly = True
+
+            if should_send_weekly:
+                await self._send_weekly_report()
+                self._last_weekly_report = datetime.now(BANGKOK_TZ)
+
+    async def _send_daily_report(self) -> None:
+        """Generate and send daily performance report."""
+        try:
+            BANGKOK_TZ = timezone(timedelta(hours=7))
+            now_bkk = datetime.now(BANGKOK_TZ)
+            today_start = now_bkk.replace(hour=0, minute=0, second=0, microsecond=0)
+            yesterday_start = today_start - timedelta(days=1)
+
+            start_str = yesterday_start.astimezone(timezone.utc).isoformat()
+            end_str = today_start.astimezone(timezone.utc).isoformat()
+
+            trades = await self.trade_logger.get_trades_in_range(start_str, end_str)
+            session_breakdown = await self.trade_logger.get_session_breakdown(start_str, end_str)
+            regime_dist = await self.trade_logger.get_regime_distribution(start_str, end_str)
+
+            total_trades = len(trades)
+            pnls = [t.get("pnl", 0) or 0 for t in trades]
+            realized_pnl = Decimal(str(sum(pnls)))
+            winning = [p for p in pnls if p > 0]
+            win_rate = Decimal(str(len(winning) / total_trades * 100)) if total_trades > 0 else Decimal("0")
+            best_trade = max(pnls) if pnls else 0.0
+            worst_trade = min(pnls) if pnls else 0.0
+
+            await self.telegram.send_daily_report(
+                symbol=config.trading.SYMBOL,
+                total_trades=total_trades,
+                realized_pnl=realized_pnl,
+                unrealized_pnl=self.state.unrealized_pnl,
+                current_balance=self.state.current_balance,
+                initial_balance=self.state.initial_balance,
+                win_rate=win_rate,
+                runtime_hours=24.0,
+                best_trade=best_trade,
+                worst_trade=worst_trade,
+                session_breakdown=session_breakdown,
+                regime_distribution=regime_dist,
+                side_switches=self.strategy_manager.daily_switch_count,
+            )
+            logger.info("Daily report sent")
+        except Exception as e:
+            logger.error(f"Failed to send daily report: {e}")
+
+    async def _send_weekly_report(self) -> None:
+        """Generate and send weekly performance report."""
+        try:
+            BANGKOK_TZ = timezone(timedelta(hours=7))
+            now_bkk = datetime.now(BANGKOK_TZ)
+            week_start = now_bkk.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=7)
+
+            start_str = week_start.astimezone(timezone.utc).isoformat()
+            end_str = now_bkk.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat()
+
+            trades = await self.trade_logger.get_trades_in_range(start_str, end_str)
+            daily_stats = await self.trade_logger.get_daily_stats(days=7)
+            regime_dist = await self.trade_logger.get_regime_distribution(start_str, end_str)
+
+            total_trades = len(trades)
+            pnls = [t.get("pnl", 0) or 0 for t in trades]
+            realized_pnl = Decimal(str(sum(pnls)))
+            winning = [p for p in pnls if p > 0]
+            win_rate = len(winning) / total_trades * 100 if total_trades > 0 else 0.0
+            best_trade = max(pnls) if pnls else 0.0
+            worst_trade = min(pnls) if pnls else 0.0
+
+            await self.telegram.send_weekly_report(
+                symbol=config.trading.SYMBOL,
+                total_trades=total_trades,
+                realized_pnl=realized_pnl,
+                current_balance=self.state.current_balance,
+                initial_balance=self.state.initial_balance,
+                win_rate=win_rate,
+                best_trade=best_trade,
+                worst_trade=worst_trade,
+                daily_stats=daily_stats,
+                regime_distribution=regime_dist,
+            )
+            logger.info("Weekly report sent")
+        except Exception as e:
+            logger.error(f"Failed to send weekly report: {e}")
+
+    async def _check_regime_transition(self, analysis, regime_result) -> None:
+        """Check for regime transition and send alert if changed."""
+        new_regime = regime_result.regime
+        now = datetime.now()
+
+        if self._current_regime is None:
+            # First detection — initialize without alert
+            self._current_regime = new_regime
+            self._regime_entered_at = now
+            return
+
+        if new_regime == self._current_regime:
+            return
+
+        # Cooldown check
+        if self._last_regime_alert and (now - self._last_regime_alert).total_seconds() < config.risk.REGIME_ALERT_COOLDOWN:
+            return
+
+        # Calculate duration in previous regime
+        duration_minutes = 0.0
+        if self._regime_entered_at:
+            duration_minutes = (now - self._regime_entered_at).total_seconds() / 60
+
+        old_regime = self._current_regime
+        self._current_regime = new_regime
+        self._regime_entered_at = now
+        self._last_regime_alert = now
+
+        # Log regime transition to database
+        try:
+            atr_percent = float(analysis.atr_value / analysis.current_price * 100) if analysis.current_price > 0 else 0.0
+            await self.trade_logger.log_regime(
+                regime=new_regime,
+                trend_score=analysis.trend_score,
+                atr_pct=atr_percent,
+                volume_ratio=getattr(analysis, 'volume_ratio', 1.0),
+            )
+        except Exception as e:
+            logger.error(f"Failed to log regime: {e}")
+
+        # Send alert
+        await self.telegram.send_regime_transition(
+            old_regime=old_regime,
+            new_regime=new_regime,
+            duration_minutes=duration_minutes,
+            trend_score=analysis.trend_score,
+            rsi=analysis.rsi,
+            volume_ratio=getattr(analysis, 'volume_ratio', 1.0),
+            atr_percent=float(analysis.atr_value / analysis.current_price * 100) if analysis.current_price > 0 else 0.0,
+            recommendation=regime_result.recommendation,
+        )
+
+        logger.info(f"Regime transition: {old_regime} -> {new_regime} (was {duration_minutes:.0f}m)")
+
+    def _detect_market_regime(self, analysis) -> tuple[str, str]:
+        """
+        Simple market regime detection from analysis data.
+
+        Returns:
+            Tuple of (regime_name, recommendation)
+        """
+        volume_ratio = getattr(analysis, 'volume_ratio', 0.0)
+        trend_score = analysis.trend_score
+        atr_percent = float(analysis.atr_value / analysis.current_price * 100) if analysis.current_price > 0 else 0.0
+
+        if atr_percent > 5:
+            return "High Volatility", "Widen grid or pause"
+        elif abs(trend_score) >= 3:
+            return "Strong Trend", "Follow trend"
+        elif abs(trend_score) >= 2:
+            return "Trending", "Grid optimal"
+        elif volume_ratio < 0.5:
+            return "Choppy (Low Vol)", "Reduce exposure"
+        else:
+            return "Ranging", "Grid optimal"
+
     async def _wait_for_clear_signal_monitor(self) -> None:
         """
         Monitor market until trend becomes clear, then start placing orders.

@@ -269,6 +269,12 @@ class GridConfig:
     # Block LONG switch if 4h score <= -HTF_MIN_SCORE
     # Block SHORT switch if 4h score >= +HTF_MIN_SCORE
     HTF_MIN_SCORE: int = 1
+
+    # Weekly timeframe interval for multi-timeframe advisory
+    WEEKLY_INTERVAL: str = "1w"
+
+    # Weekly analysis cache duration (seconds) - weekly data changes slowly
+    WEEKLY_REFRESH_INTERVAL: int = 14400  # 4 hours
     
     # ==========================================================================
     # Choppy Market Auto-Pause
@@ -423,6 +429,9 @@ class RiskConfig:
     # SuperTrend flip alert cooldown (seconds)
     # Prevents spam when SuperTrend flips repeatedly in choppy markets
     SUPERTREND_FLIP_ALERT_COOLDOWN: int = 3600  # 1 hour
+
+    # Regime transition alert cooldown (seconds)
+    REGIME_ALERT_COOLDOWN: int = 900  # 15 minutes
     
     # Minimum balance to maintain (bot stops if balance falls below)
     MIN_BALANCE_USDT: Decimal = Decimal("30.0")
@@ -549,6 +558,22 @@ class LogConfig:
 
 
 @dataclass
+class ReportConfig:
+    """Daily and weekly report settings."""
+    # Enable automated daily reports
+    DAILY_REPORT_ENABLED: bool = True
+
+    # Hour to send daily report (Bangkok time, 0 = midnight)
+    DAILY_REPORT_HOUR_BANGKOK: int = 0
+
+    # Enable automated weekly reports
+    WEEKLY_REPORT_ENABLED: bool = True
+
+    # Day to send weekly report (0 = Monday)
+    WEEKLY_REPORT_DAY: int = 0
+
+
+@dataclass
 class BotConfig:
     """
     Main configuration container aggregating all config sections.
@@ -564,6 +589,7 @@ class BotConfig:
     risk: RiskConfig = field(default_factory=RiskConfig)
     harvest: HarvestConfig = field(default_factory=HarvestConfig)
     log: LogConfig = field(default_factory=LogConfig)
+    report: ReportConfig = field(default_factory=ReportConfig)
     
     # Dry run mode - simulate orders without executing
     DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() == "true"

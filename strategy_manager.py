@@ -115,6 +115,48 @@ class TrendScore:
 
 
 @dataclass
+class TimeframeAnalysis:
+    """Analysis result for a single timeframe (4H, Weekly, etc.)."""
+    interval: str
+    trend_score: int  # -4 to +4
+    rsi: float = 50.0
+    price: float = 0.0
+    volume_ratio: float = 1.0
+    last_updated: datetime | None = None
+
+    @property
+    def bias(self) -> str:
+        """Human-readable bias label."""
+        if self.trend_score >= 3:
+            return "STRONG BULLISH"
+        elif self.trend_score >= 2:
+            return "BULLISH"
+        elif self.trend_score <= -3:
+            return "STRONG BEARISH"
+        elif self.trend_score <= -2:
+            return "BEARISH"
+        return "NEUTRAL"
+
+    @property
+    def bias_emoji(self) -> str:
+        if self.trend_score >= 2:
+            return "🟢"
+        elif self.trend_score <= -2:
+            return "🔴"
+        return "⚪"
+
+    def to_dict(self) -> dict:
+        return {
+            "interval": self.interval,
+            "score": self.trend_score,
+            "bias": self.bias,
+            "rsi": round(self.rsi, 1),
+            "price": round(self.price, 2),
+            "volume_ratio": round(self.volume_ratio, 2),
+        }
+
+
+@dataclass
 class FastTrendConfirmation:
     """
     Point-based trend confirmation for faster side switching.
@@ -280,6 +322,11 @@ class StrategyManager:
         self.last_htf_trend_score: TrendScore | None = None
         self.last_htf_analysis_time: datetime | None = None
 
+        # Multi-Timeframe Advisory (4H + Weekly)
+        self.htf_4h_analysis: TimeframeAnalysis | None = None
+        self.weekly_analysis: TimeframeAnalysis | None = None
+        self.last_weekly_analysis_time: datetime | None = None
+
         # Choppy Market Detection
         self.choppy_count: int = 0
         self.choppy_paused: bool = False
@@ -368,6 +415,10 @@ class StrategyManager:
         # Start real-time price monitoring in background
         self._price_monitor_task = asyncio.create_task(self._monitor_price_spikes())
 
+        # Pre-fetch multi-timeframe data at startup
+        logger.info("Pre-fetching multi-timeframe analysis...")
+        await self.refresh_mtf_advisory()
+
         while self.is_running:
             try:
                 # Check if choppy pause has expired (auto-resume)
@@ -402,6 +453,9 @@ class StrategyManager:
 
                 # Check drawdown and execute protection actions
                 await self._check_drawdown()
+
+                # Refresh multi-timeframe advisory (internal caching prevents redundant API calls)
+                await self.refresh_mtf_advisory()
 
                 # Sleep for interval
                 await asyncio.sleep(self.check_interval)
@@ -1968,12 +2022,159 @@ class StrategyManager:
             self.last_htf_trend_score = htf_score
             self.last_htf_analysis_time = datetime.now()
 
+            # Populate advisory 4H analysis
+            self.htf_4h_analysis = TimeframeAnalysis(
+                interval=config.grid.HTF_INTERVAL,
+                trend_score=htf_score.total,
+                rsi=rsi_val,
+                price=float(latest['close']),
+                volume_ratio=vol_ratio,
+                last_updated=datetime.now(),
+            )
+
             logger.info(f"MTF Analysis ({config.grid.HTF_INTERVAL}): {htf_score}")
             return htf_score
 
         except Exception as e:
             logger.error(f"Error in higher timeframe analysis: {e}")
             return self.last_htf_trend_score
+
+    async def _analyze_weekly_timeframe(self) -> TimeframeAnalysis | None:
+        """
+        Analyze weekly timeframe for long-term trend context.
+
+        Cached for 4 hours (weekly data changes slowly).
+
+        Returns:
+            TimeframeAnalysis for weekly, or None on failure
+        """
+        # Return cached result if fresh enough (4 hours)
+        if (
+            self.weekly_analysis is not None
+            and self.last_weekly_analysis_time is not None
+            and (datetime.now() - self.last_weekly_analysis_time).total_seconds() < config.grid.WEEKLY_REFRESH_INTERVAL
+        ):
+            return self.weekly_analysis
+
+        try:
+            candles = await self.client.get_klines(
+                symbol=config.trading.SYMBOL,
+                interval=config.grid.WEEKLY_INTERVAL,
+                limit=60
+            )
+
+            if not candles or len(candles) < 20:
+                logger.warning("Not enough weekly candles for MTF analysis")
+                return self.weekly_analysis
+
+            df = pd.DataFrame(candles, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_volume', 'trades', 'taker_buy_volume',
+                'taker_buy_quote_volume', 'ignore'
+            ])
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            ema_fast = EMAIndicator(close=df['close'], window=self.ma_fast_period).ema_indicator()
+            ema_slow = EMAIndicator(close=df['close'], window=self.ma_slow_period).ema_indicator()
+            rsi = RSIIndicator(close=df['close'], window=14).rsi()
+            macd_indicator = MACD(close=df['close'], window_fast=12, window_slow=26, window_sign=9)
+            macd_hist = macd_indicator.macd_diff()
+
+            latest = df.iloc[-1]
+            ema_f = Decimal(str(ema_fast.iloc[-1])) if pd.notna(ema_fast.iloc[-1]) else Decimal("0")
+            ema_s = Decimal(str(ema_slow.iloc[-1])) if pd.notna(ema_slow.iloc[-1]) else Decimal("0")
+            rsi_val = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
+            macd_h = float(macd_hist.iloc[-1]) if pd.notna(macd_hist.iloc[-1]) else 0.0
+
+            vol_series = df['volume'].astype(float)
+            avg_vol = vol_series.rolling(window=20).mean().iloc[-1]
+            current_vol = float(latest['volume'])
+            vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1.0
+
+            weekly_score = self._calculate_trend_score(ema_f, ema_s, macd_h, rsi_val, vol_ratio)
+
+            self.weekly_analysis = TimeframeAnalysis(
+                interval=config.grid.WEEKLY_INTERVAL,
+                trend_score=weekly_score.total,
+                rsi=rsi_val,
+                price=float(latest['close']),
+                volume_ratio=vol_ratio,
+                last_updated=datetime.now(),
+            )
+            self.last_weekly_analysis_time = datetime.now()
+
+            logger.info(f"Weekly MTF Analysis: score={weekly_score.total:+d}, RSI={rsi_val:.1f}")
+            return self.weekly_analysis
+
+        except Exception as e:
+            logger.error(f"Error in weekly timeframe analysis: {e}")
+            return self.weekly_analysis
+
+    async def refresh_mtf_advisory(self) -> None:
+        """Refresh multi-timeframe advisory data (4H + Weekly)."""
+        try:
+            await self._analyze_higher_timeframe()
+            await self._analyze_weekly_timeframe()
+        except Exception as e:
+            logger.error(f"Error refreshing MTF advisory: {e}")
+
+    def get_mtf_alignment(self) -> dict:
+        """
+        Get multi-timeframe alignment assessment.
+
+        Returns dict with htf_4h, weekly, alignment, and summary text.
+        """
+        result = {
+            "htf_4h": self.htf_4h_analysis.to_dict() if self.htf_4h_analysis else None,
+            "weekly": self.weekly_analysis.to_dict() if self.weekly_analysis else None,
+            "alignment": "UNKNOWN",
+            "summary": "Waiting for data...",
+        }
+
+        # Need at least 1H analysis to determine alignment
+        if not self.last_analysis:
+            return result
+
+        score_1h = self.last_analysis.trend_score
+        score_4h = self.htf_4h_analysis.trend_score if self.htf_4h_analysis else None
+        score_w = self.weekly_analysis.trend_score if self.weekly_analysis else None
+
+        scores = [score_1h]
+        if score_4h is not None:
+            scores.append(score_4h)
+        if score_w is not None:
+            scores.append(score_w)
+
+        if len(scores) < 2:
+            return result
+
+        all_bullish = all(s >= 2 for s in scores)
+        all_bearish = all(s <= -2 for s in scores)
+        any_bullish = any(s >= 2 for s in scores)
+        any_bearish = any(s <= -2 for s in scores)
+
+        if all_bullish:
+            result["alignment"] = "ALIGNED_BULLISH"
+            result["summary"] = "All timeframes bullish"
+        elif all_bearish:
+            result["alignment"] = "ALIGNED_BEARISH"
+            result["summary"] = "All timeframes bearish"
+        elif any_bullish and any_bearish:
+            result["alignment"] = "CONFLICTING"
+            parts = []
+            if score_1h is not None:
+                parts.append(f"1H: {score_1h:+d}")
+            if score_4h is not None:
+                parts.append(f"4H: {score_4h:+d}")
+            if score_w is not None:
+                parts.append(f"W: {score_w:+d}")
+            result["summary"] = f"Timeframes in conflict ({', '.join(parts)})"
+        else:
+            result["alignment"] = "MIXED"
+            result["summary"] = "Mixed signals across timeframes"
+
+        return result
 
     async def _check_auto_switch(self, analysis: MarketAnalysis) -> None:
         """

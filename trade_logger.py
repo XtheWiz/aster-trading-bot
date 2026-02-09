@@ -146,11 +146,25 @@ class TradeLogger:
             )
         """)
         
+        # Regime history table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS regime_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                regime TEXT NOT NULL,
+                trend_score INTEGER DEFAULT 0,
+                atr_pct REAL DEFAULT 0,
+                volume_ratio REAL DEFAULT 1.0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Create indexes for faster queries
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_balance_timestamp ON balance_snapshots(timestamp)")
-        
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_regime_timestamp ON regime_history(timestamp)")
+
         conn.commit()
     
     async def log_trade(self, trade: TradeRecord) -> int:
@@ -522,6 +536,119 @@ class TradeLogger:
             for row in rows
         ]
     
+    async def log_regime(self, regime: str, trend_score: int, atr_pct: float, volume_ratio: float) -> None:
+        """Log a regime detection to the database."""
+        async with self._lock:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, self._insert_regime, regime, trend_score, atr_pct, volume_ratio
+            )
+
+    def _insert_regime(self, regime: str, trend_score: int, atr_pct: float, volume_ratio: float) -> None:
+        """Insert regime record (sync)."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO regime_history (timestamp, regime, trend_score, atr_pct, volume_ratio)
+            VALUES (?, ?, ?, ?, ?)
+        """, (datetime.now().isoformat(), regime, trend_score, atr_pct, volume_ratio))
+        conn.commit()
+
+    async def get_trades_in_range(self, start: str, end: str) -> list[dict]:
+        """Get SELL trades with PnL in a date range."""
+        async with self._lock:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self._get_trades_in_range, start, end)
+
+    def _get_trades_in_range(self, start: str, end: str) -> list[dict]:
+        """Get trades in range (sync)."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT timestamp, side, CAST(price AS REAL) as price,
+                   CAST(quantity AS REAL) as quantity,
+                   CAST(pnl AS REAL) as pnl, grid_level
+            FROM trades
+            WHERE side = 'SELL' AND status = 'FILLED'
+              AND timestamp >= ? AND timestamp < ?
+            ORDER BY timestamp ASC
+        """, (start, end))
+        return [dict(row) for row in cursor.fetchall()]
+
+    async def get_session_breakdown(self, start: str, end: str) -> dict:
+        """Classify SELL trades by trading session (Asian/EU/US/Late)."""
+        async with self._lock:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self._get_session_breakdown, start, end)
+
+    def _get_session_breakdown(self, start: str, end: str) -> dict:
+        """Get session breakdown (sync)."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT timestamp, CAST(pnl AS REAL) as pnl
+            FROM trades
+            WHERE side = 'SELL' AND status = 'FILLED'
+              AND timestamp >= ? AND timestamp < ?
+        """, (start, end))
+
+        sessions = {
+            "Asian (00-08 UTC)": {"count": 0, "pnl": 0.0},
+            "EU (08-13 UTC)": {"count": 0, "pnl": 0.0},
+            "US (13-21 UTC)": {"count": 0, "pnl": 0.0},
+            "Late (21-00 UTC)": {"count": 0, "pnl": 0.0},
+        }
+
+        for row in cursor.fetchall():
+            try:
+                ts = datetime.fromisoformat(row["timestamp"])
+                hour = ts.hour
+                pnl = row["pnl"] or 0.0
+
+                if 0 <= hour < 8:
+                    key = "Asian (00-08 UTC)"
+                elif 8 <= hour < 13:
+                    key = "EU (08-13 UTC)"
+                elif 13 <= hour < 21:
+                    key = "US (13-21 UTC)"
+                else:
+                    key = "Late (21-00 UTC)"
+
+                sessions[key]["count"] += 1
+                sessions[key]["pnl"] += pnl
+            except Exception:
+                continue
+
+        return sessions
+
+    async def get_regime_distribution(self, start: str, end: str) -> dict:
+        """Get percentage of time spent in each regime during a period."""
+        async with self._lock:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self._get_regime_distribution, start, end)
+
+    def _get_regime_distribution(self, start: str, end: str) -> dict:
+        """Get regime distribution (sync)."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT regime, COUNT(*) as count
+            FROM regime_history
+            WHERE timestamp >= ? AND timestamp < ?
+            GROUP BY regime
+            ORDER BY count DESC
+        """, (start, end))
+
+        rows = cursor.fetchall()
+        total = sum(row["count"] for row in rows)
+        if total == 0:
+            return {}
+
+        return {
+            row["regime"]: round(row["count"] / total * 100, 1)
+            for row in rows
+        }
+
     async def get_recent_trades(self, limit: int = 10) -> list[dict]:
         """
         Get recent trades from database.
