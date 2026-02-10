@@ -9,6 +9,7 @@ pandas>=2.1.0
 numpy>=1.26.0
 ta>=0.11.0  # Technical analysis indicators (RSI, MACD, ATR, etc.) - pure Python
 # Note: SuperTrend and StochRSI are implemented manually using ta library
+tvscreener>=1.0.0  # TradingView screener API for advisory recommendations
 
 # Database (optional, but good practice if switching from sqlite)
 # asyncpg>=0.29.0  # For PostgreSQL on Railway later
